@@ -1,6 +1,6 @@
 [package]
 name = "wechat-pay-rust-sdk"
-version = "0.2.20"
+version = "0.2.21"
 edition = "2024"
 authors = ["lake"]
 description = "微信支付 © Wechat Pay SDK Official (标准库)"
@@ -15,20 +15,20 @@ members = ["example"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-base64 = "0.22.1"
-chrono = "0.4.31"
-rsa = { version = "0.9.6", features = ["sha2"] }
-aes-gcm = "0.10.3"
-reqwest = { version = "0.12.20", optional = true, features = ["json"] }
-thiserror = "2.0.12"
-uuid = { version = "1.6.1", features = ["v4"] }
-tracing = { version = "0.1.40", optional = true }
-tracing-subscriber = { version = "0.3.18", optional = true }
-serde = { version = "1.0.195", features = ["derive"] }
-pem = "3.0"
-x509-parser = "0.17.0"
-serde_json = "1.0.111"
-maybe-async = "0.2.10"
+base64 = "0.23"
+chrono = "0.4"
+rsa = { version = "0.9", features = ["sha2"] }
+aes-gcm = "0.11"
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "rustls"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+serde = { version = "1", features = ["derive"] }
+pem = "4"
+x509-parser = "0.18"
+serde_json = "1"
+maybe-async = "0.2"
 
 [features]
 default = ["reqwest/blocking"]
@@ -36,7 +36,7 @@ async = ["reqwest"]
 debug-print = ["tracing", "tracing-subscriber"]
 
 [dev-dependencies]
-dotenvy = "0.15.7"
-tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
-tokio = { version = "1.35.1", features = ["full"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio = { version = "1", features = ["full"] }

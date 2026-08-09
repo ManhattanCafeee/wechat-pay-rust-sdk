@@ -3,8 +3,8 @@ use crate::model::WechatPayDecodeData;
 use crate::request::HttpMethod;
 use crate::response::SignData;
 use crate::{debug, sign, util};
-use aes_gcm::aead::{AeadMut, Payload};
-use aes_gcm::{aead::KeyInit, Aes256Gcm};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::sha2::{Digest, Sha256};
@@ -75,21 +75,19 @@ pub trait PayNotifyTrait: WechatPayTrait {
     where
         S: AsRef<str>,
     {
-        if nonce.as_ref().len() != 12 {
-            return Err(PayError::DecryptError(
-                "nonce length must be 12".to_string(),
-            ));
-        }
+        let nonce: [u8; 12] = nonce.as_ref().as_bytes().try_into().map_err(|_| {
+            PayError::DecryptError("nonce length must be 12".to_string())
+        })?;
         let v3_key = self.v3_key();
         let ciphertext = util::base64_decode(ciphertext.as_ref())?;
-        let aes_key = v3_key.as_bytes();
-        let mut cipher = Aes256Gcm::new(aes_key.into());
+        let cipher = Aes256Gcm::new_from_slice(v3_key.as_bytes())
+            .map_err(|e| PayError::DecryptError(format!("invalid v3 key: {e}")))?;
         let payload = Payload {
             msg: ciphertext.as_slice(),
             aad: associated_data.as_ref().as_bytes(),
         };
         let plaintext = cipher
-            .decrypt(nonce.as_ref().as_bytes().into(), payload)
+            .decrypt(&Nonce::from(nonce), payload)
             .map_err(|e| PayError::DecryptError(e.to_string()))?;
         Ok(plaintext)
     }
@@ -194,7 +192,6 @@ impl WechatPay {
 
     #[cfg(feature = "debug-print")]
     pub fn open_debug(&self) {
-        std::env::set_var("RUST_LOG", "oss=debug");
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
             .with_line_number(true)
