@@ -14,10 +14,15 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use wechat_pay_rust_sdk::cert::{PlatformKeys, REFRESH_INTERVAL_SECS};
 use wechat_pay_rust_sdk::error::PayError;
-use wechat_pay_rust_sdk::model::{JsapiParams, RefundsParams};
+use wechat_pay_rust_sdk::model::{
+    AmountInfo, Currency, GoodsDetail, JsapiParams, NativeParams, OrderDetail, PayerInfo,
+    RefundsParams, SceneInfo, SettleInfo,
+};
 use wechat_pay_rust_sdk::notify::NotifyHeaders;
 use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
+use wechat_pay_rust_sdk::request::HttpMethod;
 use wechat_pay_rust_sdk::util;
 
 /// 测试专用 RSA 私钥（PKCS#8, 2048 bit）。
@@ -747,12 +752,12 @@ dual_test! {
 }
 dual_test! {
     fn platform_keys_refresh_window() {
-        let mut keys = wechat_pay_rust_sdk::cert::PlatformKeys::new();
+        let mut keys = PlatformKeys::new();
         assert!(keys.needs_refresh(0), "从未拉取过就该刷新");
         keys.mark_refreshed(1_000);
         assert!(!keys.needs_refresh(1_000 + 3600), "一小时后不必刷新");
         assert!(
-            keys.needs_refresh(1_000 + wechat_pay_rust_sdk::cert::REFRESH_INTERVAL_SECS),
+            keys.needs_refresh(1_000 + REFRESH_INTERVAL_SECS),
             "达到刷新间隔就该刷新"
         );
         assert_eq!(keys.fetched_at(), Some(1_000));
@@ -937,4 +942,35 @@ dual_test! {
             other => panic!("应返回 Err(PayError::ApiError)，实际得到 {other:?}"),
         }
     }
+}
+
+/// 编译期断言：这些公开类型必须是 `Send + Sync`。
+///
+/// 原先由 **22 处 `unsafe impl Send/Sync`** 手工保证，现已全部删除，改为依赖自动派生
+/// （`src/lib.rs` 同时加了 `#![forbid(unsafe_code)]` 防止再引入）。这个测试就是替代品：
+/// 一旦有人给这些类型加上 `Rc`、裸指针之类非 Send/Sync 的字段，**本测试会编译失败**，
+/// 而不是等到线上把 `WechatPay` 放进 web 框架共享状态时才炸。
+///
+/// 断言是编译期的，所以函数体故意留空。
+#[test]
+fn public_types_are_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    // 需要跨线程共享的核心类型
+    assert_send_sync::<WechatPay>();
+    assert_send_sync::<PayError>();
+    assert_send_sync::<PlatformKeys>();
+    assert_send_sync::<NotifyHeaders>();
+    assert_send_sync::<HttpMethod>();
+
+    // 原先被 `unsafe impl` 覆盖过的模型类型
+    assert_send_sync::<Currency>();
+    assert_send_sync::<AmountInfo>();
+    assert_send_sync::<PayerInfo>();
+    assert_send_sync::<GoodsDetail>();
+    assert_send_sync::<OrderDetail>();
+    assert_send_sync::<SceneInfo>();
+    assert_send_sync::<SettleInfo>();
+    assert_send_sync::<NativeParams>();
+    assert_send_sync::<JsapiParams>();
 }

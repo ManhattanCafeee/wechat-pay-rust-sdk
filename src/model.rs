@@ -18,10 +18,6 @@ impl Display for Currency {
     }
 }
 
-unsafe impl Send for Currency {}
-
-unsafe impl Sync for Currency {}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AmountInfo {
     ///【标价金额】 订单总金额，单位为分。
@@ -33,10 +29,6 @@ impl From<i32> for AmountInfo {
         Self { total: value }
     }
 }
-
-unsafe impl Send for AmountInfo {}
-
-unsafe impl Sync for AmountInfo {}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PayerInfo {
@@ -51,10 +43,6 @@ impl From<&str> for PayerInfo {
         }
     }
 }
-
-unsafe impl Send for PayerInfo {}
-
-unsafe impl Sync for PayerInfo {}
 
 #[derive(Serialize, Debug, Clone)]
 pub struct GoodsDetail {
@@ -72,10 +60,6 @@ pub struct GoodsDetail {
     pub goods_name: Option<String>,
 }
 
-unsafe impl Send for GoodsDetail {}
-
-unsafe impl Sync for GoodsDetail {}
-
 #[derive(Serialize, Debug, Clone)]
 pub struct OrderDetail {
     ///【订单原价】
@@ -90,10 +74,6 @@ pub struct OrderDetail {
     ///【单品列表】 单品列表信息,条目个数限制：【1，6000】
     pub goods_detail: Vec<GoodsDetail>,
 }
-
-unsafe impl Send for OrderDetail {}
-
-unsafe impl Sync for OrderDetail {}
 
 #[derive(Serialize, Debug, Clone)]
 pub struct StoreInfo {
@@ -188,10 +168,6 @@ impl H5SceneInfo {
         }
     }
 }
-
-unsafe impl Send for SceneInfo {}
-
-unsafe impl Sync for SceneInfo {}
 
 impl ParamsTrait for SceneInfo {
     fn to_json(&self) -> String {
@@ -305,10 +281,6 @@ pub struct SettleInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profit_sharing: Option<bool>,
 }
-
-unsafe impl Send for SettleInfo {}
-
-unsafe impl Sync for SettleInfo {}
 
 #[derive(Serialize, Debug, Clone)]
 pub struct NativeParams {
@@ -473,14 +445,6 @@ impl NativeParams {
         }
     }
 }
-
-unsafe impl Send for NativeParams {}
-
-unsafe impl Sync for NativeParams {}
-
-unsafe impl Send for JsapiParams {}
-
-unsafe impl Sync for JsapiParams {}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WechatPayNotifySource {

@@ -38,10 +38,6 @@ impl std::fmt::Debug for WechatPay {
     }
 }
 
-unsafe impl Send for WechatPay {}
-
-unsafe impl Sync for WechatPay {}
-
 pub trait PayNotifyTrait: WechatPayTrait {
     fn verify_signature<S>(
         &self,

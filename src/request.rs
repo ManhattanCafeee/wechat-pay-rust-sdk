@@ -20,7 +20,3 @@ impl Display for HttpMethod {
         }
     }
 }
-
-unsafe impl Send for HttpMethod {}
-
-unsafe impl Sync for HttpMethod {}
