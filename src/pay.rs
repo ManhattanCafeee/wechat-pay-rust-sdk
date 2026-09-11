@@ -6,20 +6,36 @@ use crate::{debug, sign, util};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
-use rsa::pkcs8::DecodePublicKey;
-use rsa::sha2::{Digest, Sha256};
-use rsa::{Pkcs1v15Sign, RsaPublicKey};
 use uuid::Uuid;
 
-#[derive(Debug)]
+/// 微信支付客户端。
+///
+/// 字段全部私有：`private_key` / `v3_key` 是能直接动钱的机密，`base_url` 决定你
+/// 签好名的请求发往何处 —— 三者都不应被外部随手改写。要覆盖网关地址请用
+/// [`WechatPay::with_base_url`]。
 pub struct WechatPay {
-    pub appid: String,
-    pub mch_id: String,
-    pub private_key: String,
-    pub serial_no: String,
-    pub v3_key: String,
-    pub notify_url: String,
-    pub base_url: String,
+    pub(crate) appid: String,
+    pub(crate) mch_id: String,
+    pub(crate) private_key: String,
+    pub(crate) serial_no: String,
+    pub(crate) v3_key: String,
+    pub(crate) notify_url: String,
+    pub(crate) base_url: String,
+}
+
+// `Debug` 手写而非 derive：derive 会把 `private_key` / `v3_key` 原样打进日志。
+impl std::fmt::Debug for WechatPay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WechatPay")
+            .field("appid", &self.appid)
+            .field("mch_id", &self.mch_id)
+            .field("private_key", &"<redacted>")
+            .field("serial_no", &self.serial_no)
+            .field("v3_key", &"<redacted>")
+            .field("notify_url", &self.notify_url)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 unsafe impl Send for WechatPay {}
@@ -44,14 +60,7 @@ pub trait PayNotifyTrait: WechatPayTrait {
             nonce.as_ref(),
             body.as_ref()
         );
-        let pub_key = RsaPublicKey::from_public_key_pem(pub_key)
-            .map_err(|e| PayError::VerifyError(format!("public key parser error: {}", e)))?;
-        let hashed = Sha256::new().chain_update(message).finalize();
-        let signature = util::base64_decode(signature.as_ref())?;
-        let scheme = Pkcs1v15Sign::new::<Sha256>();
-        pub_key
-            .verify(scheme, &hashed, signature.as_slice())
-            .map_err(|e| PayError::VerifyError(e.to_string()))
+        util::verify_rsa_sha256(pub_key, &message, signature.as_ref())
     }
     fn decrypt_paydata<S>(
         &self,
@@ -166,11 +175,16 @@ impl WechatPayTrait for WechatPay {
 }
 
 impl WechatPay {
-    #[allow(dead_code)]
-    fn with_base_url(mut self, base_url: impl AsRef<str>) -> Self {
-        self.base_url = base_url.as_ref().to_string();
+    /// 覆盖默认网关地址（默认 `https://api.mch.weixin.qq.com`）。
+    ///
+    /// 主要用途是把请求指向本地 mock 服务做离线测试（见 `tests/offline.rs`）。
+    /// ⚠ 生产代码绝不能让这个值受用户输入影响：你签好名的请求（含 openid、
+    /// 订单信息）会被送到该地址。
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
         self
     }
+
     pub fn new<S: AsRef<str>>(
         appid: S,
         mch_id: S,

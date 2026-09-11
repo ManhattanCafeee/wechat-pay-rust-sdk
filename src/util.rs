@@ -1,7 +1,30 @@
 use base64::engine::general_purpose;
 use base64::{DecodeError, Engine};
+use rsa::pkcs8::DecodePublicKey;
+use rsa::sha2::{Digest, Sha256};
+use rsa::{Pkcs1v15Sign, RsaPublicKey};
 use std::error::Error;
 use uuid::Uuid;
+
+use crate::error::PayError;
+
+/// 用 PEM 公钥验证 RSA-SHA256（PKCS#1 v1.5）签名，`signature_b64` 为 base64。
+///
+/// 微信支付 v3 的应答验签与回调验签都走这条路径；平台证书轮换时由调用方
+/// 先从证书列表里挑出对应公钥再传进来。
+pub fn verify_rsa_sha256(
+    pub_key_pem: &str,
+    message: &str,
+    signature_b64: &str,
+) -> Result<(), PayError> {
+    let pub_key = RsaPublicKey::from_public_key_pem(pub_key_pem)
+        .map_err(|e| PayError::VerifyError(format!("public key parser error: {e}")))?;
+    let hashed = Sha256::new().chain_update(message).finalize();
+    let signature = base64_decode(signature_b64)?;
+    pub_key
+        .verify(Pkcs1v15Sign::new::<Sha256>(), &hashed, signature.as_slice())
+        .map_err(|e| PayError::VerifyError(e.to_string()))
+}
 
 pub fn random_trade_no() -> String {
     Uuid::new_v4().simple().to_string()

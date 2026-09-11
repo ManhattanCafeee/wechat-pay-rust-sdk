@@ -222,6 +222,7 @@ fn handle_connection(
 
     let reason = match response.status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
@@ -240,18 +241,17 @@ fn handle_connection(
 }
 
 /// 构造一个指向本地 mock 服务的客户端。
-/// 生产代码不应该这样用——`base_url` 只应由 `WechatPay::new` 设置。
+/// 走公开的 `with_base_url`，不依赖字段可见性。
 fn client_for(base_url: &str) -> WechatPay {
-    let mut wechat_pay = WechatPay::new(
+    WechatPay::new(
         TEST_APPID,
         TEST_MCH_ID,
         TEST_PRIVATE_KEY,
         TEST_SERIAL_NO,
         TEST_V3_KEY,
         TEST_NOTIFY_URL,
-    );
-    wechat_pay.base_url = base_url.to_string();
-    wechat_pay
+    )
+    .with_base_url(base_url)
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +370,6 @@ dual_test! {
         assert_valid_signature(&message, &auth_field(auth, "signature"));
     }
 }
-
 dual_test! {
     fn jsapi_pay_returns_err_on_api_error() {
         // 微信 v3 的真实错误体；HTTP 状态码为 400。
@@ -404,7 +403,6 @@ dual_test! {
         }
     }
 }
-
 dual_test! {
     fn refunds_returns_err_on_api_error() {
         let mock = Mock::start(vec![MockResponse::json(
@@ -431,7 +429,6 @@ dual_test! {
         }
     }
 }
-
 dual_test! {
     fn decrypt_paydata_roundtrip() {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -467,7 +464,6 @@ dual_test! {
         assert_eq!(data.amount.total, 1);
     }
 }
-
 dual_test! {
     fn verify_signature_accepts_valid_and_rejects_tampered() {
         let timestamp = "1705066785";
@@ -511,7 +507,6 @@ dual_test! {
         assert!(result.is_err(), "非法签名必须验签失败");
     }
 }
-
 dual_test! {
     fn non_json_error_body_is_preserved() {
         // 网关故障时可能返回 HTML 而不是微信的错误结构；
@@ -537,7 +532,6 @@ dual_test! {
         }
     }
 }
-
 dual_test! {
     fn non_wechat_json_error_body_is_preserved() {
         // 回归：ErrorResponse 的字段全是 Option 且未加 deny_unknown_fields，
@@ -569,7 +563,6 @@ dual_test! {
         }
     }
 }
-
 dual_test! {
     fn oversized_error_body_is_truncated() {
         // 网关可能返回整页 HTML；不能让整个 body 复制进错误消息并刷爆日志。
@@ -599,7 +592,6 @@ dual_test! {
         }
     }
 }
-
 dual_test! {
     fn empty_error_body_is_marked() {
         let mock = Mock::start(vec![MockResponse::json(502, "")]);
@@ -621,5 +613,45 @@ dual_test! {
             }
             other => panic!("必须返回 Err(PayError::ApiError)，实际得到 {other:?}"),
         }
+    }
+}
+dual_test! {
+    fn debug_output_redacts_secrets() {
+        // 用哨兵值而不是真实 PEM：Debug 会把换行转义成 \n，
+        // 多行字符串包含判断会失真。
+        let wechat_pay = WechatPay::new(
+            "appid-x",
+            "mch-x",
+            "SENTINEL_PRIVATE_KEY",
+            "serial-x",
+            "SENTINEL_V3_KEY",
+            "https://example.com/notify",
+        );
+        let rendered = format!("{wechat_pay:?}");
+
+        assert!(
+            !rendered.contains("SENTINEL_PRIVATE_KEY"),
+            "Debug 泄露商户私钥: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SENTINEL_V3_KEY"),
+            "Debug 泄露 APIv3 密钥: {rendered}"
+        );
+        // 非机密字段仍应保留，否则排障时无从判断用的是哪个商户号
+        assert!(rendered.contains("mch-x"), "非机密字段应保留: {rendered}");
+        assert!(rendered.contains("redacted"), "应显式标注脱敏: {rendered}");
+    }
+}
+dual_test! {
+    fn with_base_url_overrides_default_gateway() {
+        // 默认必须是官方网关；with_base_url 只用于把请求指向 mock / 沙箱。
+        let default = WechatPay::new("a", "b", "c", "d", "e", "f");
+        assert!(
+            format!("{default:?}").contains("https://api.mch.weixin.qq.com"),
+            "默认网关应指向微信官方地址"
+        );
+
+        let overridden = default.with_base_url("http://127.0.0.1:1234");
+        assert!(format!("{overridden:?}").contains("http://127.0.0.1:1234"));
     }
 }
