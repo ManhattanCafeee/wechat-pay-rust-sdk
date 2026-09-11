@@ -9,12 +9,14 @@
 //! | --- | --- | --- | --- |
 //! | [`Delivery::NotSent`] | 连接被拒、连接超时 | **确定没收到** | 任何接口都可以 |
 //! | [`Delivery::Rejected`] | 429 / 500 / 502 / 503 | 官方标注「未受理 / 无法处理」 | 任何接口都可以 |
+//! | [`Delivery::Accepted`] | HTTP 202 | **已收到**，只是尚未处理完 | 任何接口都可以 |
 //! | [`Delivery::Unknown`] | 连上了但读不到响应（读写超时） | **可能已经处理** | 只有只读接口敢 |
 //! | [`Delivery::Processed`] | 响应体读了一半断连 | **已经处理过** | 一律不重放 |
 //!
 //! 前三类的判据来自微信官方文档（HTTP 状态码页把 429 写成「请求未受理」、
-//! 502/503 写成「请求无法处理」，各接口的 500 都写「请用相同参数重新调用」）；
-//! 四类之间的界线则来自 reqwest 的错误标志位实测（`is_connect` / `is_decode` /
+//! 502/503 写成「请求无法处理」，202 写成「已接受请求，但尚未处理，请使用原参数重复
+//! 请求一遍」，各接口的 500 都写「请用相同参数重新调用」）；
+//! 这些界线则来自 reqwest 的错误标志位实测（`is_connect` / `is_decode` /
 //! `is_timeout` 能把上表干净地分开）。
 //!
 //! # 为什么「结果未知」时写接口不重试
@@ -76,14 +78,23 @@ pub struct RetryPolicy {
     ///
     /// `0` 会被当作 `1`（即不重试）处理，不会出现「一次都不发」。
     pub max_attempts: u32,
-    /// 首次重试前的退避间隔；之后按 2 的幂增长，直到 `max_delay`。
+    /// 退避基准：首次重试等这么久，之后按 2 的幂增长，直到 `max_delay`。
+    ///
+    /// ⚠ 开了 [`jitter`](Self::jitter) 时它是**上限**而不是确定值 —— 实际等待是
+    /// `0..=计算结果` 上的随机数。需要「至少等这么久」的语义（例如官方对退款要求的
+    /// 最小间隔），请把 `jitter` 设为 `false`。
     pub base_delay: Duration,
-    /// 单次退避的上限。
+    /// 退避增长的上限。
+    ///
+    /// ⚠ 抖动是在截断**之后**施加的，所以开启抖动时实际等待只会比它更短。
     pub max_delay: Duration,
-    /// 是否给退避加**全抖动**（在 `0..=本次退避` 之间随机取值）。
+    /// 是否给退避加**全抖动**：实际等待取 `0..=计算值` 上的随机数。
     ///
     /// 微信侧大面积故障时，所有客户端会在同一刻失败、又在同一刻重发；
     /// 抖动把这批重发摊开，避免把刚恢复的服务再打垮。
+    ///
+    /// ⚠ 它是**向下**抖动的，因此开启后 `base_delay` 与 `max_delay` 都退化为上限。
+    /// 若某个档位的等待时点是外部的硬要求（退款就是），关掉它。
     pub jitter: bool,
 }
 
@@ -111,12 +122,17 @@ impl RetryPolicy {
     ///
     /// 依据是官方对退款重试的节奏要求（「间隔 1 分钟」）以及接口在失败时报错
     /// 限流仅 6QPS 的约束。
+    ///
+    /// ⚠ 这里**刻意关掉抖动**：`base_delay` 是官方要求的最小间隔，而全抖动会把实际
+    /// 等待摊到 `0..=base_delay`（可以接近 0），等于把「间隔 1 分钟」变成「可能立刻
+    /// 重发」—— 正是本策略要避免的事。代价是重试时点不再分散；退款并发量小，
+    /// 这个代价可以接受。
     pub fn for_refund() -> Self {
         Self {
             max_attempts: DEFAULT_REFUND_MAX_ATTEMPTS,
             base_delay: DEFAULT_REFUND_BASE_DELAY,
             max_delay: DEFAULT_REFUND_MAX_DELAY,
-            jitter: true,
+            jitter: false,
         }
     }
 
@@ -160,9 +176,17 @@ fn random_upto(cap: Duration) -> Duration {
 pub(crate) enum Delivery {
     /// 请求确定没送到微信：连接被拒，或连 TCP 都没建立起来就超时。
     NotSent,
-    /// 微信明确表示没有受理这次请求：429 / 500 / 502 / 503，以及 202。
+    /// 微信明确表示没有受理这次请求：429 / 500 / 502 / 503，以及错误码为
+    /// `SYSTEM_ERROR` 的 2xx 错误信封（与 HTTP 500 同源）。
     Rejected,
-    /// 请求送到了，但结果未知：连上了、读不到响应（读写超时），或官方未定义处置的 504。
+    /// 微信**已经收到**这次请求，只是尚未处理完：HTTP 202。
+    ///
+    /// ⚠ 与 [`Delivery::Rejected`] 的区别很关键：请求已被受理，**可能随后生效**。
+    /// 官方对 202 的要求是「请使用原参数重复请求一遍」，所以照样重试；
+    /// 但绝不能当成「没发生」—— 它的「可能已生效」判定是 `true`。
+    Accepted,
+    /// 请求送到了，但结果未知：连上了、读不到响应（读写超时），或官方未定义处置的
+    /// 5xx（504 / 501 / 505，以及 CDN 的 520 一类）。
     Unknown,
     /// 响应都开始返回了，说明微信**已经处理过**这次请求：读响应体失败属于这类。
     Processed,
@@ -190,25 +214,41 @@ pub(crate) fn classify(err: &PayError) -> Option<Delivery> {
                 Some(Delivery::Unknown)
             }
         }
-        PayError::ApiError { status, .. } => match *status {
-            // 官方 HTTP 状态码页：429「请求未受理」、502/503「请求无法处理」；
-            // 各接口的 500 都写「请用相同参数重新调用」。
-            429 | 500 | 502 | 503 => Some(Delivery::Rejected),
-            // 官方的状态码表里**没有 504**，不要按 RFC 语义替它下结论，
-            // 归到「结果未知」最保守。
-            504 => Some(Delivery::Unknown),
-            // 4xx 都是参数 / 权限 / 签名问题，重试不会有不同结果。
-            _ => None,
-        },
-        // 签名、解密、Base64、JSON 解析失败等本地错误：重试结果一样。
+        PayError::ApiError { status, response } => {
+            // 错误码优先于状态码：微信会以 HTTP 200 返回错误信封，那时状态码没有意义。
+            // SYSTEM_ERROR 与 HTTP 500 同源，官方要求「请用相同参数重新调用」。
+            if response.code.as_deref() == Some("SYSTEM_ERROR") {
+                return Some(Delivery::Rejected);
+            }
+            match *status {
+                // 官方 HTTP 状态码页：429「请求未受理」、502/503「请求无法处理」；
+                // 各接口的 500 都写「请用相同参数重新调用」。
+                429 | 500 | 502 | 503 => Some(Delivery::Rejected),
+                // 202 是「已受理、尚未处理」：能重试，但**不等于没发生**。
+                202 => Some(Delivery::Accepted),
+                // 官方状态码表里没有 504，也没有 501 / 505 / CDN 的 520 一类。
+                // 不替它下结论 —— 按「结果未知」处理最保守：只读可重试、写不重试，
+                // 且「可能已生效」为 true。
+                status if (500..600).contains(&status) => Some(Delivery::Unknown),
+                // 4xx 是参数 / 权限 / 签名问题，重试不会有不同结果。
+                _ => None,
+            }
+        }
+        // 响应体解析失败：只可能发生在**已经拿到响应**之后（`pay()` 里构造请求体时
+        // 的本地序列化失败属于 crate 自身 bug，实际不可达）。既然响应都回来了，请求
+        // 必然已经送到微信 —— 按「可能已生效」处理。
+        // 这个方向判错只会让调用方多查一次单；反方向判错可能导致重复下单。
+        PayError::JsonError(_) => Some(Delivery::Processed),
+        // 签名、解密、Base64、验签失败等本地错误：重试结果一样，也不可能已生效。
         _ => None,
     }
 }
 
 /// 请求的重放语义。
 ///
-/// **默认取最保守的那个**：新增接口时忘了标注，行为是「只在确定没送出去时才重试」，
-/// 而不是「随便重试」。
+/// 枚举**没有默认值**：新增接口必须显式标明语义，漏写就是编译错误 ——
+/// 这比「有个保守默认值」更硬（`should_retry` 里没有 `_` 分支可以兜底）。
+/// 代价是每加一个接口都得先想清楚它能不能重放，但这正是必须想清楚的事。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestKind {
     /// 只读查询：重放不改变任何状态，所以**结果未知也能重试**。
@@ -225,11 +265,12 @@ pub(crate) enum RequestKind {
 /// | --- | --- | --- |
 /// | `NotSent`（确定没送到） | 重试 | 重试 |
 /// | `Rejected`（微信说没受理） | 重试 | 重试 |
+/// | `Accepted`（已受理未处理完） | 重试 | 重试 |
 /// | `Unknown`（结果未知） | 重试 | **不重试** |
 /// | `Processed`（已处理） | 不重试 | 不重试 |
 pub(crate) fn should_retry(delivery: Delivery, kind: RequestKind) -> bool {
     match delivery {
-        Delivery::NotSent | Delivery::Rejected => true,
+        Delivery::NotSent | Delivery::Rejected | Delivery::Accepted => true,
         Delivery::Unknown => matches!(kind, RequestKind::Read),
         Delivery::Processed => false,
     }
@@ -295,6 +336,16 @@ mod tests {
             policy.max_attempts() <= 2,
             "退款不应重试太多次，否则阻塞数分钟"
         );
+        assert!(
+            !policy.jitter,
+            "退款必须关掉抖动：全抖动会把实际等待摊到 0..=base_delay，\
+             等于把「间隔 1 分钟」变成「可能立刻重发」"
+        );
+        assert_eq!(
+            policy.delay_for(1),
+            DEFAULT_REFUND_BASE_DELAY,
+            "关掉抖动后，首次（也是唯一一次）重试必须等满 60s"
+        );
         assert_eq!(RetryPolicy::disabled().max_attempts(), 1);
     }
 
@@ -313,10 +364,11 @@ mod tests {
     }
 
     #[test]
-    fn not_sent_and_rejected_are_retryable_for_every_kind() {
+    fn always_retryable_classes_cover_every_kind() {
         for kind in [RequestKind::Read, RequestKind::Write, RequestKind::Refund] {
-            assert!(should_retry(Delivery::NotSent, kind), "{kind:?}");
-            assert!(should_retry(Delivery::Rejected, kind), "{kind:?}");
+            for delivery in [Delivery::NotSent, Delivery::Rejected, Delivery::Accepted] {
+                assert!(should_retry(delivery, kind), "{delivery:?} / {kind:?}");
+            }
         }
         // 只读接口连「结果未知」都能重试。
         assert!(should_retry(Delivery::Unknown, RequestKind::Read));
@@ -358,12 +410,39 @@ mod tests {
             );
         }
         assert_eq!(
-            classify(&api(504)),
-            Some(Delivery::Unknown),
-            "官方状态码表没有 504，只能按「结果未知」处理"
+            classify(&api(202)),
+            Some(Delivery::Accepted),
+            "202 是「已接受、尚未处理」，不是「没受理」—— 能重试但**不等于没发生**"
+        );
+        for undefined in [501, 504, 505, 520] {
+            assert_eq!(
+                classify(&api(undefined)),
+                Some(Delivery::Unknown),
+                "官方状态码表没有 {undefined}，只能按「结果未知」处理"
+            );
+        }
+        // 2xx + SYSTEM_ERROR 信封与 HTTP 500 同源，官方要求「请用相同参数重新调用」。
+        let envelope = PayError::api_error(200, r#"{"code":"SYSTEM_ERROR","message":"系统异常"}"#);
+        assert_eq!(
+            classify(&envelope),
+            Some(Delivery::Rejected),
+            "错误码应当优先于状态码：HTTP 200 的 SYSTEM_ERROR 同样要重试"
         );
         for permanent in [400, 401, 403, 404, 405] {
             assert_eq!(classify(&api(permanent)), None, "{permanent} 重试没有意义");
         }
+    }
+
+    #[test]
+    fn accepted_and_unparsable_responses_may_have_taken_effect() {
+        // 202：微信已经受理，只是还没处理完 —— 可能随后生效，不能当成「没发生」。
+        assert!(
+            PayError::api_error(202, "").may_have_taken_effect(),
+            "202 的请求已被微信接收，调用方必须去查单而不是换个单号重开"
+        );
+        // 响应体解析失败：响应都回来了，请求必然已送达。这里刻意偏保守 ——
+        // 判成 false 会让调用方以为「没发生」，进而可能重复下单。
+        let parse_error = serde_json::from_str::<i32>("not json").expect_err("应当解析失败");
+        assert!(PayError::JsonError(parse_error).may_have_taken_effect());
     }
 }

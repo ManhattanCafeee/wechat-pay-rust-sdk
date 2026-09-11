@@ -60,7 +60,7 @@ pub enum PayError {
 /// | 归类 | 含义 | 建议处置 |
 /// | --- | --- | --- |
 /// | [`Network`](ErrorKind::Network) | 传输 / 连接层失败 | 交给 [`crate::retry`] 判断。确定没送到的可安全重试；⚠ 结果未知的（读写超时）**写接口不重试**，应先查单确认（见 [`PayError::may_have_taken_effect`]） |
-/// | [`Api`](ErrorKind::Api) | 微信侧业务拒绝（HTTP 非 2xx） | 不要重试；按 `response.code` 分支。`ORDER_NOT_EXIST` 这类是**正常业务结果**，不是故障 |
+/// | [`Api`](ErrorKind::Api) | 微信侧业务拒绝（HTTP 非 2xx，或 2xx 的错误信封） | 交给 [`crate::retry`] 判定：429 / 500 / 502 / 503 与 `SYSTEM_ERROR` 会自动重试；其余按 `response.code` 分支，不要重试。`ORDER_NOT_EXIST` 这类是**正常业务结果**，不是故障 |
 /// | [`Local`](ErrorKind::Local) | 本地错误：签名、解密、Base64、JSON 解析、验签失败、回调超窗 | 不要重试，通常意味着配置或数据有问题，应当告警 |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
@@ -93,16 +93,26 @@ impl PayError {
 
     /// 这次失败是否**可能已经在微信侧生效**。
     ///
-    /// `true` 表示请求确实送到了微信、但没拿到结果（读写超时，或响应体没读完）——
-    /// 此时**不要**当成「操作失败」处理：支付、退款这类接口应当先用
+    /// `true` 表示请求确实送到了微信、但没拿到确定结果 —— 读写超时、响应体没读完、
+    /// HTTP 202（已受理但尚未处理完），或响应体解析失败。此时**不要**当成「操作失败」
+    /// 处理：支付、退款这类接口应当先用
     /// [`WechatPay::query_order`](crate::pay::WechatPay::query_order) /
     /// [`WechatPay::query_refund`](crate::pay::WechatPay::query_refund) 确认最终状态，
     /// 再决定下一步。**这正是 SDK 不对写接口超时做自动重试的原因**
     /// （见 [`crate::retry`]）。
     ///
     /// `false` 表示可以确定微信没有受理这次请求：连接根本没建立起来（连接被拒 /
-    /// 连接超时），微信明确说未受理（429/500/502/503），或者是签名 / 解密 / 解析这类
-    /// 本地错误。
+    /// 连接超时），微信明确说未受理（429 / 500 / 502 / 503、`SYSTEM_ERROR`），
+    /// 或者是签名 / 解密 / 验签这类本地错误。
+    ///
+    /// ⚠ 两类容易被想当然的边界，都刻意偏保守：
+    ///
+    /// - **HTTP 202** 是「已接受请求，但尚未处理」，官方要求「请使用原参数重复请求
+    ///   一遍」—— 它返回 `true`。请求已经被接收，可能随后生效。
+    /// - **响应体解析失败**也返回 `true`：响应都回来了，说明请求早已送达。
+    ///
+    /// 判错的方向性代价并不对称 —— 多判成 `true` 只是让调用方多查一次单（`ORDER_NOT_EXIST`
+    /// 会如实告诉他没这回事），漏判成 `false` 则可能诱导他换个单号重新下单。
     ///
     /// ```
     /// # use wechat_pay_rust_sdk::error::PayError;
@@ -115,7 +125,11 @@ impl PayError {
     pub fn may_have_taken_effect(&self) -> bool {
         matches!(
             crate::retry::classify(self),
-            Some(crate::retry::Delivery::Unknown | crate::retry::Delivery::Processed)
+            Some(
+                crate::retry::Delivery::Unknown
+                    | crate::retry::Delivery::Processed
+                    | crate::retry::Delivery::Accepted
+            )
         )
     }
 }

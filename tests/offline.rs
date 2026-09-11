@@ -1,8 +1,7 @@
 //! 离线集成测试：用本地 mock HTTP 服务替代微信支付网关。
 //!
 //! 这些测试**不联网、不需要任何真实商户凭证**，可在 CI 中运行。
-//! 之所以可以这样测，是因为 `WechatPay` 的字段是 `pub` 的，
-//! 可以直接把 `base_url` 指向本地 mock 服务。
+//! 之所以可以这样测，是因为 `with_base_url` 允许把实例指向本地 mock 服务（字段本身是私有的）。
 //!
 //! 同一份测试体在两种 feature 下都会编译并运行：
 //! - 默认（sync）：`reqwest::blocking`，普通 `#[test]`
@@ -1431,12 +1430,33 @@ fn truncated_body_mock() -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
 
 /// 从 Authorization 头里取出 `nonce_str`。
 fn nonce_of(request: &CapturedRequest) -> String {
-    request
+    let auth = request
         .header("authorization")
-        .and_then(|value| value.split("nonce_str=\"").nth(1))
-        .and_then(|value| value.split('"').next())
-        .expect("Authorization 头里应当有 nonce_str")
-        .to_string()
+        .expect("请求应当带 Authorization 头");
+    auth_field(auth, "nonce_str")
+}
+
+/// 等 mock 的读取线程把请求收完，返回**稳定后**的请求数。
+///
+/// `Mock` / `truncated_body_mock` 有「先 push 再写响应」的顺序保证 —— 客户端拿到响应或
+/// 报错时，捕获一定已经写入。但 `black_hole_mock` 永远不回响应，客户端返回与读取线程
+/// 之间只剩调度窗口，直接断言就是一条理论上有几率失败的用例。
+///
+/// 这里等计数**连续 [`SETTLE_WINDOW`] 不变**才认账；窗口取得比「一次尝试的最长间隔」
+/// （请求超时 + 退避）更长，所以既不会提前认账，也不会漏掉迟到的重试。
+fn settled_captures(captured: &Arc<Mutex<Vec<CapturedRequest>>>) -> usize {
+    /// 必须大于 `request` 超时 + 退避：否则一次尝试与下一次之间会被误判成「已经稳定」。
+    const SETTLE_WINDOW: Duration = Duration::from_millis(800);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = captured.lock().expect("lock captured").len();
+    loop {
+        thread::sleep(SETTLE_WINDOW);
+        let now = captured.lock().expect("lock captured").len();
+        if now == last || Instant::now() >= deadline {
+            return now;
+        }
+        last = now;
+    }
 }
 
 /// 把退避压到毫秒级，避免测试真的等下去（默认策略是 200ms 起步、上限 2s）。
@@ -1559,7 +1579,7 @@ dual_test! {
         let (write_url, write_captured) = black_hole_mock();
         let writer = client_for(&write_url)
             .with_timeouts(HttpTimeouts {
-                request: Duration::from_millis(300),
+                request: Duration::from_millis(200),
                 ..HttpTimeouts::default()
             })
             .with_retry(fast_retry(3));
@@ -1567,7 +1587,7 @@ dual_test! {
         let err = call!(writer.close_order("TIMEOUT_WRITE")).expect_err("超时应当报错");
         assert!(err.may_have_taken_effect(), "超时属于「结果未知」");
         assert_eq!(
-            write_captured.lock().expect("lock captured").len(),
+            settled_captures(&write_captured),
             1,
             "写接口超时**不得**重试：结果未知，应当由调用方查单确认，而不是再发一次"
         );
@@ -1577,7 +1597,7 @@ dual_test! {
         let (read_url, read_captured) = black_hole_mock();
         let reader = client_for(&read_url)
             .with_timeouts(HttpTimeouts {
-                request: Duration::from_millis(300),
+                request: Duration::from_millis(200),
                 ..HttpTimeouts::default()
             })
             .with_retry(fast_retry(3));
@@ -1586,7 +1606,7 @@ dual_test! {
 
         assert!(err.may_have_taken_effect());
         assert_eq!(
-            read_captured.lock().expect("lock captured").len(),
+            settled_captures(&read_captured),
             3,
             "只读接口超时应当重试：max_attempts = 3 就是 3 次尝试"
         );
@@ -1683,4 +1703,78 @@ fn refund_uses_a_separate_minute_scaled_policy() {
         tuned.retry_policy().max_attempts > 1,
         "改退款策略不应把通用重试也关掉"
     );
+}
+
+dual_test! {
+    fn refund_retry_actually_uses_the_refund_policy() {
+        // 上面那条只断言两个 getter 的默认值，证明不了**退款真的走了退款策略** ——
+        // 把 refunds() 的 kind 从 Refund 改成 Write、或 policy_for 丢掉 Refund 分支，
+        // 所有测试都还是绿的，而退款会退回毫秒级退避（违反官方「间隔 1 分钟」）。
+        let body = r#"{"refund_id":"50000000382019052709732678859","out_refund_no":"R_RETRY","transaction_id":"4200000000000000000000000000","out_trade_no":"ORDER_RETRY","channel":"ORIGINAL","user_received_account":"支付用户零钱","create_time":"2026-09-11T12:00:00+08:00","status":"PROCESSING","funds_account":"UNSETTLED","amount":{"total":1,"refund":1,"payer_total":1,"payer_refund":1,"settlement_refund":1,"settlement_total":1,"discount_refund":0,"currency":"CNY"}}"#;
+        let mock = Mock::start(vec![
+            MockResponse::json(429, r#"{"code":"FREQUENCY_LIMITED","message":"频率超限"}"#),
+            MockResponse::json(200, body),
+        ]);
+        // 通用策略关掉、只放开退款策略：只有「退款确实选中 refund_retry」才会有第 2 次请求。
+        let wechat_pay = client_for(&mock.base_url)
+            .with_retry(RetryPolicy::disabled())
+            .with_refund_retry(fast_retry(2));
+
+        call!(wechat_pay.refunds(RefundsParams::new(
+            "R_RETRY",
+            1,
+            1,
+            None,
+            Some("ORDER_RETRY"),
+        )))
+        .expect("429 之后应当按退款策略重试并成功");
+
+        assert_eq!(
+            mock.requests().len(),
+            2,
+            "退款必须选中退款策略；kind 标错就会退化成通用策略（这里已关掉）而只发 1 次"
+        );
+    }
+}
+
+dual_test! {
+    fn close_order_does_not_treat_a_200_error_envelope_as_success() {
+        // 关单走 request_no_content，而它不看响应体 —— 在此次改动之前，
+        // 「HTTP 200 + 错误信封」会被当成关单成功，尽管 README 承诺过
+        // 「包括 HTTP 200 但 body 是错误信封，都返回 Err」。
+        let mock = Mock::start(vec![MockResponse::json(
+            200,
+            r#"{"code":"RULE_LIMIT","message":"业务规则限制"}"#,
+        )]);
+        let wechat_pay = client_for(&mock.base_url).with_retry(RetryPolicy::disabled());
+
+        let err = call!(wechat_pay.close_order("ENVELOPE")).expect_err("200 + 错误信封不是成功");
+
+        match err {
+            PayError::ApiError { response, .. } => {
+                assert_eq!(response.code.as_deref(), Some("RULE_LIMIT"));
+            }
+            other => panic!("应当返回 ApiError，实际得到 {other:?}"),
+        }
+    }
+}
+
+dual_test! {
+    fn system_error_envelope_on_200_is_retried_like_a_500() {
+        // 同一个系统级失败，载体是 HTTP 500 还是 HTTP 200 + 信封，不该有不同处置 ——
+        // 官方对 SYSTEM_ERROR 的要求是「请用相同参数重新调用」。
+        let mock = Mock::start(vec![
+            MockResponse::json(200, r#"{"code":"SYSTEM_ERROR","message":"系统异常"}"#),
+            MockResponse::json(204, ""),
+        ]);
+        let wechat_pay = client_for(&mock.base_url).with_retry(fast_retry(3));
+
+        call!(wechat_pay.close_order("SYSTEM_ERROR_200")).expect("SYSTEM_ERROR 之后应当重试并成功");
+
+        assert_eq!(
+            mock.requests().len(),
+            2,
+            "错误码应当优先于状态码：HTTP 200 的 SYSTEM_ERROR 同样要重试"
+        );
+    }
 }

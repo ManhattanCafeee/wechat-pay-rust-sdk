@@ -108,10 +108,13 @@ impl WechatPay {
     /// # 重试
     ///
     /// **「能不能重试」由 `kind`（重放语义）与失败分类共同决定，策略只控制次数与退避**
-    /// —— 详见 [`crate::retry`]。核心是两条：
+    /// —— 详见 [`crate::retry`]。核心是这几条：
     ///
-    /// - 确定没送到（连接失败）或微信明确未受理（429 / 5xx / 202）→ 任何接口都可重试
-    /// - 结果未知（读写超时）→ **只有只读接口重试**；写接口交给调用方查单确认
+    /// - 确定没送到（连接失败）或微信明确未受理（429 / 500 / 502 / 503 / `SYSTEM_ERROR`）
+    ///   → 任何接口都可重试
+    /// - 202（已受理、尚未处理完）→ 任何接口都可重试，但它**不等于没发生**
+    /// - 结果未知（读写超时、官方未定义的 5xx）→ **只有只读接口重试**；
+    ///   写接口交给调用方查单确认
     ///
     /// 每次尝试都重新签名：重试可能跨过 5 分钟的签名有效窗口，复用旧签名会直接 401。
     #[maybe_async_attr]
@@ -142,10 +145,22 @@ impl WechatPay {
 
             let outcome = send_and_check(builder.headers(headers).body(body.to_owned())).await;
 
-            // 202 是「已受理但尚未处理」，官方要求「请使用原参数重复请求一遍」，
-            // 因此与 429 / 5xx 归为同一类：微信还没处理，可以安全重放。
+            // 2xx 也可能是失败：微信会以 HTTP 200 返回 `{"code","message","detail"}` 信封。
+            // 先把它归一到 `Err`，后面就与非 2xx 走**完全同一条**判定路径 ——
+            // 这样 `SYSTEM_ERROR`（与 HTTP 500 同源，官方要求「请用相同参数重新调用」）
+            // 也会被重试；顺带修掉 `request_no_content` 的旧毛病 ——
+            // 关单以前会把「HTTP 200 + 错误信封」当成成功（它根本不看响应体）。
+            let outcome = match outcome {
+                Ok((status, text)) if is_error_envelope(&text) => {
+                    Err(PayError::api_error(status, &text))
+                }
+                other => other,
+            };
+
             let delivery = match &outcome {
-                Ok((202, _)) => Some(Delivery::Rejected),
+                // 202 是「已受理但尚未处理」，官方要求「请使用原参数重复请求一遍」：
+                // 照样重试，但它**不等于没发生**（见 `Delivery::Accepted`）。
+                Ok((202, _)) => Some(Delivery::Accepted),
                 Ok(_) => None,
                 Err(err) => classify(err),
             };
@@ -154,8 +169,9 @@ impl WechatPay {
             };
 
             if !should_retry(delivery, kind) || attempt >= max_attempts {
-                // 重试用尽（或本就不该重试）。把 202 这类「2xx 但没处理」降级成错误返回，
-                // 否则下游会拿空 body 去解析，报出一个与真实原因毫无关系的 JSON 错误。
+                // 重试用尽（或本就不该重试）。到这里还可能是 `Ok` 的只剩 202 ——
+                // 它意味着「微信收了但没处理完」，必须降级成错误返回，
+                // 否则下游会拿空 body 去解析，报出一个与真实原因无关的 JSON 错误。
                 return match outcome {
                     Ok((status, text)) => Err(PayError::api_error(status, &text)),
                     Err(err) => Err(err),
@@ -174,8 +190,9 @@ impl WechatPay {
 
     /// `request` + JSON 解析。
     ///
-    /// 解析前先做一次错误信封检查：状态码是 2xx 但 body 是
-    /// `{"code": "..."}` 时，同样返回 [`PayError::ApiError`]。
+    /// 「2xx + 错误信封」在 [`WechatPay::request`] 里就已经归一成
+    /// [`PayError::ApiError`] 了（只有那样它才能参与重试判定），所以这里拿到的
+    /// 一定是真正的成功响应体。
     #[maybe_async_attr]
     async fn request_json<R: ResponseTrait>(
         &self,
@@ -184,11 +201,7 @@ impl WechatPay {
         body: &str,
         kind: RequestKind,
     ) -> Result<R, PayError> {
-        let (status, text) = self.request(method, url, body, kind).await?;
-        if is_error_envelope(&text) {
-            // status 会是 200：如实记录真实状态码，业务原因看 response.code
-            return Err(PayError::api_error(status, &text));
-        }
+        let (_, text) = self.request(method, url, body, kind).await?;
         Ok(serde_json::from_str::<R>(&text)?)
     }
 

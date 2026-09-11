@@ -128,7 +128,7 @@ Run everything from the repo root (tests use CWD-relative fixture paths).
 
 ```bash
 # 完整测试：tests/offline.rs 用本地 mock 服务替代微信网关，不需要凭证或公网
-cargo test                    # PASS — lib 10 passed / 14 ignored，offline 40 passed
+cargo test                    # PASS — lib 11 passed / 14 ignored，offline 43 passed
 cargo test --features async   # PASS — 同一套测试在 async 模式下再跑一遍
 
 # 两种 feature 模式都必须能编译（含测试目标）——这是防回归的关键两条
@@ -158,6 +158,8 @@ cargo test --lib -- --ignored
   其示例需要真实商户密钥与公网（还含 actix-web 片段与输出示例）。`[lib] doctest = false` 使普通
   `cargo test` 跳过它们，但**显式**传入 `--doc` 会强制编译 README 代码块并失败（20 个）。
   它不是本仓库受支持的命令；要改 README 示例请自行编译验证。
+  ⚠ 同一开关也关掉了**源码注释里的示例**（`src/retry.rs`、`src/error.rs`、`src/pay.rs` 都有），
+  它们同样不会被编译 —— 改这些示例时别以为编译器会兜住。
 
 `cargo check --no-default-features` 会失败，属**既有问题**（`src/error.rs` 无条件引用
 `reqwest::Error`，而 reqwest 是 optional 依赖），与本次改动无关。
@@ -224,8 +226,8 @@ match wechat_pay.query_order("ORDER_1") {
 
 | 归类 | 含义 | 处置 |
 | --- | --- | --- |
-| `Network` | 传输 / 连接层失败 | 可考虑重试；⚠ 下单接口不可无脑重试（会重复下单） |
-| `Api` | 微信业务拒绝（HTTP 非 2xx） | 不重试，按 `response.code` 分支。`ORDER_NOT_EXIST` 是**正常业务结果**而不是故障 |
+| `Network` | 传输 / 连接层失败 | 交给 `src/retry.rs` 分类：确定没送到（连接被拒 / 连接超时）会自动重试；⚠ 结果未知的（读写超时）**写接口不重试**，应先查单（`PayError::may_have_taken_effect`） |
+| `Api` | 微信业务拒绝（HTTP 非 2xx，或 2xx 的错误信封） | 交给 `src/retry.rs` 分类：429 / 500 / 502 / 503 / `SYSTEM_ERROR` 会自动重试；其余按 `response.code` 分支。`ORDER_NOT_EXIST` 是**正常业务结果**而不是故障 |
 | `Local` | 签名、解密、Base64、JSON 解析、验签失败、回调超窗 | 不重试，通常是配置或数据问题，应当告警 |
 
 `kind()` 用**穷尽匹配**，新增 `PayError` 变体时编译器会强制你在这里做出归类决定。
@@ -281,20 +283,19 @@ prepended (`https://api.mch.weixin.qq.com` by default, set in `WechatPay::new`).
 | `README.md` | Chinese usage guide; also the crate docs — its ```rust fences are **not** compiled (see `[lib] doctest = false`) |
 | `NOTICE` | Apache-2.0 attribution for upstream contributors |
 
-**测试用 mock：** `WechatPay` 字段全是 `pub`，因此可以把实例指向本地假网关 —— 这正是
-`tests/offline.rs` 的做法（`wechat_pay.base_url = "http://127.0.0.1:PORT"`）。
-⚠ 同一个特性也是安全脚枪：**生产代码绝不能让用户输入接触到 `base_url`**，否则你签好名的请求
-（含 openid、订单信息）会被送到第三方域名。
+**测试用 mock：** `tests/offline.rs` 用 `WechatPay::with_base_url` 把实例指向本地假网关
+（`client_for("http://127.0.0.1:PORT")`）。字段自 0.3.0 起**全部私有**，`with_base_url` 是
+唯一入口 —— 这个能力本身曾是安全脚枪：能改 `base_url` 就能把你签好名的请求（含 openid、
+订单信息）改送到第三方域名。⚠ 生产代码依然绝不能让用户输入接触到 `base_url`。
 
-Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused public API, and
-`WechatPay::with_base_url` is private + `#[allow(dead_code)]` (the `pub` field is the real lever).
+Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused public API.
 `get_weixin(h5_url, referer)` 对调用方传入的 URL 发 GET 且无白名单 —— 是 SSRF 面；`h5_url` 只能
 来自你自己的服务端或微信返回的 `h5_url`，绝不能来自用户输入。
 
 ## Runtime/Tooling Preferences
 
-- Plain **Cargo**, edition 2024, no MSRV pin and no toolchain file. `Cargo.lock` is gitignored
-  (library convention) — don't commit one, and don't report its absence as a problem.
+- Plain **Cargo**, edition 2024, MSRV **1.89**（见上方 `rust-version` 说明）, no toolchain file.
+  `Cargo.lock` is gitignored (library convention) — don't commit one, and don't report its absence as a problem.
 - Features are the only build knob and they change **public method signatures**, not just deps:
 
   | Build | Effect |
@@ -323,7 +324,7 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
 
 | 层 | 位置 | 内容 |
 | --- | --- | --- |
-| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写 HTTP 服务，支持 keep-alive 与连接计数）替代微信网关；40 个带断言的用例（含编译期 Send/Sync 断言） |
+| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写 HTTP 服务，支持 keep-alive 与连接计数）替代微信网关；43 个带断言的用例（含编译期 Send/Sync 断言） |
 | 纯逻辑单测 | `src/pay.rs`、`src/async_impl/pay.rs`、`src/retry.rs` | 签名/加解密助手等无外部依赖用例；`retry.rs` 覆盖退避曲线、抖动边界与可重试判定矩阵 |
 
 **`tests/offline.rs` 覆盖的契约（改这些行为必须同步改测试）：**
@@ -350,8 +351,16 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
 - **重试的安全边界（关键）**：写接口**超时不重试**、只读接口超时重试；「响应体没读完」这类
   **已处理**的失败，写和读都**不重试**（`is_decode()` 而非 `is_body()`）；连接被拒时连写接口也重试
 - **重试后的请求是新签的**：两次尝试的 `nonce_str` 必须不同（复用旧签名会跨过 5 分钟窗口后 401）
-- **`202 Accepted`**：会按官方要求重发；重试用尽时降级成带状态码 202 的 `ApiError`，而不是 JSON 解析错误
-- **退款策略独立**：退款退避是分钟级且与通用策略互不牵连（`with_refund_retry` 不改变 `retry_policy`）
+- **`202 Accepted`**：会按官方要求重发；重试用尽时降级成带状态码 202 的 `ApiError`，而不是 JSON 解析错误。
+  ⚠ 202 **不等于「没发生」**（请求已被接收、可能随后生效），`may_have_taken_effect()` 对它返回 `true`
+- **2xx + 错误信封**：`SYSTEM_ERROR` 信封与 HTTP 500 同源、会被重试；其余错误码立即返回 `Err`。
+  且关单（`request_no_content`）**不再**把「HTTP 200 + 错误信封」当成成功
+- **`may_have_taken_effect()`**：读写超时 / 响应体没读完 / 202 / 响应体解析失败返回 `true`；
+  连接失败、429 / 500 / 502 / 503、`SYSTEM_ERROR`、本地错误返回 `false`
+- **退款策略独立且真的被选中**：退款退避是分钟级、不加抖动，与通用策略互不牵连 ——
+  关掉通用策略后仍会出现第 2 次请求，证明 `refunds()` 走的是退款策略而不是通用策略
+- **超时类断言要先等捕获稳定**（`settled_captures`）：`black_hole_mock` 永不回响应，
+  客户端返回与 mock 读取线程之间没有同步点，直接断言请求次数会偶发失败
 
 **写新测试请用 `dual_test!`** —— 一份测试体在两种 feature 下各生成一个测试函数：
 
@@ -453,6 +462,9 @@ pub fn test_native_pay() { /* … sync … */ }
 - ~~版本号未体现破坏性变更~~ → `0.2.21` → `0.3.0`，并设 `publish = false`（fork 不发布到 crates.io）
 - ~~README 写死 crates.io 版本号安装~~ → 改为 git / path 引入（fork 未发布，写版本号会拿到上游代码）
 - ~~自动重试未实现~~ → `src/retry.rs`：按「失败时微信侧处于什么状态」分类，默认只重试**确定没送到**
-  （连接被拒/连接超时）与**官方明确未受理**（429/500/502/503/202）的失败；写接口超时不重试
-- ~~`202 Accepted` 被当成 2xx 成功~~ → 按官方「请使用原参数重复请求一遍」处理，不再报误导性的 JSON 错误
+  （连接被拒 / 连接超时）、**官方明确未受理**（429 / 500 / 502 / 503、`SYSTEM_ERROR`）与
+  **已受理但未处理完**（202）的失败；写接口超时不重试
+- ~~`202 Accepted` 被当成 2xx 成功~~ → 按官方「请使用原参数重复请求一遍」处理，不再报误导性的
+  JSON 错误；且它是「可能已生效」而不是「没发生」，避免调用方换个单号重开
+- ~~关单会把「HTTP 200 + 错误信封」当成成功~~ → 错误信封在传输层就归一成 `Err`，与非 2xx 走同一条判定
 - ~~超时后无法区分「确定没生效」与「结果未知」~~ → `PayError::may_have_taken_effect()`
