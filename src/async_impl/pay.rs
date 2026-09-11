@@ -15,22 +15,21 @@ use crate::response::JsapiResponse;
 use crate::response::MicroResponse;
 use crate::response::RefundsResponse;
 use crate::response::ResponseTrait;
-use crate::response::WeChatResponse;
 use crate::response::{CertificateResponse, NativeResponse, TransactionResponse};
 use reqwest::header::{HeaderMap, REFERER};
 use serde_json::{Map, Value};
 
 #[cfg(not(feature = "async"))]
-use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::blocking::RequestBuilder;
 #[cfg(feature = "async")]
-use reqwest::{Client, RequestBuilder};
+use reqwest::RequestBuilder;
 
 #[cfg(feature = "async")]
 use maybe_async::maybe_async as maybe_async_attr;
 #[cfg(not(feature = "async"))]
 use maybe_async::must_be_sync as maybe_async_attr;
 
-/// 发送请求并做 HTTP 状态检查，返回响应体文本。
+/// 发送请求并做 HTTP 状态检查，返回 `(状态码, 响应体文本)`。
 ///
 /// 微信支付在失败时返回**非 2xx 状态码** + `{"code","message","detail"}` 响应体。
 /// 必须先看状态码再看 body：若像 `.json::<R>()` 那样直接解析，错误响应体会被塞进
@@ -38,12 +37,10 @@ use maybe_async::must_be_sync as maybe_async_attr;
 /// `Ok(JsapiResponse { code: Some("PARAM_ERROR"), prepay_id: None })`，
 /// 调用方只能靠 `prepay_id` 为空去猜，且微信的错误码会全部丢失。
 ///
-/// ⚠ 本函数只覆盖**非 2xx**。若微信以 HTTP 200 返回错误信封，`pay()` / `get_pay()`
-/// 仍会把它解析进成功类型并返回 `Ok`（那些类型的字段全是 `Option`）。
-/// 因此调用方还必须检查业务字段：`prepay_id` / `code_url` / `h5_url` 是否为空、
-/// `code` 是否非空。只有 `refunds()` 通过 `WeChatResponse` 覆盖了 200 带错误码的情况。
+/// ⚠ 这里只处理**非 2xx**。「2xx + 错误信封」由 [`is_error_envelope`] 在
+/// [`WechatPay::request_json`] 里兜住 —— 两道检查缺一不可。
 #[maybe_async_attr]
-async fn send_and_check(builder: RequestBuilder) -> Result<String, PayError> {
+async fn send_and_check(builder: RequestBuilder) -> Result<(u16, String), PayError> {
     let response = builder.send().await?;
     let status = response.status();
     let text = response.text().await?;
@@ -51,11 +48,37 @@ async fn send_and_check(builder: RequestBuilder) -> Result<String, PayError> {
     if !status.is_success() {
         return Err(PayError::api_error(status.as_u16(), &text));
     }
-    Ok(text)
+    Ok((status.as_u16(), text))
+}
+
+/// 只取顶层 `code`，用于识别「状态码是 2xx、body 却是错误信封」。
+#[derive(serde::Deserialize)]
+struct EnvelopeProbe {
+    code: Option<serde_json::Value>,
+}
+
+/// 2xx 的响应体是否是微信的错误信封。
+///
+/// 微信会以 200 返回 `{"code": "...", "message": "..."}`，而成功响应类型字段全是
+/// `Option`，能把它照单全收 —— 于是失败**再一次**伪装成成功。这是单靠状态码检查
+/// 覆盖不到的那一半。
+///
+/// 判据：顶层出现**非空字符串** `code`。本 crate 解析的成功响应
+/// （`prepay_id` / `code_url` / `h5_url` / `data` / 交易对象）都不含顶层 `code`，
+/// 所以不会误伤。解析失败（非 JSON、数组等）一律视为不是信封。
+fn is_error_envelope(text: &str) -> bool {
+    match serde_json::from_str::<EnvelopeProbe>(text) {
+        Ok(probe) => probe
+            .code
+            .as_ref()
+            .and_then(|value| value.as_str())
+            .is_some_and(|code| !code.is_empty()),
+        Err(_) => false,
+    }
 }
 
 impl WechatPay {
-    /// 底层请求：签名 → 发送 → 状态检查，返回响应体文本。
+    /// 底层请求：签名 → 发送 → 状态检查，返回 `(状态码, 响应体文本)`。
     ///
     /// **不注入任何字段** —— `appid` / `mchid` / `notify_url` 的注入只发生在 `pay()` 里。
     /// 这是有意的：关单只需要 `mchid`、查单的 `mchid` 要放在 query string，
@@ -64,9 +87,15 @@ impl WechatPay {
     /// ⚠ 传入的 `url` 会**原样参与签名**，所以 GET 的查询串必须拼进 `url`
     /// （微信要求签名串第二行是 path + `?` + query）。
     #[maybe_async_attr]
-    async fn request(&self, method: HttpMethod, url: &str, body: &str) -> Result<String, PayError> {
+    async fn request(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        body: &str,
+    ) -> Result<(u16, String), PayError> {
         let headers = self.build_header(method.clone(), url, body)?;
-        let client = Client::new();
+        // 复用 `WechatPay` 持有的客户端：连接池跨请求共享，不必每次重新建连 / TLS 握手。
+        let client = &self.client;
         let full_url = format!("{}{}", self.base_url(), url);
         debug!("url: {} body: {}", full_url, body);
         let builder = match method {
@@ -81,6 +110,9 @@ impl WechatPay {
     }
 
     /// `request` + JSON 解析。
+    ///
+    /// 解析前先做一次错误信封检查：状态码是 2xx 但 body 是
+    /// `{"code": "..."}` 时，同样返回 [`PayError::ApiError`]。
     #[maybe_async_attr]
     async fn request_json<R: ResponseTrait>(
         &self,
@@ -88,7 +120,11 @@ impl WechatPay {
         url: &str,
         body: &str,
     ) -> Result<R, PayError> {
-        let text = self.request(method, url, body).await?;
+        let (status, text) = self.request(method, url, body).await?;
+        if is_error_envelope(&text) {
+            // status 会是 200：如实记录真实状态码，业务原因看 response.code
+            return Err(PayError::api_error(status, &text));
+        }
         Ok(serde_json::from_str::<R>(&text)?)
     }
 
@@ -183,7 +219,9 @@ impl WechatPay {
     where
         S: AsRef<str>,
     {
-        let client = Client::new();
+        // 同样复用共享客户端（目标是与微信 API 不同的主机，连接池不会命中，
+        // 但仍比每次新建客户端好；且自动继承统一的超时配置）。
+        let client = &self.client;
         let mut headers = HeaderMap::new();
         headers.insert(REFERER, referer.as_ref().parse().unwrap());
         let text = client
@@ -203,11 +241,13 @@ impl WechatPay {
             .ok_or_else(|| PayError::WeixinNotFound)
     }
 
+    /// 申请退款。
+    ///
+    /// 响应体与「查询退款」一致，因此返回 [`RefundsResponse`]。
+    /// 退款是异步的：受理成功不等于退款成功，需用 [`WechatPay::query_refund`] 轮询
+    /// `status` 直到离开 `PROCESSING`。
     #[maybe_async_attr]
-    pub async fn refunds(
-        &self,
-        params: RefundsParams,
-    ) -> Result<WeChatResponse<RefundsResponse>, PayError> {
+    pub async fn refunds(&self, params: RefundsParams) -> Result<RefundsResponse, PayError> {
         let url = "/v3/refund/domestic/refunds";
         let body = params.to_json();
         self.request_json(HttpMethod::POST, url, &body).await
@@ -264,12 +304,19 @@ impl WechatPay {
 mod tests {
     use dotenvy::dotenv;
     use crate::error::PayError;
-    use crate::model::{
-        AppParams, H5Params, H5SceneInfo, JsapiParams, MicroParams, NativeParams, RefundsParams,
-    };
-    use crate::pay::{PayNotifyTrait, WechatPay};
+    // 以下导入只被 `#[cfg(not(feature = "async"))]` 的测试使用，
+    // 不加 cfg 会在 async 模式下产生 unused_imports 告警。
+    #[cfg(not(feature = "async"))]
+    use crate::model::{AppParams, H5Params, H5SceneInfo, JsapiParams, MicroParams};
+    use crate::model::{NativeParams, RefundsParams};
+    #[cfg(not(feature = "async"))]
+    use crate::pay::PayNotifyTrait;
+    use crate::pay::WechatPay;
+    #[cfg(not(feature = "async"))]
     use crate::response::Certificate;
+    #[cfg(not(feature = "async"))]
     use crate::util;
+    #[cfg(not(feature = "async"))]
     use std::io::Write;
     use tracing::debug;
 
@@ -405,8 +452,11 @@ mod tests {
         let req = RefundsParams::new("123456", 1, 1, None, Some("123456"));
 
         match wechat_pay.refunds(req) {
-            Ok(body) if body.is_success() => debug!("refunds success: {:?}", body.ok()),
-            Ok(body) => debug!("refunds rejected: {:?}", body.err()),
+            // 受理成功 ≠ 退款成功，需再用 query_refund 轮询 status 到终态
+            Ok(body) => debug!(
+                "refunds status: {} refund_id: {}",
+                body.status, body.refund_id
+            ),
             Err(PayError::ApiError { status, response }) => {
                 debug!("refunds failed: http {status}, {response}");
             }
@@ -459,8 +509,10 @@ mod tests {
         let req = RefundsParams::new("123456", 1, 1, None, Some("123456"));
 
         match wechat_pay.refunds(req).await {
-            Ok(body) if body.is_success() => debug!("refunds success: {:?}", body.ok()),
-            Ok(body) => debug!("refunds rejected: {:?}", body.err()),
+            Ok(body) => debug!(
+                "refunds status: {} refund_id: {}",
+                body.status, body.refund_id
+            ),
             Err(PayError::ApiError { status, response }) => {
                 debug!("refunds failed: http {status}, {response}");
             }
@@ -479,8 +531,11 @@ mod tests {
         let req = RefundsParams::new("123456", 1, 1, None, Some("123456"));
 
         match wechat_pay.refunds(req) {
-            Ok(body) if body.is_success() => debug!("refunds success: {:?}", body.ok()),
-            Ok(body) => debug!("refunds rejected: {:?}", body.err()),
+            // 受理成功 ≠ 退款成功，需再用 query_refund 轮询 status 到终态
+            Ok(body) => debug!(
+                "refunds status: {} refund_id: {}",
+                body.status, body.refund_id
+            ),
             Err(PayError::ApiError { status, response }) => {
                 debug!("refunds failed: http {status}, {response}");
             }

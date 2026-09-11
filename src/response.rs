@@ -95,43 +95,6 @@ pub struct CertificateResponse {
 impl ResponseTrait for CertificateResponse {}
 
 #[derive(Deserialize, Debug)]
-#[serde(untagged, bound = "T: ResponseTrait + DeserializeOwned")]
-pub enum WeChatResponse<T>
-where
-    T: ResponseTrait + DeserializeOwned,
-{
-    Ok(T),
-    Err(ErrorResponse),
-}
-
-impl<T> ResponseTrait for WeChatResponse<T> where T: ResponseTrait + DeserializeOwned {}
-
-impl<T> WeChatResponse<T>
-where
-    T: ResponseTrait + DeserializeOwned,
-{
-    pub fn is_success(&self) -> bool {
-        matches!(self, WeChatResponse::Ok(_))
-    }
-
-    pub fn ok(&self) -> Option<&T> {
-        if let WeChatResponse::Ok(response) = self {
-            Some(response)
-        } else {
-            None
-        }
-    }
-
-    pub fn err(&self) -> Option<&ErrorResponse> {
-        if let WeChatResponse::Err(error_response) = self {
-            Some(error_response)
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Deserialize, Debug)]
 pub struct ErrorResponse {
     /// 【错误码】 错误码
     pub code: Option<String>,

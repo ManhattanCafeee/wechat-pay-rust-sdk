@@ -42,24 +42,36 @@ caller ──▶ WechatPay::pay::<P: ParamsTrait, R: ResponseTrait>(method, url,
              ▼
         WechatPay::request(method, url, body)          # ⚠ 不注入任何字段
              │  build_header(method, url, body)        # RSA-SHA256 sign → Authorization header
-             │  Client::new().{get,post,…}(base_url + url).body(body).send()
+             │  self.client.{get,post,…}(base_url + url).body(body).send()
              ▼
         send_and_check(builder)   # 先取 status + text
              ├── 非 2xx → Err(PayError::ApiError { status, response })
-             └── 2xx    → 文本交给 request_json / request_no_content 处理
+             └── 2xx    → (status, text) 交给 request_json / request_no_content
+                            └── request_json 再查一次「2xx + 错误信封」
 ```
 
-三个层次（都在 `src/async_impl/pay.rs`）：
+三层请求结构（都在 `src/async_impl/pay.rs`）：
 
 | 方法 | 职责 |
 | --- | --- |
-| `send_and_check` | 收 builder，做状态检查，返回响应体文本 |
+| `send_and_check` | 收 builder，检查状态码，返回 `(状态码, 响应体文本)` |
 | `request` / `request_json` / `request_no_content` | 签名 + 发送；**不注入字段** |
 | `pay` / `get_pay` / `refunds` / `query_order` / `close_order` / `query_refund` | 各端点 |
 
-⚠ **状态码必须先于 body 处理。** 微信失败时返回非 2xx + `{"code","message","detail"}`。若直接
-`.json::<R>()`，错误体就会被解析进字段全为 `Option` 的成功类型（如 `JsapiResponse`），
-下单失败会伪装成 `Ok(JsapiResponse { code: Some("PARAM_ERROR"), prepay_id: None })`。
+⚠ **失败有两条伪装路径，两道检查缺一不可。**
+
+1. **非 2xx + 错误体**（多数情况）：若直接 `.json::<R>()`，错误体会被解析进字段全为 `Option`
+   的成功类型，下单失败伪装成 `Ok(JsapiResponse { code: Some("PARAM_ERROR"), prepay_id: None })`。
+   由 `send_and_check` 的状态码检查挡住。
+2. **2xx + 错误信封**（微信偶尔为之）：状态码是 200，但 body 是 `{"code","message","detail"}`。
+   成功类型的 `Option` 字段同样照单全收。由 `is_error_envelope` 在 `request_json` 里挡住 ——
+   判据是**顶层出现非空字符串 `code`**；本 crate 解析的成功响应都不含顶层 `code`，
+   `code: null` / `code: ""` 也不算信封（有专门的反向测试）。
+
+**HTTP 客户端由 `WechatPay` 持有并复用**（连接池跨请求共享），不要退回 `Client::new()` 每请求新建。
+超时由 `HttpTimeouts` 配置，默认 connect 5s / request 10s / pool idle 90s，用
+`with_timeouts` 覆盖。⚠ **超时不代表操作没发生**：请求可能已被微信受理，支付类接口超时后
+必须用 `query_order` 确认状态，不能直接重试下单。
 
 ⚠ **`request()` 有意不注入 `appid`/`mchid`/`notify_url`** —— 关单的请求体只需要 `mchid`、
 查单的 `mchid` 要放在 query string，无脑注入这三个字段会让这些端点直接失败。注入只发生在
@@ -85,12 +97,12 @@ Crypto is centralized in `src/pay.rs` traits:
 ## Key Directories
 
 ```
-src/pay.rs            WechatPay struct + config, both traits, from_env(), build_header(), sync tests
+src/pay.rs            WechatPay（含复用的 Client 与 HttpTimeouts）、两个 trait、from_env()、build_header()
 src/async_impl/       ⚠ name is misleading — this is the ONLY HTTP layer and serves sync + async
   pay.rs              send_and_check → request* → 各端点（pay / *_pay / refunds / query_order / close_order / query_refund / certificates / get_weixin）
   mod.rs              `pub mod pay;` (not feature-gated, always compiled)
 src/model.rs          request params + notify models (Serialize); ParamsTrait
-src/response.rs       response types (Deserialize); ResponseTrait, WeChatResponse<T>, TransactionResponse
+src/response.rs       response types (Deserialize); ResponseTrait, TransactionResponse, ErrorResponse
 src/cert.rs           PlatformKeys：serial_no → 公钥 PEM 索引 + fetch_platform_keys（平台证书轮换）
 src/notify.rs         NotifyHeaders + verify_notify：时间戳新鲜度 → 按 serial 选键 → 验签（防重放）
 src/sign.rs           sha256_sign — RSA PKCS#1 v1.5 + SHA-256, base64 STANDARD
@@ -111,7 +123,7 @@ Run everything from the repo root (tests use CWD-relative fixture paths).
 
 ```bash
 # 完整测试：tests/offline.rs 用本地 mock 服务替代微信网关，不需要凭证或公网
-cargo test                    # PASS — lib 2 passed / 14 ignored，offline 21 passed
+cargo test                    # PASS — lib 2 passed / 14 ignored，offline 25 passed
 cargo test --features async   # PASS — 同一套测试在 async 模式下再跑一遍
 
 # 两种 feature 模式都必须能编译（含测试目标）——这是防回归的关键两条
@@ -177,23 +189,26 @@ Match this style for new model fields; write code identifiers in English.
 functions are spelled `Result<T, PayError>`. Convert with `?` or `.map_err(...)`; don't `unwrap()` in
 library code.
 
-**API-error contract:** every HTTP path returns `Err(PayError::ApiError)` on non-2xx, with WeChat's
-error body preserved. Branch on `response.code` rather than guessing from empty fields:
+**API-error contract:** 所有 HTTP 路径在**非 2xx** 或 **2xx + 错误信封**时都返回
+`Err(PayError::ApiError)`，并保留微信的错误体。按 `response.code` 分支，而不是从空字段去猜：
 
 ```rust
-match wechat_pay.jsapi_pay(params) {
+match wechat_pay.query_order("ORDER_1") {
     Err(PayError::ApiError { status, response }) => {
-        // status: u16；response.code / response.message / response.detail 均为 Option
-        // detail 是微信的字段级定位信息（serde_json::Value），原样保留
+        // status: u16（错误信封情况下是 200）；response.code / message / detail 均为 Option
+        if response.code.as_deref() == Some("ORDER_NOT_EXIST") {
+            // 正常业务结果，不是故障
+        }
     }
-    Err(other) => { /* 网络/序列化/本地错误 */ }
-    Ok(response) => { /* … */ }
+    Err(other) => { /* 网络 / 序列化 / 本地错误，见 other.kind() */ }
+    Ok(order) => { /* … */ }
 }
 ```
 
-`WeChatResponse<T>`（`refunds()` 的返回类型）保留 `is_success()` / `ok()` / `err()`：非 2xx 现在
-先变成 `Err`，该类型留给「200 但 body 里带错误码」的边界情况。非 JSON 响应体（例如网关返回
-HTML）会被原样放进 `response.message`，不丢线索。
+`refunds()` 返回 `Result<RefundsResponse, PayError>`（与 `query_refund` 同一个类型）。
+原来的 `WeChatResponse<T>` 已删除 —— 它的 `Err` 变体在新契约下永不可达，留着只会让人误以为
+还需要手工检查 `is_success()`。非 JSON 响应体（例如网关返回 HTML）会被原样放进
+`response.message`（超长则截断），不丢线索。
 
 `src/sign.rs` 与 `from_env()` 仍会 `expect()`/panic —— 属既有债务，不要照抄。
 
@@ -300,7 +315,7 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
 
 | 层 | 位置 | 内容 |
 | --- | --- | --- |
-| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写单请求 HTTP 服务）替代微信网关；21 个带断言的用例（含编译期 Send/Sync 断言） |
+| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写 HTTP 服务，支持 keep-alive 与连接计数）替代微信网关；25 个带断言的用例（含编译期 Send/Sync 断言） |
 | 纯逻辑单测 | `src/pay.rs`、`src/async_impl/pay.rs` | `test_uuid_v4`、`test_str` 两个无外部依赖用例 |
 
 **`tests/offline.rs` 覆盖的契约（改这些行为必须同步改测试）：**
@@ -316,6 +331,9 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
 - 回调验签：合法通过 / 篡改 body 失败 / 非法签名失败
 - **平台证书轮换**：轮换期两张证书都进索引；按 `Wechatpay-Serial` 选键；未知 serial 报 `UnknownPlatformSerial`
 - **防重放**：±300s 时间窗（含边界）、非法时间戳拒绝
+- **错误信封**：2xx + `{"code":…}` → `Err`；且成功响应不被误判（含 `code: null` / `code: ""` 两种负例）
+- **连接复用**：同一客户端两次请求只占 1 条 TCP 连接；独立客户端占 2 条（后者同时证明计数不是恒为 1）
+- **超时**：只接受连接不回响应的服务端会触发超时（`reqwest::Error::is_timeout()`）而不是挂死
 
 **写新测试请用 `dual_test!`** —— 一份测试体在两种 feature 下各生成一个测试函数：
 
@@ -378,22 +396,22 @@ pub fn test_native_pay() { /* … sync … */ }
 
 来自一次代码 / 依赖 / 许可证审计，按优先级排列：
 
-1. **连接未复用** —— 每次请求都 `Client::new()`，无超时、无连接池。建议持有 `Client` 并设置超时；
-   ⚠ 下单接口不可无脑重试（会重复下单），只对幂等的 GET 查单重试。
-2. **生产环境不要开 `debug-print`** —— 会记录 Authorization 头（含签名与 serial_no）、完整请求体
+1. **生产环境不要开 `debug-print`** —— 会记录 Authorization 头（含签名与 serial_no）、完整请求体
    （openid、订单号、金额）以及被签名的原文。不含私钥，但属敏感数据。
-3. **幂等未内建** —— `notify::verify_notify` 只解决「是不是微信发的、是不是刚发的」，
+2. **幂等未内建** —— `notify::verify_notify` 只解决「是不是微信发的、是不是刚发的」，
    按 `out_trade_no` / `transaction_id` 落库去重仍需业务侧实现（微信最多重试 15 次）。
-4. **账单下载未实现** —— 对账用的交易账单接口还没封装。
-5. **`get_weixin` 是 SSRF 面** —— 对调用方传入的 URL 发 GET 且无白名单；`h5_url` 绝不能来自用户输入。
-6. **`cargo check --no-default-features` 失败** —— 既有问题：`src/error.rs` 无条件引用
+3. **账单下载未实现** —— 对账用的交易账单接口还没封装。
+4. **`get_weixin` 是 SSRF 面** —— 对调用方传入的 URL 发 GET 且无白名单；`h5_url` 绝不能来自用户输入。
+5. **`cargo check --no-default-features` 失败** —— 既有问题：`src/error.rs` 无条件引用
    `reqwest::Error`，而 reqwest 是 optional 依赖。
-7. **仓库尚未整体 rustfmt 化** —— 见 Development Commands。
-8. **`.json()` → `from_str` 的解码差异** —— 非法 UTF-8 的 2xx 响应体现在会被有损替换为 U+FFFD
+6. **仓库尚未整体 rustfmt 化** —— 见 Development Commands。
+7. **`.json()` → `from_str` 的解码差异** —— 非法 UTF-8 的 2xx 响应体现在会被有损替换为 U+FFFD
    后解析成功，而不是报错（微信返回的 JSON 始终是合法 UTF-8，实际无影响）。
-9. **版本号未体现破坏性变更** —— `refunds()` 语义变更（非 2xx 现在返回 `Err`）、`WechatPay`
-   字段私有化、`PayError` 新增变体，按 semver 都应把 `Cargo.toml` 的 `0.2.21` 提到 **`0.3.0`**。
-   是否 bump / 何时发布由维护者决定，本次未动。
+8. **自动重试未实现** —— 超时/连接失败的重试策略留给调用方：⚠ 下单类接口**不可**无脑重试
+   （会重复下单），只对幂等的 GET 查单重试；超时后应先用 `query_order` 确认状态。
+9. **版本号未体现破坏性变更** —— 破坏性变更已累积：`refunds()` 返回类型与语义变更、`WeChatResponse`
+   被删除、`WechatPay` 字段私有化、`PayError` 新增变体。按 semver 应把 `Cargo.toml` 的
+   `0.2.21` 提到 **`0.3.0`**。是否 bump / 何时发布由维护者决定，本次未动。
 10. **crate name 与上游冲突** —— `name = "wechat-pay-rust-sdk"` 在 crates.io 已被上游占用。
     仅当要发布到 crates.io 时才需要改名（改名会牵动 `example/Cargo.toml` 的依赖声明）；
     作为 path / git 依赖使用则无需改动。
@@ -410,3 +428,5 @@ pub fn test_native_pay() { /* … sync … */ }
 - ~~许可证元数据与 LICENSE 文件不一致~~ → 统一 Apache-2.0 + `NOTICE`
 - ~~22 处冗余 `unsafe impl Send/Sync`~~ → 全部删除 + `#![forbid(unsafe_code)]` + 编译期 Send/Sync 断言
 - ~~`PayError` 只有一个大枚举，无法区分处置策略~~ → `PayError::kind()` 分三层（Network / Api / Local）
+- ~~每次请求 `Client::new()`，无超时、无连接池~~ → `WechatPay` 持有复用客户端 + `HttpTimeouts`（默认 5s / 10s / 90s）
+- ~~HTTP 200 + 错误信封仍返回 `Ok`~~ → `is_error_envelope` 在 `request_json` 兜住；删除已无意义的 `WeChatResponse`

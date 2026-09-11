@@ -11,8 +11,10 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use wechat_pay_rust_sdk::cert::{PlatformKeys, REFRESH_INTERVAL_SECS};
 use wechat_pay_rust_sdk::error::{ErrorKind, PayError};
@@ -21,7 +23,9 @@ use wechat_pay_rust_sdk::model::{
     RefundsParams, SceneInfo, SettleInfo,
 };
 use wechat_pay_rust_sdk::notify::NotifyHeaders;
-use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
+use wechat_pay_rust_sdk::pay::{
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, HttpTimeouts, PayNotifyTrait, WechatPay,
+};
 use wechat_pay_rust_sdk::request::HttpMethod;
 use wechat_pay_rust_sdk::util;
 
@@ -137,48 +141,122 @@ impl MockResponse {
 struct Mock {
     base_url: String,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    /// 已接受的 TCP 连接数。客户端复用连接时它不会增长。
+    connections: Arc<AtomicUsize>,
 }
 
 impl Mock {
     /// 启动 mock 服务；`responses` 按请求先后顺序依次返回。
+    ///
+    /// 支持 keep-alive：一条连接上可以连续跑多个请求，用于验证客户端是否复用连接。
     fn start(responses: Vec<MockResponse>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let addr = listener.local_addr().expect("local_addr");
-        let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
-
-        let captured_bg = Arc::clone(&captured);
-        thread::spawn(move || {
-            // 测试进程结束即终止；每个连接处理一个请求后主动关闭。
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => handle_connection(&stream, &captured_bg, &responses),
-                    Err(_) => break,
-                }
-            }
-        });
-
+        let (base_url, captured, connections) = spawn_mock(responses);
         Self {
-            base_url: format!("http://{addr}"),
+            base_url,
             captured,
+            connections,
         }
     }
 
     fn requests(&self) -> Vec<CapturedRequest> {
         self.captured.lock().expect("lock captured").clone()
     }
+
+    /// 已接受的连接数。
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
 }
 
+/// 启动 mock 的公共部分，返回 `(base_url, 已捕获请求, 连接计数)`。
+fn spawn_mock(
+    responses: Vec<MockResponse>,
+) -> (String, Arc<Mutex<Vec<CapturedRequest>>>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let addr = listener.local_addr().expect("local_addr");
+    let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let connections = Arc::new(AtomicUsize::new(0));
+    let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+
+    let captured_bg = Arc::clone(&captured);
+    let connections_bg = Arc::clone(&connections);
+    thread::spawn(move || {
+        // 测试进程结束即终止。
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            connections_bg.fetch_add(1, Ordering::SeqCst);
+            let captured = Arc::clone(&captured_bg);
+            let responses = Arc::clone(&responses);
+            // 每条连接一个线程：这样一条连接上可以连续处理多个请求（keep-alive）。
+            thread::spawn(move || handle_connection(stream, &captured, &responses));
+        }
+    });
+
+    (format!("http://{addr}"), captured, connections)
+}
+
+/// 启动一个「只接受连接、不回任何响应」的 mock，用于验证超时。
+///
+/// 连接被持有不关闭，客户端只能等到自己的超时。
+fn hanging_mock_base_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging mock");
+    let addr = listener.local_addr().expect("local_addr");
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            held.push(stream); // 持有连接，不写任何字节
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// 在一条连接上循环处理请求（keep-alive），直到对端关闭。
 fn handle_connection(
-    stream: &TcpStream,
+    stream: TcpStream,
     captured: &Arc<Mutex<Vec<CapturedRequest>>>,
     responses: &Arc<Mutex<VecDeque<MockResponse>>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut writer = stream;
 
+    while let Some(request) = read_request(&mut reader) {
+        captured.lock().expect("lock captured").push(request);
+
+        let response = responses
+            .lock()
+            .expect("lock responses")
+            .pop_front()
+            .unwrap_or(MockResponse::json(500, "{}"));
+
+        let reason = match response.status {
+            200 => "OK",
+            204 => "No Content",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            _ => "Error",
+        };
+        // 刻意不发 `Connection: close`：客户端会把连接放回池里复用，
+        // 这正是 connections() 计数能验证的东西。
+        let out = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            response.status,
+            reason,
+            response.body.len(),
+            response.body
+        );
+        if writer.write_all(out.as_bytes()).is_err() || writer.flush().is_err() {
+            return;
+        }
+    }
+}
+
+/// 读一个完整的 HTTP 请求；对端关闭或读到空行时返回 `None`。
+fn read_request(reader: &mut BufReader<TcpStream>) -> Option<CapturedRequest> {
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
-        return;
+    if reader.read_line(&mut request_line).ok()? == 0 || request_line.trim().is_empty() {
+        return None;
     }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
@@ -206,44 +284,16 @@ fn handle_connection(
     }
 
     let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        let _ = reader.read_exact(&mut body);
+    if content_length > 0 && reader.read_exact(&mut body).is_err() {
+        return None;
     }
 
-    captured
-        .lock()
-        .expect("lock captured")
-        .push(CapturedRequest {
-            method,
-            path,
-            headers,
-            body: String::from_utf8_lossy(&body).to_string(),
-        });
-
-    let response = responses
-        .lock()
-        .expect("lock responses")
-        .pop_front()
-        .unwrap_or(MockResponse::json(500, "{}"));
-
-    let reason = match response.status {
-        200 => "OK",
-        204 => "No Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        _ => "Error",
-    };
-    let out = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        response.status,
-        reason,
-        response.body.len(),
-        response.body
-    );
-    let mut stream = stream;
-    let _ = stream.write_all(out.as_bytes());
-    let _ = stream.flush();
+    Some(CapturedRequest {
+        method,
+        path,
+        headers,
+        body: String::from_utf8_lossy(&body).to_string(),
+    })
 }
 
 /// 构造一个指向本地 mock 服务的客户端。
@@ -973,6 +1023,134 @@ fn public_types_are_send_and_sync() {
     assert_send_sync::<SettleInfo>();
     assert_send_sync::<NativeParams>();
     assert_send_sync::<JsapiParams>();
+}
+
+dual_test! {
+    fn error_envelope_with_200_status_is_err() {
+        // 微信偶尔会以 HTTP 200 返回错误信封。成功响应类型字段全是 Option，
+        // 能把它照单全收 —— 单靠状态码检查覆盖不到这一半。
+        let mock = Mock::start(vec![MockResponse::json(
+            200,
+            r#"{"code":"PARAM_ERROR","message":"参数错误","detail":{"field":"/payer/openid"}}"#,
+        )]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let result = call!(wechat_pay.jsapi_pay(JsapiParams::new(
+            "测试商品",
+            "ORDER_E1",
+            1.into(),
+            "openid".into(),
+        )));
+
+        match result {
+            Err(PayError::ApiError { status, response }) => {
+                // status 如实记录真实状态码（200），业务原因看 response.code
+                assert_eq!(status, 200);
+                assert_eq!(response.code.as_deref(), Some("PARAM_ERROR"));
+                assert_eq!(
+                    response.detail.as_ref().expect("detail")["field"],
+                    "/payer/openid"
+                );
+            }
+            other => panic!("200 + 错误信封必须返回 Err，实际得到 {other:?}"),
+        }
+    }
+}
+
+dual_test! {
+    fn success_bodies_are_not_mistaken_for_error_envelopes() {
+        // 反向断言：正常成功响应不能被误判。顺带覆盖最容易误伤的一种写法 ——
+        // 顶层出现 `code` 键但值为 null（不作为信封）。
+        let mock = Mock::start(vec![
+            MockResponse::json(200, r#"{"prepay_id":"wx_envelope_ok"}"#),
+            MockResponse::json(200, r#"{"data":[]}"#),
+            MockResponse::json(
+                200,
+                r#"{"appid":"wx_test_appid","mchid":"1900000001","out_trade_no":"O","trade_state":"NOTPAY","trade_state_desc":"未支付","code":null}"#,
+            ),
+            MockResponse::json(200, r#"{"code":"","message":""}"#),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let jsapi = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect("正常下单响应不应被当成错误");
+        assert_eq!(jsapi.prepay_id.as_deref(), Some("wx_envelope_ok"));
+
+        let certs = call!(wechat_pay.certificates()).expect("证书响应不应被当成错误");
+        assert_eq!(certs.data.map(|list| list.len()), Some(0));
+
+        let order = call!(wechat_pay.query_order("O")).expect("查单响应不应被当成错误");
+        assert_eq!(order.trade_state, "NOTPAY");
+
+        // code 为空串同样不算信封（微信不会这么返回，但不能因此误判）
+        call!(wechat_pay.jsapi_pay(JsapiParams::new("b", "O2", 1.into(), "o".into())))
+            .expect("空字符串 code 不应被当成错误信封");
+
+        assert_eq!(mock.requests().len(), 4);
+    }
+}
+
+dual_test! {
+    fn request_times_out_instead_of_hanging() {
+        let base_url = hanging_mock_base_url();
+        let wechat_pay = client_for(&base_url).with_timeouts(HttpTimeouts {
+            request: Duration::from_millis(400),
+            ..HttpTimeouts::default()
+        });
+
+        let started = Instant::now();
+        let err = call!(wechat_pay.jsapi_pay(JsapiParams::new(
+            "测试商品",
+            "ORDER_TIMEOUT",
+            1.into(),
+            "openid".into(),
+        )))
+        .expect_err("服务端不响应必须触发超时，而不是无限等待");
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.kind(), ErrorKind::Network, "超时应归为网络层: {err}");
+        match &err {
+            PayError::RequestError(e) => assert!(e.is_timeout(), "应为超时错误: {e}"),
+            other => panic!("应为 RequestError，实际 {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "应在超时后尽快返回，实际耗时 {elapsed:?}"
+        );
+
+        // 默认配置本身就带超时（不是无限等待）
+        let defaults = WechatPay::new("a", "b", "c", "d", "e", "f").timeouts();
+        assert_eq!(defaults.request, DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(defaults.connect, DEFAULT_CONNECT_TIMEOUT);
+    }
+}
+
+dual_test! {
+    fn client_reuses_connections_across_requests() {
+        let mock = Mock::start(vec![
+            MockResponse::json(200, r#"{"prepay_id":"wx_1"}"#),
+            MockResponse::json(200, r#"{"prepay_id":"wx_2"}"#),
+            MockResponse::json(200, r#"{"prepay_id":"wx_3"}"#),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        // 同一客户端连续两次请求：连接池应复用同一条 TCP 连接
+        call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O1", 1.into(), "o".into()))).unwrap();
+        call!(wechat_pay.jsapi_pay(JsapiParams::new("b", "O2", 1.into(), "o".into()))).unwrap();
+
+        assert_eq!(mock.requests().len(), 2);
+        assert_eq!(
+            mock.connections(),
+            1,
+            "同一客户端应复用连接（连接池），而不是每次重新建连"
+        );
+
+        // 反证：另一个客户端有独立连接池，必然新开一条连接。
+        // 这条同时证明 connections() 计数不是恒为 1（否则上面的断言没有意义）。
+        let other = client_for(&mock.base_url);
+        call!(other.jsapi_pay(JsapiParams::new("c", "O3", 1.into(), "o".into()))).unwrap();
+        assert_eq!(mock.connections(), 2, "独立客户端应使用独立连接池");
+    }
 }
 
 dual_test! {

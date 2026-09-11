@@ -359,10 +359,9 @@ async fn pay_notify(bytes: Bytes, req: HttpRequest) -> impl Responder {
     let wechat_pay = WechatPay::from_env();
     let req = RefundsParams::new("123456", 1, 1, None, Some("123456"));
     match wechat_pay.refunds(req).await {
-        Ok(body) if body.is_success() => debug!("refunds success: {:?}", body.ok()),
-        // HTTP 200 但 body 里带错误码（少见；WeChatResponse 为此保留）
-        Ok(body) => debug!("refunds rejected: {:?}", body.err()),
-        // 非 2xx：微信的业务错误，code / message / detail 都在这里
+        // 受理成功 ≠ 退款成功，需再用 query_refund 轮询 status 到终态
+        Ok(body) => debug!("refunds status: {} refund_id: {}", body.status, body.refund_id),
+        // 微信的业务错误：非 2xx 与「200 但 body 是错误信封」都会走到这里
         Err(PayError::ApiError { status, response }) => debug!(
             "refunds failed: http {status}, code={:?}, message={:?}, detail={:?}",
             response.code, response.message, response.detail

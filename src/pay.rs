@@ -6,7 +6,57 @@ use crate::{debug, sign, util};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use std::time::Duration;
 use uuid::Uuid;
+
+#[cfg(not(feature = "async"))]
+use reqwest::blocking::Client;
+#[cfg(feature = "async")]
+use reqwest::Client;
+
+/// 默认连接超时：5 秒。
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 默认整请求超时：10 秒。
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// 默认连接池空闲连接保留时长：90 秒。
+pub const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// HTTP 客户端超时配置。
+///
+/// 用 [`WechatPay::with_timeouts`] 覆盖，配合 struct update 语法只改想改的那项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpTimeouts {
+    /// TCP / TLS 建连超时。
+    pub connect: Duration,
+    /// 整个请求的超时 —— 从开始建连到响应体读完。
+    pub request: Duration,
+    /// 连接池里空闲连接的保留时长，决定连接能复用多久。
+    pub pool_idle: Duration,
+}
+
+impl Default for HttpTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: DEFAULT_CONNECT_TIMEOUT,
+            request: DEFAULT_REQUEST_TIMEOUT,
+            pool_idle: DEFAULT_POOL_IDLE_TIMEOUT,
+        }
+    }
+}
+
+/// 构建带超时的 HTTP 客户端。
+///
+/// ⚠ 超时**不代表操作没有发生**：请求很可能已在微信侧受理，只是响应没回来。
+/// 支付类接口超时后必须用 [`WechatPay::query_order`] 确认最终状态，
+/// **不能**直接重试下单（会重复下单）。
+fn build_client(timeouts: HttpTimeouts) -> Client {
+    Client::builder()
+        .connect_timeout(timeouts.connect)
+        .timeout(timeouts.request)
+        .pool_idle_timeout(timeouts.pool_idle)
+        .build()
+        .expect("构建 HTTP 客户端失败（TLS 后端初始化失败）")
+}
 
 /// 微信支付客户端。
 ///
@@ -21,6 +71,10 @@ pub struct WechatPay {
     pub(crate) v3_key: String,
     pub(crate) notify_url: String,
     pub(crate) base_url: String,
+    /// 复用的 HTTP 客户端：连接池跨请求共享，避免每次请求重新建连 + TLS 握手。
+    pub(crate) client: Client,
+    /// 当前超时配置。改它需要连同重建 client，见 [`WechatPay::with_timeouts`]。
+    pub(crate) timeouts: HttpTimeouts,
 }
 
 // `Debug` 手写而非 derive：derive 会把 `private_key` / `v3_key` 原样打进日志。
@@ -34,6 +88,7 @@ impl std::fmt::Debug for WechatPay {
             .field("v3_key", &"<redacted>")
             .field("notify_url", &self.notify_url)
             .field("base_url", &self.base_url)
+            .field("timeouts", &self.timeouts)
             .finish()
     }
 }
@@ -181,6 +236,32 @@ impl WechatPay {
         self
     }
 
+    /// 覆盖 HTTP 超时配置（阈值见 [`HttpTimeouts`] 的默认值）。
+    ///
+    /// 会重建 HTTP 客户端，因此请在启动阶段调用，不要在每请求路径上调用。
+    ///
+    /// 只改其中一项：
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # use wechat_pay_rust_sdk::pay::{HttpTimeouts, WechatPay};
+    /// # let wechat_pay = WechatPay::new("a", "b", "c", "d", "e", "f");
+    /// let wechat_pay = wechat_pay.with_timeouts(HttpTimeouts {
+    ///     request: Duration::from_secs(30),
+    ///     ..HttpTimeouts::default()
+    /// });
+    /// ```
+    pub fn with_timeouts(mut self, timeouts: HttpTimeouts) -> Self {
+        self.client = build_client(timeouts);
+        self.timeouts = timeouts;
+        self
+    }
+
+    /// 当前的超时配置。
+    pub fn timeouts(&self) -> HttpTimeouts {
+        self.timeouts
+    }
+
     pub fn new<S: AsRef<str>>(
         appid: S,
         mch_id: S,
@@ -189,6 +270,7 @@ impl WechatPay {
         v3_key: S,
         notify_url: S,
     ) -> Self {
+        let timeouts = HttpTimeouts::default();
         Self {
             appid: appid.as_ref().to_string(),
             mch_id: mch_id.as_ref().to_string(),
@@ -197,6 +279,8 @@ impl WechatPay {
             v3_key: v3_key.as_ref().to_string(),
             notify_url: notify_url.as_ref().to_string(),
             base_url: "https://api.mch.weixin.qq.com".to_string(),
+            client: build_client(timeouts),
+            timeouts,
         }
     }
 
