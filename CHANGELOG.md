@@ -4,10 +4,11 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.3.0] - 2026-09-11
 
-> ⚠ **尚未发布。** `Cargo.toml` 的版本号仍停在 `0.2.21`，但下列变更含多处破坏性改动，
-> 按语义化版本应发布为 **`0.3.0`**。发版时请先 bump `version`，再把本节移到新的版本号下。
+> **不发布到 crates.io。** 本仓库是 fork —— `wechat-pay-rust-sdk` 这个名字在 crates.io 属于上游，
+> `Cargo.toml` 已设 `publish = false`，引入方式见 README「引入依赖」（git / path）。
+> 版本号仍按语义化版本管理：相对上游 `0.2.21` 含破坏性改动，故取 `0.3.0`。
 
 ### 破坏性变更
 
@@ -45,7 +46,7 @@
 - 回调防护：`notify::NotifyHeaders`（含 `from_pairs`）+ `PlatformKeys::verify_notify`。
 - 错误三层归类：`PayError::kind() -> ErrorKind`（Network / Api / Local）。
 - `HttpTimeouts` 与 `WechatPay::with_timeouts` / `timeouts()`。
-- 离线测试网 `tests/offline.rs`（25 个带断言的用例，不需要凭证）+ GitHub Actions CI。
+- 离线测试网 `tests/offline.rs`（30 个带断言的用例，不需要凭证）+ GitHub Actions CI。
 - 仓库指南 `AGENTS.md`、归属声明 `NOTICE`、本 `CHANGELOG.md`。
 
 ### 修复

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`wechat-pay-rust-sdk` (v0.2.21) is a Rust client for the **WeChat Pay v3 HTTP API**. It wraps the
+`wechat-pay-rust-sdk` (v0.3.0) is a Rust client for the **WeChat Pay v3 HTTP API**. It wraps the
 payment endpoints (native / H5 / JSAPI / app / micropay), refunds, platform-certificate download,
 and callback (notify) decryption + RSA signature verification behind one `WechatPay` handle.
 
@@ -114,9 +114,9 @@ src/error.rs          PayError (thiserror); src/request.rs HttpMethod; src/pay_t
 src/macros.rs         crate-local `debug!` / `error!` (no-ops unless `debug-print`)
 example/              actix-web notify server; async usage reference
 tests/offline.rs      离线集成测试：本地 mock 微信网关，无需凭证，CI 跑的就是它
-.github/workflows/    CI：两种 feature 模式下的 test / check / clippy
+.github/workflows/    CI：fmt + 3 种 feature 组合的 clippy -D warnings + 两种模式的 test + MSRV 1.89
 NOTICE                Apache-2.0 归属声明（上游贡献者名单）
-CHANGELOG.md          破坏性/行为变更记录（含未发布的 0.3.0 变更集）
+CHANGELOG.md          破坏性/行为变更记录（0.3.0 起）
 ```
 
 没有 scripts、没有 `rustfmt.toml`、没有 clippy 配置文件。
@@ -419,13 +419,10 @@ pub fn test_native_pay() { /* … sync … */ }
    后解析成功，而不是报错（微信返回的 JSON 始终是合法 UTF-8，实际无影响）。
 7. **自动重试未实现** —— 超时/连接失败的重试策略留给调用方：⚠ 下单类接口**不可**无脑重试
    （会重复下单），只对幂等的 GET 查单重试；超时后应先用 `query_order` 确认状态。
-8. **版本号未体现破坏性变更** —— 破坏性变更已累积：`refunds()` 返回类型与语义变更、`WeChatResponse`
-   被删除、`WechatPay` 字段私有化、`PayError` 新增变体。按 semver 应把 `Cargo.toml` 的
-   `0.2.21` 提到 **`0.3.0`**（`CHANGELOG.md` 的 Unreleased 一节已列全）。
-   是否 bump / 何时发布由维护者决定，本次未动。
-9. **crate name 与上游冲突** —— `name = "wechat-pay-rust-sdk"` 在 crates.io 已被上游占用。
-   仅当要发布到 crates.io 时才需要改名（改名会牵动 `example/Cargo.toml` 的依赖声明）；
-   作为 path / git 依赖使用则无需改动。
+8. **不发布到 crates.io（crate name 与上游冲突）** —— `name = "wechat-pay-rust-sdk"` 在 crates.io
+   已被上游占用，`Cargo.toml` 已设 `publish = false`，误执行 `cargo publish` 会在本地就失败。
+   作为 git / path 依赖使用无需改动；将来真要发布，需先改名（会牵动 `example/Cargo.toml` 的
+   依赖声明）并删掉 `publish = false`。
 
 ### 已完成（P0 / P1 / P2 / 规范）
 
@@ -444,3 +441,5 @@ pub fn test_native_pay() { /* … sync … */ }
 - ~~179 处公开项缺文档~~ → 全部补齐；`[lints.rust] missing_docs = "warn"` + CI `-D warnings` 作硬门槛
 - ~~仓库未 rustfmt 化~~ → 全仓格式化 + CI `cargo fmt --all -- --check`
 - ~~MSRV 未声明且会随依赖解析漂移~~ → 声明 `rust-version = "1.89"` + CI MSRV 作业（用 1.89.0 验证）
+- ~~版本号未体现破坏性变更~~ → `0.2.21` → `0.3.0`，并设 `publish = false`（fork 不发布到 crates.io）
+- ~~README 写死 crates.io 版本号安装~~ → 改为 git / path 引入（fork 未发布，写版本号会拿到上游代码）

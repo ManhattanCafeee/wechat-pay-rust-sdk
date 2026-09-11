@@ -1,7 +1,9 @@
 # wechat-pay-rust-sdk
-[![Latest Version](https://img.shields.io/crates/v/wechat-pay-rust-sdk.svg)](https://crates.io/crates/wechat-pay-rust-sdk)
 
 微信支付 APIv3 的 Rust SDK（**社区维护，非腾讯官方**）。
+
+> **这是 fork，不是上游，也未发布到 crates.io。** 当前版本 `0.3.0`，相对上游 `0.2.21`
+> 含破坏性改动（见 [CHANGELOG](CHANGELOG.md)）。请按「引入依赖」用 **git 或 path** 引入。
 
 覆盖：JSAPI / Native / APP / H5 / 付款码下单、申请退款、订单查询、关单、退款查询、
 平台证书获取与轮换、支付回调的验签与解密。
@@ -30,15 +32,27 @@
 
 # 使用指南
 引入依赖
+
+本 crate **未发布到 crates.io**，用 git 或 path 引入：
+
 ```toml
-# 同步（默认）
-wechat-pay-rust-sdk = { version = "x.x.x" }
-# 异步
-wechat-pay-rust-sdk = { version = "x.x.x", features = ["async"] }
-# 打开调试日志（会输出请求体与 Authorization 头，生产环境不要开）
-wechat-pay-rust-sdk = { version = "x.x.x", features = ["debug-print"] }
+# 方式一：git —— 建议固定 tag，避免跟随 main 漂移导致构建不可复现
+#   需先把本仓库 push 到 remote，并打上 tag v0.3.0
+wechat-pay-rust-sdk = { git = "https://github.com/ManhattanCafeee/wechat-pay-rust-sdk", tag = "v0.3.0" }
+
+# 方式二：path —— 适合边改 SDK 边调业务代码
+wechat-pay-rust-sdk = { path = "../wechat-pay-rust-sdk" }
+
+# 异步：在上面任一方式的基础上加 features
+wechat-pay-rust-sdk = { path = "../wechat-pay-rust-sdk", features = ["async"] }
+
+# 调试日志（会输出请求体与 Authorization 头，生产环境不要开）
+wechat-pay-rust-sdk = { path = "../wechat-pay-rust-sdk", features = ["debug-print"] }
 ```
 
+> ⚠ **不要**写成 `wechat-pay-rust-sdk = "0.3.0"` —— 该名字在 crates.io 属于上游（最高 `0.2.21`），
+> 这句话要么解析到**上游代码**、要么直接解析失败，两种情况都拿不到本 fork 的修复。
+>
 > MSRV 1.89（edition 2024）。
 > ⚠ 不存在 `blocking` feature —— 同步是**默认**行为，异步才需要 feature。
 
