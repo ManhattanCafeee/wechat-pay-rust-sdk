@@ -16,8 +16,10 @@ use crate::response::MicroResponse;
 use crate::response::RefundsResponse;
 use crate::response::ResponseTrait;
 use crate::response::{CertificateResponse, NativeResponse, TransactionResponse};
+use crate::retry::{Delivery, RequestKind, classify, should_retry};
 use reqwest::header::{HeaderMap, REFERER};
 use serde_json::{Map, Value};
+use std::time::Duration;
 
 #[cfg(feature = "async")]
 use reqwest::RequestBuilder;
@@ -51,6 +53,22 @@ async fn send_and_check(builder: RequestBuilder) -> Result<(u16, String), PayErr
     Ok((status.as_u16(), text))
 }
 
+/// 重试前的退避等待。
+///
+/// 同步模式阻塞当前线程；异步模式让出执行权（依赖 `tokio` 的 `time`）。
+/// 两份定义按 feature 择一编译，同步版本**刻意不是 `async fn`** ——
+/// 否则调用方在同步模式下拿到的是一个永不轮询的 Future，睡不成。
+#[cfg(feature = "async")]
+async fn sleep_for(delay: Duration) {
+    tokio::time::sleep(delay).await;
+}
+
+/// 重试前的退避等待（同步实现，见异步版本的说明）。
+#[cfg(not(feature = "async"))]
+fn sleep_for(delay: Duration) {
+    std::thread::sleep(delay);
+}
+
 /// 只取顶层 `code`，用于识别「状态码是 2xx、body 却是错误信封」。
 #[derive(serde::Deserialize)]
 struct EnvelopeProbe {
@@ -78,7 +96,7 @@ fn is_error_envelope(text: &str) -> bool {
 }
 
 impl WechatPay {
-    /// 底层请求：签名 → 发送 → 状态检查，返回 `(状态码, 响应体文本)`。
+    /// 底层请求：签名 → 发送 → 状态检查，失败时按策略重试。
     ///
     /// **不注入任何字段** —— `appid` / `mchid` / `notify_url` 的注入只发生在 `pay()` 里。
     /// 这是有意的：关单只需要 `mchid`、查单的 `mchid` 要放在 query string，
@@ -86,27 +104,72 @@ impl WechatPay {
     ///
     /// ⚠ 传入的 `url` 会**原样参与签名**，所以 GET 的查询串必须拼进 `url`
     /// （微信要求签名串第二行是 path + `?` + query）。
+    ///
+    /// # 重试
+    ///
+    /// **「能不能重试」由 `kind`（重放语义）与失败分类共同决定，策略只控制次数与退避**
+    /// —— 详见 [`crate::retry`]。核心是两条：
+    ///
+    /// - 确定没送到（连接失败）或微信明确未受理（429 / 5xx / 202）→ 任何接口都可重试
+    /// - 结果未知（读写超时）→ **只有只读接口重试**；写接口交给调用方查单确认
+    ///
+    /// 每次尝试都重新签名：重试可能跨过 5 分钟的签名有效窗口，复用旧签名会直接 401。
     #[maybe_async_attr]
     async fn request(
         &self,
         method: HttpMethod,
         url: &str,
         body: &str,
+        kind: RequestKind,
     ) -> Result<(u16, String), PayError> {
-        let headers = self.build_header(method.clone(), url, body)?;
-        // 复用 `WechatPay` 持有的客户端：连接池跨请求共享，不必每次重新建连 / TLS 握手。
-        let client = &self.client;
-        let full_url = format!("{}{}", self.base_url(), url);
-        debug!("url: {} body: {}", full_url, body);
-        let builder = match method {
-            HttpMethod::GET => client.get(full_url),
-            HttpMethod::POST => client.post(full_url),
-            HttpMethod::PUT => client.put(full_url),
-            HttpMethod::DELETE => client.delete(full_url),
-            HttpMethod::PATCH => client.patch(full_url),
-        };
+        let policy = self.policy_for(kind);
+        let max_attempts = policy.max_attempts();
+        let mut attempt: u32 = 1;
 
-        send_and_check(builder.headers(headers).body(body.to_owned())).await
+        loop {
+            let headers = self.build_header(method.clone(), url, body)?;
+            // 复用 `WechatPay` 持有的客户端：连接池跨请求共享，不必每次重新建连 / TLS 握手。
+            let client = &self.client;
+            let full_url = format!("{}{}", self.base_url(), url);
+            debug!("url: {} body: {}", full_url, body);
+            let builder = match method {
+                HttpMethod::GET => client.get(full_url),
+                HttpMethod::POST => client.post(full_url),
+                HttpMethod::PUT => client.put(full_url),
+                HttpMethod::DELETE => client.delete(full_url),
+                HttpMethod::PATCH => client.patch(full_url),
+            };
+
+            let outcome = send_and_check(builder.headers(headers).body(body.to_owned())).await;
+
+            // 202 是「已受理但尚未处理」，官方要求「请使用原参数重复请求一遍」，
+            // 因此与 429 / 5xx 归为同一类：微信还没处理，可以安全重放。
+            let delivery = match &outcome {
+                Ok((202, _)) => Some(Delivery::Rejected),
+                Ok(_) => None,
+                Err(err) => classify(err),
+            };
+            let Some(delivery) = delivery else {
+                return outcome;
+            };
+
+            if !should_retry(delivery, kind) || attempt >= max_attempts {
+                // 重试用尽（或本就不该重试）。把 202 这类「2xx 但没处理」降级成错误返回，
+                // 否则下游会拿空 body 去解析，报出一个与真实原因毫无关系的 JSON 错误。
+                return match outcome {
+                    Ok((status, text)) => Err(PayError::api_error(status, &text)),
+                    Err(err) => Err(err),
+                };
+            }
+
+            let delay = policy.delay_for(attempt);
+            debug!(
+                "retry {}/{} after {:?} ({:?})",
+                attempt, max_attempts, delay, delivery
+            );
+            attempt += 1;
+            sleep_for(delay).await;
+        }
     }
 
     /// `request` + JSON 解析。
@@ -119,8 +182,9 @@ impl WechatPay {
         method: HttpMethod,
         url: &str,
         body: &str,
+        kind: RequestKind,
     ) -> Result<R, PayError> {
-        let (status, text) = self.request(method, url, body).await?;
+        let (status, text) = self.request(method, url, body, kind).await?;
         if is_error_envelope(&text) {
             // status 会是 200：如实记录真实状态码，业务原因看 response.code
             return Err(PayError::api_error(status, &text));
@@ -135,8 +199,9 @@ impl WechatPay {
         method: HttpMethod,
         url: &str,
         body: &str,
+        kind: RequestKind,
     ) -> Result<(), PayError> {
-        self.request(method, url, body).await?;
+        self.request(method, url, body, kind).await?;
         Ok(())
     }
 
@@ -158,7 +223,8 @@ impl WechatPay {
         map.insert("mchid".to_owned(), self.mch_id().into());
         map.insert("notify_url".to_owned(), self.notify_url().into());
         let body = serde_json::to_string(&map)?;
-        self.request_json(method, url, &body).await
+        self.request_json(method, url, &body, RequestKind::Write)
+            .await
     }
 
     /// 通用 GET：签名后请求 `url`，把响应解析成 `R`。
@@ -166,7 +232,8 @@ impl WechatPay {
     /// ⚠ `url` 会**原样参与签名**，带查询参数时必须把查询串一起传进来。
     #[maybe_async_attr]
     pub async fn get_pay<R: ResponseTrait>(&self, url: &str) -> Result<R, PayError> {
-        self.request_json(HttpMethod::GET, url, "").await
+        self.request_json(HttpMethod::GET, url, "", RequestKind::Read)
+            .await
     }
 
     /// H5 支付（外部浏览器）：返回拉起微信收银台的 `h5_url`。
@@ -274,7 +341,8 @@ impl WechatPay {
     pub async fn refunds(&self, params: RefundsParams) -> Result<RefundsResponse, PayError> {
         let url = "/v3/refund/domestic/refunds";
         let body = params.to_json();
-        self.request_json(HttpMethod::POST, url, &body).await
+        self.request_json(HttpMethod::POST, url, &body, RequestKind::Refund)
+            .await
     }
 
     /// 查询订单（按商户订单号）。
@@ -291,7 +359,8 @@ impl WechatPay {
             "/v3/pay/transactions/out-trade-no/{out_trade_no}?mchid={}",
             self.mch_id()
         );
-        self.request_json(HttpMethod::GET, &url, "").await
+        self.request_json(HttpMethod::GET, &url, "", RequestKind::Read)
+            .await
     }
 
     /// 关闭订单。
@@ -305,7 +374,8 @@ impl WechatPay {
     pub async fn close_order(&self, out_trade_no: &str) -> Result<(), PayError> {
         let url = format!("/v3/pay/transactions/out-trade-no/{out_trade_no}/close");
         let body = serde_json::json!({ "mchid": self.mch_id() }).to_string();
-        self.request_no_content(HttpMethod::POST, &url, &body).await
+        self.request_no_content(HttpMethod::POST, &url, &body, RequestKind::Write)
+            .await
     }
 
     /// 查询退款（按商户退款单号）。
@@ -320,7 +390,8 @@ impl WechatPay {
     #[maybe_async_attr]
     pub async fn query_refund(&self, out_refund_no: &str) -> Result<RefundsResponse, PayError> {
         let url = format!("/v3/refund/domestic/refunds/{out_refund_no}");
-        self.request_json(HttpMethod::GET, &url, "").await
+        self.request_json(HttpMethod::GET, &url, "", RequestKind::Read)
+            .await
     }
 }
 

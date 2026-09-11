@@ -47,11 +47,16 @@ serde = { version = "1", features = ["derive"] }
 pem = "4"
 x509-parser = "0.18"
 serde_json = "1"
+# 仅在 `async` feature 下启用，且只要 `time`：供重试退避的 `tokio::time::sleep` 使用。
+tokio = { version = "1", optional = true, default-features = false, features = ["time"] }
 maybe-async = "0.2"
 
 [features]
 default = ["reqwest/blocking"]
-async = ["reqwest"]
+# `dep:tokio` 只带 `time`：重试退避在异步模式下需要 `tokio::time::sleep`。
+# 异步 reqwest 本来就跑在 tokio 上，所以这不算引入新的运行时体系；
+# 用 `dep:` 前缀是为了不额外暴露一个叫 `tokio` 的 feature。
+async = ["reqwest", "dep:tokio"]
 debug-print = ["tracing", "tracing-subscriber"]
 
 [dev-dependencies]

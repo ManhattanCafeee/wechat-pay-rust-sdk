@@ -22,6 +22,8 @@ pub mod pay_type;
 pub mod request;
 /// 响应模型（`Deserialize`）。
 pub mod response;
+/// 自动重试策略 [`RetryPolicy`]：哪些失败能重试、退避多久。
+pub mod retry;
 /// RSA-SHA256（PKCS#1 v1.5）签名。
 pub mod sign;
 /// Base64、随机单号、X.509 解析与 RSA 验签等公开助手。

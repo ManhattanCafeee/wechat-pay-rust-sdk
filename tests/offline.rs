@@ -27,6 +27,7 @@ use wechat_pay_rust_sdk::pay::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, HttpTimeouts, PayNotifyTrait, WechatPay,
 };
 use wechat_pay_rust_sdk::request::HttpMethod;
+use wechat_pay_rust_sdk::retry::RetryPolicy;
 use wechat_pay_rust_sdk::util;
 
 /// 测试专用 RSA 私钥（PKCS#8, 2048 bit）。
@@ -568,7 +569,9 @@ dual_test! {
         // 网关故障时可能返回 HTML 而不是微信的错误结构；
         // 这种情况必须保留原文，否则唯一的排查线索就丢了。
         let mock = Mock::start(vec![MockResponse::json(502, "<html>Bad Gateway</html>")]);
-        let wechat_pay = client_for(&mock.base_url);
+        // 关掉重试：本用例只关心「单个响应体有没有被完整保留」。502 按官方口径是可重试的，
+        // 开着重试会让最终错误变成第 N 次尝试的响应体（重试行为另有专门用例覆盖）。
+        let wechat_pay = client_for(&mock.base_url).with_retry(RetryPolicy::disabled());
 
         let result = call!(wechat_pay.jsapi_pay(JsapiParams::new(
             "测试商品",
@@ -598,7 +601,8 @@ dual_test! {
             502,
             r#"{"errcode":40001,"errmsg":"invalid credential from upstream"}"#,
         )]);
-        let wechat_pay = client_for(&mock.base_url);
+        // 同上：只验证「非微信形状的错误体被保留原文」，与重试无关。
+        let wechat_pay = client_for(&mock.base_url).with_retry(RetryPolicy::disabled());
 
         let result = call!(wechat_pay.jsapi_pay(JsapiParams::new(
             "测试商品",
@@ -624,7 +628,9 @@ dual_test! {
         // 网关可能返回整页 HTML；不能让整个 body 复制进错误消息并刷爆日志。
         let huge = format!("<html>{}</html>", "x".repeat(20_000));
         let mock = Mock::start(vec![MockResponse::json(504, &huge)]);
-        let wechat_pay = client_for(&mock.base_url);
+        // 关掉重试：本用例只验证截断行为。（504 目前在分类里属「结果未知」，
+        // 对写接口本就不会重试 —— 但别让这个用例依赖那个间接结论。）
+        let wechat_pay = client_for(&mock.base_url).with_retry(RetryPolicy::disabled());
 
         let result = call!(wechat_pay.jsapi_pay(JsapiParams::new(
             "测试商品",
@@ -651,7 +657,8 @@ dual_test! {
 dual_test! {
     fn empty_error_body_is_marked() {
         let mock = Mock::start(vec![MockResponse::json(502, "")]);
-        let wechat_pay = client_for(&mock.base_url);
+        // 同上：只验证「空响应体有显式标记」，与重试无关。
+        let wechat_pay = client_for(&mock.base_url).with_retry(RetryPolicy::disabled());
 
         let result = call!(wechat_pay.jsapi_pay(JsapiParams::new(
             "测试商品",
@@ -1358,4 +1365,322 @@ dual_test! {
         assert!(util::x509_to_pem(b"not a pem").is_err());
         assert!(util::x509_is_valid(b"not a pem").is_err());
     }
+}
+
+// ---------------------------------------------------------------------------
+// 自动重试
+// ---------------------------------------------------------------------------
+
+/// 启动一个「收下请求、但永不响应」的 mock，并捕获收到的请求。
+///
+/// 用来把**超时**这条路走实：客户端每次尝试都会等到自己的请求超时，
+/// 而服务端能如实数出它到底尝试了几次 —— 这正是「写接口超时不得重试」的判据。
+fn black_hole_mock() -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind black hole mock");
+    let addr = listener.local_addr().expect("local_addr");
+    let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_bg = Arc::clone(&captured);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let captured = Arc::clone(&captured_bg);
+            thread::spawn(move || {
+                // 读走请求（让客户端确认「已发出」），然后既不响应也不关闭连接。
+                // 客户端超时后会自己断开，此时 read_request 返回 None，线程结束。
+                let mut reader = BufReader::new(stream);
+                while let Some(request) = read_request(&mut reader) {
+                    captured.lock().expect("lock captured").push(request);
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), captured)
+}
+
+/// 启动一个「声称有 100 字节响应体、实际只发 10 字节就断连」的 mock。
+///
+/// 这是「微信**已经处理过**这次请求」的真实形态：响应都开始返回了，只是没读完。
+/// 哪怕客户端最终拿到的是个传输层错误，这种请求也绝不能重放。
+/// ⚠ reqwest 给这类失败打的标志位是 `is_decode()` 而**不是** `is_body()` ——
+/// 按直觉写 `is_body()` 会把它误判成可以重试。
+fn truncated_body_mock() -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated mock");
+    let addr = listener.local_addr().expect("local_addr");
+    let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_bg = Arc::clone(&captured);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let captured = Arc::clone(&captured_bg);
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut writer = stream;
+                if let Some(request) = read_request(&mut reader) {
+                    captured.lock().expect("lock captured").push(request);
+                    let _ = writer.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"prepay_",
+                    );
+                    let _ = writer.flush();
+                }
+                // 连接在此关闭，客户端读到一半就断了。
+            });
+        }
+    });
+    (format!("http://{addr}"), captured)
+}
+
+/// 从 Authorization 头里取出 `nonce_str`。
+fn nonce_of(request: &CapturedRequest) -> String {
+    request
+        .header("authorization")
+        .and_then(|value| value.split("nonce_str=\"").nth(1))
+        .and_then(|value| value.split('"').next())
+        .expect("Authorization 头里应当有 nonce_str")
+        .to_string()
+}
+
+/// 把退避压到毫秒级，避免测试真的等下去（默认策略是 200ms 起步、上限 2s）。
+fn fast_retry(max_attempts: u32) -> RetryPolicy {
+    RetryPolicy {
+        max_attempts,
+        base_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(10),
+        jitter: false,
+    }
+}
+
+dual_test! {
+    fn retries_on_frequency_limit_then_succeeds() {
+        let mock = Mock::start(vec![
+            MockResponse::json(429, r#"{"code":"FREQUENCY_LIMITED","message":"频率超限"}"#),
+            MockResponse::json(204, ""),
+        ]);
+        let wechat_pay = client_for(&mock.base_url).with_retry(fast_retry(3));
+
+        call!(wechat_pay.close_order("RETRY_429")).expect("429 之后应当重试并成功");
+
+        assert_eq!(
+            mock.requests().len(),
+            2,
+            "官方对 429 的措辞是「请求未受理，请降低操作频率后重试」，应当重试一次"
+        );
+    }
+}
+
+dual_test! {
+    fn retries_until_max_attempts_then_gives_up() {
+        let unavailable = r#"{"code":"SERVICE_UNAVAILABLE","message":"服务不可用"}"#;
+        let mock = Mock::start(vec![
+            MockResponse::json(503, unavailable),
+            MockResponse::json(503, unavailable),
+            MockResponse::json(503, unavailable),
+            // 第 4 个响应不该被用到：max_attempts = 3
+            MockResponse::json(204, ""),
+        ]);
+        let wechat_pay = client_for(&mock.base_url).with_retry(fast_retry(3));
+
+        let err = call!(wechat_pay.close_order("RETRY_503")).expect_err("三次都失败应当返回错误");
+
+        assert_eq!(mock.requests().len(), 3, "max_attempts = 3 应当恰好尝试 3 次");
+        assert_eq!(err.kind(), ErrorKind::Api, "最终错误应是微信侧错误，实际: {err}");
+    }
+}
+
+dual_test! {
+    fn disabled_policy_sends_exactly_once() {
+        let mock = Mock::start(vec![
+            MockResponse::json(429, r#"{"code":"FREQUENCY_LIMITED","message":"频率超限"}"#),
+            MockResponse::json(204, ""),
+        ]);
+        let wechat_pay = client_for(&mock.base_url).with_retry(RetryPolicy::disabled());
+
+        call!(wechat_pay.close_order("NO_RETRY")).expect_err("关掉重试后应当直接失败");
+
+        assert_eq!(mock.requests().len(), 1, "RetryPolicy::disabled 必须只发一次");
+    }
+}
+
+dual_test! {
+    fn each_retry_is_signed_again() {
+        let mock = Mock::start(vec![
+            MockResponse::json(429, r#"{"code":"FREQUENCY_LIMITED","message":"频率超限"}"#),
+            MockResponse::json(204, ""),
+        ]);
+        let wechat_pay = client_for(&mock.base_url).with_retry(fast_retry(3));
+
+        call!(wechat_pay.close_order("RESIGN")).expect("重试之后应当成功");
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(
+            nonce_of(&requests[0]),
+            nonce_of(&requests[1]),
+            "每次重试都必须重新签名：重试可能跨过 5 分钟的签名有效窗口，\
+             复用旧 nonce / timestamp 会直接 401"
+        );
+    }
+}
+
+dual_test! {
+    fn accepted_202_is_retried_because_wechat_says_to_resend() {
+        let mock = Mock::start(vec![
+            MockResponse::json(202, ""),
+            MockResponse::json(204, ""),
+        ]);
+        let wechat_pay = client_for(&mock.base_url).with_retry(fast_retry(3));
+
+        call!(wechat_pay.close_order("ACCEPTED")).expect("202 之后应当重发并成功");
+
+        assert_eq!(
+            mock.requests().len(),
+            2,
+            "官方对 202 的要求是「服务器已接受请求，但尚未处理，请使用原参数重复请求一遍」"
+        );
+    }
+}
+
+dual_test! {
+    fn accepted_202_that_cannot_be_retried_reports_the_status_not_a_json_error() {
+        let mock = Mock::start(vec![MockResponse::json(202, "")]);
+        let wechat_pay = client_for(&mock.base_url).with_retry(RetryPolicy::disabled());
+
+        let err = call!(wechat_pay.close_order("ACCEPTED_OFF")).expect_err("202 不该当成成功");
+
+        match err {
+            PayError::ApiError { status, .. } => assert_eq!(status, 202, "应当保留真实状态码"),
+            other => panic!("202 应当降级成 ApiError，而不是一个与真实原因无关的解析错误: {other:?}"),
+        }
+    }
+}
+
+dual_test! {
+    fn write_timeout_is_not_retried_but_read_timeout_is() {
+        // ① 写接口超时：请求确实发出去了，但结果未知 —— 官方口径是「先查单」。
+        let (write_url, write_captured) = black_hole_mock();
+        let writer = client_for(&write_url)
+            .with_timeouts(HttpTimeouts {
+                request: Duration::from_millis(300),
+                ..HttpTimeouts::default()
+            })
+            .with_retry(fast_retry(3));
+
+        let err = call!(writer.close_order("TIMEOUT_WRITE")).expect_err("超时应当报错");
+        assert!(err.may_have_taken_effect(), "超时属于「结果未知」");
+        assert_eq!(
+            write_captured.lock().expect("lock captured").len(),
+            1,
+            "写接口超时**不得**重试：结果未知，应当由调用方查单确认，而不是再发一次"
+        );
+
+        // ② 只读接口超时：重放纯读没有副作用，应当重试到 max_attempts。
+        //    用独立的 mock 与客户端，避免复用上面那条已经超时作废的连接。
+        let (read_url, read_captured) = black_hole_mock();
+        let reader = client_for(&read_url)
+            .with_timeouts(HttpTimeouts {
+                request: Duration::from_millis(300),
+                ..HttpTimeouts::default()
+            })
+            .with_retry(fast_retry(3));
+
+        let err = call!(reader.query_order("TIMEOUT_READ")).expect_err("超时应当报错");
+
+        assert!(err.may_have_taken_effect());
+        assert_eq!(
+            read_captured.lock().expect("lock captured").len(),
+            3,
+            "只读接口超时应当重试：max_attempts = 3 就是 3 次尝试"
+        );
+    }
+}
+
+dual_test! {
+    fn response_body_that_dies_midway_is_never_retried() {
+        // ① 写接口：响应都开始返回了，说明微信**已经处理过**这次请求。
+        let (write_url, write_captured) = truncated_body_mock();
+        let writer = client_for(&write_url).with_retry(fast_retry(3));
+
+        let err = call!(writer.close_order("TRUNC_WRITE")).expect_err("读响应体失败应当报错");
+        assert!(
+            err.may_have_taken_effect(),
+            "响应已开始返回 —— 这次请求在微信侧很可能已经生效"
+        );
+        assert_eq!(
+            write_captured.lock().expect("lock captured").len(),
+            1,
+            "「已处理」的请求绝不能重放（这类失败在 reqwest 里是 is_decode()，不是 is_body()）"
+        );
+
+        // ② 只读接口同样不得重放：判据是「服务端已处理」，与重放语义无关。
+        let (read_url, read_captured) = truncated_body_mock();
+        let reader = client_for(&read_url).with_retry(fast_retry(3));
+
+        let err = call!(reader.query_order("TRUNC_READ")).expect_err("读响应体失败应当报错");
+
+        assert!(err.may_have_taken_effect());
+        assert_eq!(
+            read_captured.lock().expect("lock captured").len(),
+            1,
+            "已处理的请求，只读接口也不得重放"
+        );
+    }
+}
+
+dual_test! {
+    fn connection_refused_is_retried_even_for_writes() {
+        // 127.0.0.1:1 上没有服务，连接会被立刻拒绝 —— 请求**确定没送出去**。
+        // 这是唯一一种连写接口都能安全重放的场景（官方 Java SDK 默认就只重试这类失败）。
+        let wechat_pay = client_for("http://127.0.0.1:1").with_retry(RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(120),
+            max_delay: Duration::from_millis(120),
+            jitter: false,
+        });
+
+        let started = Instant::now();
+        let err = call!(wechat_pay.close_order("REFUSED")).expect_err("连不上应当报错");
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.kind(), ErrorKind::Network);
+        assert!(
+            !err.may_have_taken_effect(),
+            "连接都没建立起来，请求确定没送到微信"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(240),
+            "连接失败应当重试：3 次尝试之间有 2 段 120ms 退避，实际只等了 {elapsed:?}"
+        );
+    }
+}
+
+/// 退款走独立的分钟级策略，且与通用策略**互不牵连**。
+///
+/// 不通过真实请求验证 —— 那要等 60 秒。这里钉的是公开配置契约：
+/// 速率分档是「官方要求退款间隔 1 分钟 + 失败限流 6QPS」的直接后果，
+/// 一旦有人把两档合并成一个 `RetryPolicy`，这个用例会立刻失败。
+#[test]
+fn refund_uses_a_separate_minute_scaled_policy() {
+    let wechat_pay = client_for("http://127.0.0.1:1");
+
+    assert!(
+        wechat_pay.refund_retry_policy().base_delay >= Duration::from_secs(30),
+        "退款退避必须是分钟级，实际 {:?}",
+        wechat_pay.refund_retry_policy().base_delay
+    );
+    assert!(
+        wechat_pay.retry_policy().base_delay < Duration::from_secs(1),
+        "其余接口应当是毫秒级退避，实际 {:?}",
+        wechat_pay.retry_policy().base_delay
+    );
+
+    // 单独关掉退款重试，不得连带影响通用重试。
+    let tuned = client_for("http://127.0.0.1:1").with_refund_retry(RetryPolicy::disabled());
+    assert_eq!(
+        tuned.refund_retry_policy().max_attempts,
+        1,
+        "with_refund_retry 应当只作用于退款"
+    );
+    assert!(
+        tuned.retry_policy().max_attempts > 1,
+        "改退款策略不应把通用重试也关掉"
+    );
 }

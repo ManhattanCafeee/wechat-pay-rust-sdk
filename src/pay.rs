@@ -2,6 +2,7 @@ use crate::error::PayError;
 use crate::model::WechatPayDecodeData;
 use crate::request::HttpMethod;
 use crate::response::SignData;
+use crate::retry::{RequestKind, RetryPolicy};
 use crate::{debug, sign, util};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -46,9 +47,14 @@ impl Default for HttpTimeouts {
 
 /// 构建带超时的 HTTP 客户端。
 ///
-/// ⚠ 超时**不代表操作没有发生**：请求很可能已在微信侧受理，只是响应没回来。
-/// 支付类接口超时后必须用 [`WechatPay::query_order`] 确认最终状态，
-/// **不能**直接重试下单（会重复下单）。
+/// ⚠ 超时**不代表操作没有发生**：请求可能已在微信侧受理，只是响应没回来。
+/// 这类「结果未知」的失败（[`PayError::may_have_taken_effect`] 为 `true`）不会被
+/// 自动重试 —— 支付类接口应当先用 [`WechatPay::query_order`] 确认最终状态。
+///
+/// 需要说明的是：微信以 `out_trade_no` 作为订单的身份键，**同一单号 + 完全相同的参数**
+/// 重复下单不会产生第二笔订单（只有改参数或换接口才会报 `OUT_TRADE_NO_USED`）。
+/// 所以这里要求先查单，是遵循官方「结果未知时以查单为准」的口径，
+/// 而不是因为重放本身会重复下单 —— 详见 [`crate::retry`] 的模块文档。
 fn build_client(timeouts: HttpTimeouts) -> Client {
     Client::builder()
         .connect_timeout(timeouts.connect)
@@ -75,6 +81,10 @@ pub struct WechatPay {
     pub(crate) client: Client,
     /// 当前超时配置。改它需要连同重建 client，见 [`WechatPay::with_timeouts`]。
     pub(crate) timeouts: HttpTimeouts,
+    /// 通用重试策略：只读查询与下单 / 关单。见 [`WechatPay::with_retry`]。
+    pub(crate) retry: RetryPolicy,
+    /// 退款专用重试策略，默认分钟级退避。见 [`WechatPay::with_refund_retry`]。
+    pub(crate) refund_retry: RetryPolicy,
 }
 
 // `Debug` 手写而非 derive：derive 会把 `private_key` / `v3_key` 原样打进日志。
@@ -89,6 +99,8 @@ impl std::fmt::Debug for WechatPay {
             .field("notify_url", &self.notify_url)
             .field("base_url", &self.base_url)
             .field("timeouts", &self.timeouts)
+            .field("retry", &self.retry)
+            .field("refund_retry", &self.refund_retry)
             .finish()
     }
 }
@@ -296,6 +308,61 @@ impl WechatPay {
         self.timeouts
     }
 
+    /// 覆盖通用重试策略（只读查询与下单 / 关单）。
+    ///
+    /// 默认是 [`RetryPolicy::default`]：最多 3 次尝试，200ms 起步的指数退避 + 抖动。
+    /// **策略只控制次数与间隔；「该不该重试」由失败分类决定**，详见 [`crate::retry`]。
+    ///
+    /// ```no_run
+    /// # use wechat_pay_rust_sdk::pay::WechatPay;
+    /// # use wechat_pay_rust_sdk::retry::RetryPolicy;
+    /// # let wechat_pay = WechatPay::new("a", "b", "c", "d", "e", "f");
+    /// // 只改次数，其余沿用默认
+    /// let wechat_pay = wechat_pay.with_retry(RetryPolicy {
+    ///     max_attempts: 5,
+    ///     ..RetryPolicy::default()
+    /// });
+    /// // 或者完全关掉
+    /// let wechat_pay = wechat_pay.with_retry(RetryPolicy::disabled());
+    /// ```
+    pub fn with_retry(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
+        self
+    }
+
+    /// 覆盖**退款专用**的重试策略。
+    ///
+    /// 默认是 [`RetryPolicy::for_refund`]：最多 2 次尝试，首次退避 **60 秒**。
+    /// 依据是官方对退款重试的节奏要求（「间隔 1 分钟」）以及该接口在失败时报错限流
+    /// 只有 6QPS —— 秒级退避打过去基本是白打，还会加重限流。
+    ///
+    /// ⚠ **分钟级退避意味着阻塞**：一次退款调用最坏会挂住约 1 分钟
+    /// （退避 + 请求超时）。同步调用链里扛不住的话，用
+    /// `with_refund_retry(RetryPolicy::disabled())` 关掉，改由业务侧异步重试 ——
+    /// 分钟级节奏本来就是异步任务更自然的载体。
+    pub fn with_refund_retry(mut self, policy: RetryPolicy) -> Self {
+        self.refund_retry = policy;
+        self
+    }
+
+    /// 当前的通用重试策略。
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry
+    }
+
+    /// 当前退款专用的重试策略。
+    pub fn refund_retry_policy(&self) -> RetryPolicy {
+        self.refund_retry
+    }
+
+    /// 按请求的重放语义挑出该用哪个策略。
+    pub(crate) fn policy_for(&self, kind: RequestKind) -> RetryPolicy {
+        match kind {
+            RequestKind::Refund => self.refund_retry,
+            _ => self.retry,
+        }
+    }
+
     /// 用商户配置构造客户端。
     ///
     /// 参数顺序：`appid` / `mch_id` / `private_key` / `serial_no` / `v3_key` / `notify_url`。
@@ -320,6 +387,8 @@ impl WechatPay {
             base_url: "https://api.mch.weixin.qq.com".to_string(),
             client: build_client(timeouts),
             timeouts,
+            retry: RetryPolicy::default(),
+            refund_retry: RetryPolicy::for_refund(),
         }
     }
 
