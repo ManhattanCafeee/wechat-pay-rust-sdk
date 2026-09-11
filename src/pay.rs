@@ -266,6 +266,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     fn test_rsa_sign() {
         init_log();
         let private_key_path = "./apiclient_key.pem";
@@ -286,6 +287,7 @@ mod tests {
 
     /// 支付回调参数解密
     #[test]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     fn test_decrypt_paydata() {
         init_log();
         dotenv().ok();
@@ -306,6 +308,7 @@ mod tests {
     /// -----END CERTIFICATE-----
     /// ```
     #[test]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     fn test_decrypt_certificates() {
         init_log();
         dotenv().ok();
@@ -320,6 +323,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     fn test_verify_sign() {
         init_log();
         dotenv().ok();
@@ -341,6 +345,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     fn test_pay_verify_sign() {
         let signature = std::fs::read("signature.txt").unwrap();
         let message = std::fs::read("message.txt").unwrap();

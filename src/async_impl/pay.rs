@@ -201,6 +201,8 @@ mod tests {
     use tracing::debug;
 
     #[test]
+    #[cfg(not(feature = "async"))]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub fn test_jsapi_pay() {
         init_log();
         dotenv().ok();
@@ -217,6 +219,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "async"))]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub fn test_micro_pay() {
         init_log();
         dotenv().ok();
@@ -233,6 +237,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "async"))]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub fn test_app_pay() {
         init_log();
         dotenv().ok();
@@ -250,6 +256,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "async"))]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub fn test_h5_pay() {
         init_log();
         dotenv().ok();
@@ -269,6 +277,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "async"))]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub fn test_certificates() {
         init_log();
         dotenv().ok();
@@ -294,6 +304,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "async"))]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub fn test_decode_certificates() {
         init_log();
         dotenv().ok();
@@ -310,6 +322,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "async"))]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub fn test_blocking_refunds() {
         init_log();
         dotenv().ok();
@@ -336,6 +350,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "async")]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub async fn test_native_pay() {
         init_log();
         dotenv().ok();
@@ -348,6 +363,7 @@ mod tests {
     }
     #[test]
     #[cfg(not(feature = "async"))]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub fn test_native_pay() {
         init_log();
         dotenv().ok();
@@ -360,6 +376,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "async")]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub async fn test_refunds() {
         init_log();
         dotenv().ok();
@@ -378,6 +395,7 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "async"))]
+    #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub fn test_refunds() {
         init_log();
         dotenv().ok();

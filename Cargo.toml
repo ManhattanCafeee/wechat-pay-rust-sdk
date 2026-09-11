@@ -9,6 +9,13 @@ license = "Apache-2.0"
 keywords = ["wechat", "pay", "weixin", "wechatpay", "weixinpay"]
 exclude = ["example"]
 
+[lib]
+# README 通过 `#![doc = include_str!("../README.md")]` 充当 crate 文档，
+# 但其中示例需要真实商户证书/密钥 + 公网环境（还有 actix-web、输出示例片段），
+# 无法作为 doctest 运行。关闭 doctest 让 `cargo test` 反映真实状态；
+# README 示例的正确性依赖 tests/offline.rs 与人工验证。
+doctest = false
+
 [workspace]
 members = ["example"]
 
@@ -36,6 +43,10 @@ async = ["reqwest"]
 debug-print = ["tracing", "tracing-subscriber"]
 
 [dev-dependencies]
+# tests/offline.rs 需要：加密回调节点（aes-gcm）、验证签名与生成平台公钥（rsa）、构造 JSON（serde_json）
+aes-gcm = "0.11"
+rsa = { version = "0.9", features = ["sha2"] }
+serde_json = "1"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = "0.3"

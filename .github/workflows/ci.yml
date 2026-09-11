@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test & check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 完整测试：tests/offline.rs 用本地 mock 微信网关，
+      # 不需要凭证或公网，因此可以在 CI 中运行。
+      # src/ 内需要真实商户凭证的冒烟测试已标记 #[ignore]，默认跳过。
+      - name: Test (sync)
+        run: cargo test
+
+      - name: Test (async)
+        run: cargo test --features async
+
+      # 两种 feature 模式都必须能编译（含测试目标）。
+      # 历史上有 7 个测试函数漏了 #[cfg(not(feature = "async"))]，导致
+      # `--features async --all-targets` 编译失败 —— 这两条命令就是那条回归线。
+      - name: Check sync (all targets)
+        run: cargo check --all-targets
+
+      - name: Check async (all targets)
+        run: cargo check --features async --all-targets
+
+      - name: Check example
+        run: cargo check -p example
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features async
+
+      # 有意不运行：
+      #   * `cargo test --doc` —— README 示例需要真实商户密钥与公网，
+      #     见 Cargo.toml 中的 [lib] doctest = false
+      #   * `cargo fmt --check` —— 仓库尚未整体格式化，见 AGENTS.md 的待办
+      #
+      # 需要真实凭证的测试可在本机（有 .env 与 PEM fixture）手动运行：
+      #   cargo test --lib -- --ignored
