@@ -111,6 +111,7 @@ src/notify.rs         NotifyHeaders + verify_notify：时间戳新鲜度 → 按
 src/sign.rs           sha256_sign — RSA PKCS#1 v1.5 + SHA-256, base64 STANDARD
 src/util.rs           base64 助手、random_trade_no、verify_rsa_sha256、x509_to_pem、x509_is_valid
 src/error.rs          PayError (thiserror); src/request.rs HttpMethod; src/pay_type.rs PayType
+src/retry.rs          RetryPolicy / 失败分类 Delivery / 可重试判定 / 退避计算
 src/macros.rs         crate-local `debug!` / `error!` (no-ops unless `debug-print`)
 example/              actix-web notify server; async usage reference
 tests/offline.rs      离线集成测试：本地 mock 微信网关，无需凭证，CI 跑的就是它
@@ -127,7 +128,7 @@ Run everything from the repo root (tests use CWD-relative fixture paths).
 
 ```bash
 # 完整测试：tests/offline.rs 用本地 mock 服务替代微信网关，不需要凭证或公网
-cargo test                    # PASS — lib 2 passed / 14 ignored，offline 30 passed
+cargo test                    # PASS — lib 10 passed / 14 ignored，offline 40 passed
 cargo test --features async   # PASS — 同一套测试在 async 模式下再跑一遍
 
 # 两种 feature 模式都必须能编译（含测试目标）——这是防回归的关键两条
@@ -322,8 +323,8 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
 
 | 层 | 位置 | 内容 |
 | --- | --- | --- |
-| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写 HTTP 服务，支持 keep-alive 与连接计数）替代微信网关；30 个带断言的用例（含编译期 Send/Sync 断言） |
-| 纯逻辑单测 | `src/pay.rs`、`src/async_impl/pay.rs` | `test_uuid_v4`、`test_str` 两个无外部依赖用例 |
+| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写 HTTP 服务，支持 keep-alive 与连接计数）替代微信网关；40 个带断言的用例（含编译期 Send/Sync 断言） |
+| 纯逻辑单测 | `src/pay.rs`、`src/async_impl/pay.rs`、`src/retry.rs` | 签名/加解密助手等无外部依赖用例；`retry.rs` 覆盖退避曲线、抖动边界与可重试判定矩阵 |
 
 **`tests/offline.rs` 覆盖的契约（改这些行为必须同步改测试）：**
 
@@ -345,6 +346,12 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
 - **申请退款成功路径**：解析出退款单并断言 `status == PROCESSING`（受理 ≠ 成功）
 - **`get_weixin`**：能从 H5 页面抠出 `weixin://` 链接、带 Referer、页面无链接时报 `WeixinNotFound`
 - **X.509 助手**：`x509_to_pem` 取出的公钥必须能验证配套私钥的签名（不只是「长得像 PEM」）；非 PEM 输入返回 `Err` 而非 panic
+- **重试触发**：429 / 503 会被重试，且断言 mock **实际收到的请求次数**（`max_attempts` 用尽即停）
+- **重试的安全边界（关键）**：写接口**超时不重试**、只读接口超时重试；「响应体没读完」这类
+  **已处理**的失败，写和读都**不重试**（`is_decode()` 而非 `is_body()`）；连接被拒时连写接口也重试
+- **重试后的请求是新签的**：两次尝试的 `nonce_str` 必须不同（复用旧签名会跨过 5 分钟窗口后 401）
+- **`202 Accepted`**：会按官方要求重发；重试用尽时降级成带状态码 202 的 `ApiError`，而不是 JSON 解析错误
+- **退款策略独立**：退款退避是分钟级且与通用策略互不牵连（`with_refund_retry` 不改变 `retry_policy`）
 
 **写新测试请用 `dual_test!`** —— 一份测试体在两种 feature 下各生成一个测试函数：
 
@@ -417,14 +424,16 @@ pub fn test_native_pay() { /* … sync … */ }
    `reqwest::Error`，而 reqwest 是 optional 依赖。
 6. **`.json()` → `from_str` 的解码差异** —— 非法 UTF-8 的 2xx 响应体现在会被有损替换为 U+FFFD
    后解析成功，而不是报错（微信返回的 JSON 始终是合法 UTF-8，实际无影响）。
-7. **自动重试未实现** —— 超时/连接失败的重试策略留给调用方：⚠ 下单类接口**不可**无脑重试
-   （会重复下单），只对幂等的 GET 查单重试；超时后应先用 `query_order` 确认状态。
+7. **超时后的「查单」仍需业务侧自己发起** —— SDK 已不对写接口超时做自动重试
+   （判据见 `PayError::may_have_taken_effect`），但也**不会**替你调 `query_order`：
+   查到状态之后怎么处置（继续等用户付款 / 关单 / 退款）是业务决策，SDK 无从代劳。
+   完整口径见 `src/retry.rs` 的模块文档。
 8. **不发布到 crates.io（crate name 与上游冲突）** —— `name = "wechat-pay-rust-sdk"` 在 crates.io
    已被上游占用，`Cargo.toml` 已设 `publish = false`，误执行 `cargo publish` 会在本地就失败。
    作为 git / path 依赖使用无需改动；将来真要发布，需先改名（会牵动 `example/Cargo.toml` 的
    依赖声明）并删掉 `publish = false`。
 
-### 已完成（P0 / P1 / P2 / 规范）
+### 已完成（P0 / P1 / P2 / 规范 / 重试）
 
 - ~~错误吞噬：非 2xx 响应被解析成成功~~ → `send_and_check` 先查状态码，新增 `PayError::ApiError`
 - ~~缺少订单查询 / 关单 / 退款查询~~ → `query_order` / `close_order` / `query_refund`
@@ -443,3 +452,7 @@ pub fn test_native_pay() { /* … sync … */ }
 - ~~MSRV 未声明且会随依赖解析漂移~~ → 声明 `rust-version = "1.89"` + CI MSRV 作业（用 1.89.0 验证）
 - ~~版本号未体现破坏性变更~~ → `0.2.21` → `0.3.0`，并设 `publish = false`（fork 不发布到 crates.io）
 - ~~README 写死 crates.io 版本号安装~~ → 改为 git / path 引入（fork 未发布，写版本号会拿到上游代码）
+- ~~自动重试未实现~~ → `src/retry.rs`：按「失败时微信侧处于什么状态」分类，默认只重试**确定没送到**
+  （连接被拒/连接超时）与**官方明确未受理**（429/500/502/503/202）的失败；写接口超时不重试
+- ~~`202 Accepted` 被当成 2xx 成功~~ → 按官方「请使用原参数重复请求一遍」处理，不再报误导性的 JSON 错误
+- ~~超时后无法区分「确定没生效」与「结果未知」~~ → `PayError::may_have_taken_effect()`

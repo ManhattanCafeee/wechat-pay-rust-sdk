@@ -29,6 +29,7 @@
   - [平台证书轮换](#平台证书轮换)
   - [错误处理](#错误处理)
   - [超时与连接复用](#超时与连接复用)
+  - [自动重试](#自动重试)
 
 # 使用指南
 引入依赖
@@ -483,8 +484,9 @@ use wechat_pay_rust_sdk::error::{ErrorKind, PayError};
 match wechat_pay.jsapi_pay(params).await {
     Ok(response) => { /* response.prepay_id / response.sign_data */ }
     Err(err) => match err.kind() {
-        // 传输层失败。可考虑重试，但⚠ 下单接口不可无脑重试（会重复下单），
-        // 超时后应先用 query_order 确认状态。
+        // 传输层失败。重试判定由 SDK 的失败分类完成（见「自动重试」一节）：
+        // 确定没送到的可安全重试；⚠ 结果未知的（读写超时）写接口不会自动重试，
+        // 应当先用 query_order 确认状态。
         ErrorKind::Network => { /* … */ }
         // 微信业务拒绝：按 response.code 分支，不要重试。
         ErrorKind::Api => {
@@ -520,4 +522,65 @@ let wechat_pay = wechat_pay.with_timeouts(HttpTimeouts {
 ```
 
 ⚠ **超时不代表操作没有发生**：请求很可能已被微信受理，只是响应没回来。
-支付类接口超时后必须用 `query_order` 确认最终状态，**不能**直接重试下单。
+用 `PayError::may_have_taken_effect()` 判断 —— 它为 `true` 时不要当硬失败处理，
+支付 / 退款应当先用 `query_order` / `query_refund` 确认最终状态。
+
+## 自动重试
+
+默认**开着**，但只重试「确定没送达」或「微信明确说没受理」的失败 ——
+也就是说，**默认策略下不可能因为重试而产生第二笔下单或第二笔退款**。
+
+判据是一次失败在微信侧到底处于什么状态：
+
+| 失败 | 典型场景 | 微信侧 | 只读接口 | 写 / 退款 |
+| --- | --- | --- | --- | --- |
+| 确定没送到 | 连接被拒、连接超时 | 没收到 | 重试 | **重试** |
+| 明确未受理 | 429 / 500 / 502 / 503 / 202 | 没处理 | 重试 | **重试** |
+| 结果未知 | 读写超时、504 | **可能已处理** | 重试 | **不重试** |
+| 已处理 | 响应体没读完就断连 | 处理过了 | 不重试 | 不重试 |
+
+第二行的措辞直接来自微信官方 HTTP 状态码页：429 是「**请求未受理**」，
+502/503 是「**请求无法处理**」，各接口的 500 都写「**请用相同参数重新调用**」；
+202 则是官方要求「请使用原参数重复请求一遍」。
+
+**写接口超时为什么不重试**：微信以 `out_trade_no` / `out_refund_no` 作为订单与退款的
+身份键，SDK 内部重放又是字节完全一致的，所以重放本身不会产生第二笔。但官方对超时的
+口径是「先查单确认状态」，而不是「直接再发一次」：
+
+```rust
+match wechat_pay.jsapi_pay(params).await {
+    Err(err) if err.may_have_taken_effect() => {
+        // 结果未知：去查单，不要换个单号重新下单
+        let status = wechat_pay.query_order(&out_trade_no).await?;
+        // …
+    }
+    other => { /* … */ }
+}
+```
+
+### 退避与次数
+
+```rust
+use std::time::Duration;
+use wechat_pay_rust_sdk::retry::RetryPolicy;
+
+// 通用：默认 3 次尝试、200ms 起步的指数退避（上限 2s）+ 全抖动
+let wechat_pay = wechat_pay.with_retry(RetryPolicy {
+    max_attempts: 5,
+    ..RetryPolicy::default()
+});
+```
+
+退款走**独立**的分钟级策略（最多 2 次尝试、首次退避 60s）—— 官方对退款重试的要求是
+「间隔 1 分钟」，且该接口在失败时报错限流只有 6QPS，秒级退避打过去基本是白打：
+
+```rust
+// 同步链路扛不住分钟级阻塞时，关掉退款重试，改由业务侧异步重试
+let wechat_pay = wechat_pay.with_refund_retry(RetryPolicy::disabled());
+```
+
+> ⚠ 默认值下的最坏耗时：通用接口约 `3 × 10s + 退避 ≈ 35s`；退款因分钟级退避约 **1 分钟**。
+> 落在「用户在小程序里等」这种链路上时，请显式调小次数，或用 `RetryPolicy::disabled()` 关掉。
+
+「该不该重试」由失败分类决定，**策略只控制次数与退避** —— 把 `max_attempts` 调大
+也不会让写接口在超时后被重试。
