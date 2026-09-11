@@ -16,6 +16,16 @@ pub enum PayError {
     VerifyError(String),
     #[error("weixin not found error")]
     WeixinNotFound,
+    /// 平台上没有该 `Wechatpay-Serial` 对应的密钥。
+    ///
+    /// 通常意味着微信正在轮换平台证书（轮换期会同时下发新旧两张）——
+    /// 应当**立即重新拉取**平台证书列表（`WechatPay::fetch_platform_keys`）后重试，
+    /// 而不是拿别的密钥去试。
+    #[error("unknown platform serial: {0}")]
+    UnknownPlatformSerial(String),
+    /// 回调/应答的时间戳超出允许窗口，判定为重放，已拒绝处理。
+    #[error("stale notify rejected: {0}")]
+    StaleNotify(String),
     /// 微信侧返回的业务错误（HTTP 状态码非 2xx）。
     ///
     /// 保留微信原始的错误码、错误信息与 detail，便于定位到具体字段。

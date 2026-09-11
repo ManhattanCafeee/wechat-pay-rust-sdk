@@ -1,8 +1,10 @@
 #![doc = include_str!("../README.md")]
 pub mod async_impl;
+pub mod cert;
 pub mod error;
 pub(crate) mod macros;
 pub mod model;
+pub mod notify;
 pub mod pay;
 pub mod pay_type;
 pub mod request;

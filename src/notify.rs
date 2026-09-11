@@ -1,0 +1,153 @@
+//! 回调通知的校验：**新鲜度 → 按 serial 选键 → 验签**。
+//!
+//! 这三步缺一不可，少任何一步都有具体的资损路径：
+//!
+//! | 少做哪步 | 后果 |
+//! | --- | --- |
+//! | 不验签 | 任何人都能伪造回调让你发货 |
+//! | 不查时间戳 | 抓到一次合法回调即可**无限重放** —— 发一次货，重复领取 |
+//! | 写死单张证书 | 平台证书轮换期验签全部失败 → 回调被拒 → 订单不发货 |
+//!
+//! # 本模块**不**负责幂等
+//!
+//! 微信在收到成功应答前会重试投递（15s/15s/30m/10m/20m/30m/…，最多 15 次），
+//! 所以同一笔订单可能回调多次。幂等必须由业务侧落库完成：
+//!
+//! ```no_run
+//! # use wechat_pay_rust_sdk::cert::PlatformKeys;
+//! # use wechat_pay_rust_sdk::notify::NotifyHeaders;
+//! # use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
+//! # fn handle(keys: &PlatformKeys, wechat_pay: &WechatPay, headers: NotifyHeaders, raw_body: &str) {
+//! // 1. 校验来源与新鲜度（本模块）
+//! keys.verify_notify(&headers, raw_body).expect("非法回调");
+//!
+//! // 2. 解密出业务数据
+//! //    （实际字段来自 raw_body 的 resource 节点）
+//! # let (ciphertext, nonce, associated_data) = (String::new(), String::new(), String::new());
+//! let data = wechat_pay
+//!     .decrypt_paydata(ciphertext, nonce, associated_data)
+//!     .expect("解密失败");
+//!
+//! // 3. 幂等：按 out_trade_no / transaction_id 落库去重，重复投递直接返回成功
+//! //    —— 这一步必须由你的业务代码完成，SDK 无法代劳。
+//! # }
+//! ```
+//!
+//! 另外注意应答要求：**5 秒内**返回响应，成功时返回 **HTTP 200 或 204 且不带 body**；
+//! 校验或处理失败才返回 4XX/5XX + `{"code":"FAIL","message":"…"}`。
+//! 业务处理应当异步化，不要在回调线程里做重活。
+
+use crate::cert::PlatformKeys;
+use crate::error::PayError;
+
+/// 官方建议允许的最大时间偏差：
+/// 「如果时间戳与当前时间的偏差超过5分钟，您应拒绝处理当前的响应或回调通知」。
+pub const MAX_TIMESTAMP_SKEW_SECS: i64 = 5 * 60;
+
+/// 微信回调（及应答）的验签请求头。
+#[derive(Debug, Clone)]
+pub struct NotifyHeaders {
+    /// `Wechatpay-Serial`：签名所用平台证书的序列号，或微信支付公钥 ID（`PUB_KEY_ID_…`）。
+    pub serial: String,
+    /// `Wechatpay-Timestamp`：签名时间戳（秒）。
+    pub timestamp: String,
+    /// `Wechatpay-Nonce`：签名随机串。
+    pub nonce: String,
+    /// `Wechatpay-Signature`：base64 签名。
+    pub signature: String,
+}
+
+impl NotifyHeaders {
+    pub fn new(
+        serial: impl Into<String>,
+        timestamp: impl Into<String>,
+        nonce: impl Into<String>,
+        signature: impl Into<String>,
+    ) -> Self {
+        Self {
+            serial: serial.into(),
+            timestamp: timestamp.into(),
+            nonce: nonce.into(),
+            signature: signature.into(),
+        }
+    }
+
+    /// 从 `(name, value)` 对中提取四个头。
+    ///
+    /// header 名比较时忽略大小写，并把 `_` 视作 `-`，因此 axum / actix 的
+    /// header 迭代器都能直接传进来。四个头缺任意一个都会返回
+    /// [`PayError::VerifyError`]。
+    pub fn from_pairs<'a, I>(pairs: I) -> Result<Self, PayError>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let mut serial = None;
+        let mut timestamp = None;
+        let mut nonce = None;
+        let mut signature = None;
+
+        for (name, value) in pairs {
+            let normalized = name.to_ascii_lowercase().replace('_', "-");
+            match normalized.as_str() {
+                "wechatpay-serial" => serial = Some(value.to_string()),
+                "wechatpay-timestamp" => timestamp = Some(value.to_string()),
+                "wechatpay-nonce" => nonce = Some(value.to_string()),
+                "wechatpay-signature" => signature = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        let missing = |name: &str| PayError::VerifyError(format!("回调缺少请求头 {name}"));
+        Ok(Self {
+            serial: serial.ok_or_else(|| missing("Wechatpay-Serial"))?,
+            timestamp: timestamp.ok_or_else(|| missing("Wechatpay-Timestamp"))?,
+            nonce: nonce.ok_or_else(|| missing("Wechatpay-Nonce"))?,
+            signature: signature.ok_or_else(|| missing("Wechatpay-Signature"))?,
+        })
+    }
+}
+
+impl PlatformKeys {
+    /// 一站式回调校验：**时间戳新鲜度 → 按 serial 选键 → 验签**。
+    ///
+    /// 通过后仍需自行完成幂等去重（见模块级文档）。
+    /// 返回 [`PayError::StaleNotify`] 表示时间戳超窗（疑似重放）；
+    /// 返回 [`PayError::UnknownPlatformSerial`] 表示该 serial 不在索引里 ——
+    /// 应立即重新拉取平台证书列表后重试。
+    pub fn verify_notify(&self, headers: &NotifyHeaders, body: &str) -> Result<(), PayError> {
+        self.verify_notify_at(headers, body, chrono::Local::now().timestamp())
+    }
+
+    /// 同 [`Self::verify_notify`]，但由调用方显式提供「当前时间」（unix 秒）。
+    ///
+    /// 供测试与需要注入时钟的场景使用。
+    pub fn verify_notify_at(
+        &self,
+        headers: &NotifyHeaders,
+        body: &str,
+        now_unix_secs: i64,
+    ) -> Result<(), PayError> {
+        let signed_at: i64 = headers.timestamp.parse().map_err(|_| {
+            PayError::StaleNotify(format!(
+                "Wechatpay-Timestamp 不是整数秒: {}",
+                headers.timestamp
+            ))
+        })?;
+
+        let skew = (now_unix_secs - signed_at).abs();
+        if skew > MAX_TIMESTAMP_SKEW_SECS {
+            return Err(PayError::StaleNotify(format!(
+                "时间戳偏差 {skew}s 超出 ±{MAX_TIMESTAMP_SKEW_SECS}s，判定为重放（timestamp={}, now={now_unix_secs}）",
+                headers.timestamp
+            )));
+        }
+
+        self.verify(
+            &headers.serial,
+            &headers.timestamp,
+            &headers.nonce,
+            body,
+            &headers.signature,
+        )
+    }
+}

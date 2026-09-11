@@ -16,6 +16,7 @@ use std::thread;
 
 use wechat_pay_rust_sdk::error::PayError;
 use wechat_pay_rust_sdk::model::{JsapiParams, RefundsParams};
+use wechat_pay_rust_sdk::notify::NotifyHeaders;
 use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
 use wechat_pay_rust_sdk::util;
 
@@ -653,5 +654,180 @@ dual_test! {
 
         let overridden = default.with_base_url("http://127.0.0.1:1234");
         assert!(format!("{overridden:?}").contains("http://127.0.0.1:1234"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 平台证书轮换（P1-3）与回调防护（P1-4）
+// ---------------------------------------------------------------------------
+
+/// 测试用自签名平台证书（PEM）。
+///
+/// 微信 `GET /v3/certificates` 的 `encrypt_certificate.ciphertext` 解密后得到的是
+/// **PEM 证书**（不是 DER），`util::x509_to_pem` 也按 PEM 解析 —— 所以这里直接放 PEM。
+///
+/// 由 `TEST_PRIVATE_KEY` 签发，证书里的公钥与测试私钥配对，可直接验证 `sign_rsa`。
+/// ⚠ 一次性测试证书，不对应任何真实平台证书。
+const TEST_PLATFORM_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUZANuXDsu1bA4uXs2PNYdtb8+1LowDQYJKoZIhvcNAQEL
+BQAwIjEgMB4GA1UEAwwXd2VjaGF0cGF5LXRlc3QtcGxhdGZvcm0wHhcNMjYwOTEx
+MDgwOTQyWhcNMzYwOTA4MDgwOTQyWjAiMSAwHgYDVQQDDBd3ZWNoYXRwYXktdGVz
+dC1wbGF0Zm9ybTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMbvGuI4
+yr8IO5qECuACMmxAZPyAEqkdZeuUJsWQkPrmgu5RNXKW4bVtEvKFbOqHtY65CohO
+ZRX6zUM83yW5qI1tV+TsLt7RKW9y4R/ILkTgT/ED3uKkOeO1XMxdNZ5EyJvOptPe
+vV2SDOTTokawqCslCrSapzRR9QtRUn5v6KgTjCNgDtRs9CaiSP8kCTmKjLd8If5C
+d8Oy4sy9jQZYK1dz+65Z+avLXw8/V85X/+c3z5MZG1MWHH4U0sK8qaZSrmkgaUr8
+zLm2R/xHJwa/w7Yoowl+J44klWdo+HGSCaCqXWo2AxUcZp+iqN6EU9M81Zh3YqKj
+ZG4J/5jH9sP9UWsCAwEAAaNTMFEwHQYDVR0OBBYEFG36siVExw68hXtvpY1MPj4x
+fkcFMB8GA1UdIwQYMBaAFG36siVExw68hXtvpY1MPj4xfkcFMA8GA1UdEwEB/wQF
+MAMBAf8wDQYJKoZIhvcNAQELBQADggEBAJ9//mpwWZ1hQdDO4RDe1LdyD7JDUCUN
++c69yyvRJlwXKAEUdTiRO2i99bR18bXorkFtdKA2NcruQRkeoNsJRmTKhkV/H4hT
+mlvsIx4arU63etNw2674lbVl2KJMKf87i6+9grKTrzKIqsVAyRYnvESF0ApRmt24
+FPGMiEwdWiFmnyBE3oLazze6Ro4L1GbR9nU6za5OLF80EXkvIjdiUrstNxEGIIku
+8GHvNejrW1l90THjfbsGQw+QOldwc+1ZG5vPsdOhudpINADDFR5SK7ME4pj2SvB9
+ubZoRgaS3Vxyvr5CRzkZcoNsfQedoxGkzOkrUhIfcMWJ0AyrDcUHkNU=
+-----END CERTIFICATE-----
+";
+
+/// 用 `TEST_V3_KEY` 加密一段明文，构造微信证书接口里 `encrypt_certificate` 的形状。
+fn encrypt_certificate(plaintext: &[u8], nonce: &str) -> String {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
+
+    let cipher = Aes256Gcm::new_from_slice(TEST_V3_KEY.as_bytes()).expect("cipher");
+    let nonce_bytes: [u8; 12] = nonce.as_bytes().try_into().expect("nonce 必须是 12 字节");
+    let encrypted = cipher
+        .encrypt(
+            &Nonce::from(nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad: b"certificate",
+            },
+        )
+        .expect("encrypt");
+    util::base64_encode(&encrypted)
+}
+
+/// 构造 `GET /v3/certificates` 的响应体；`entries` 为 `(serial_no, nonce)`。
+fn certificates_response(entries: &[(&str, &str)]) -> String {
+    let cert_pem = TEST_PLATFORM_CERT_PEM.as_bytes();
+    let items: Vec<String> = entries
+        .iter()
+        .map(|(serial, nonce)| {
+            format!(
+                r#"{{"serial_no":"{serial}","effective_time":"2026-01-01T00:00:00+08:00","expire_time":"2031-01-01T00:00:00+08:00","encrypt_certificate":{{"algorithm":"AEAD_AES_256_GCM","nonce":"{nonce}","associated_data":"certificate","ciphertext":"{}"}}}}"#,
+                encrypt_certificate(cert_pem, nonce)
+            )
+        })
+        .collect();
+    format!(r#"{{"data":[{}]}}"#, items.join(","))
+}
+
+dual_test! {
+    fn fetch_platform_keys_indexes_both_certificates_during_rotation() {
+        // 轮换期微信会同时下发新旧两张且都在有效期内 —— 两张都要索引，
+        // 否则灰度期间会有一半回调验签失败。
+        let body = certificates_response(&[("SERIAL_OLD", "nonce_old_01"), ("SERIAL_NEW", "nonce_new_01")]);
+        let mock = Mock::start(vec![MockResponse::json(200, &body)]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let keys = call!(wechat_pay.fetch_platform_keys()).expect("拉取并解密平台证书");
+
+        assert_eq!(keys.len(), 2, "两张证书都要索引，实际: {:?}", keys.serials());
+        assert_eq!(keys.serials(), vec!["SERIAL_NEW", "SERIAL_OLD"]);
+        for serial in ["SERIAL_OLD", "SERIAL_NEW"] {
+            let pem = keys.get(serial).expect("serial 应在索引里");
+            assert!(pem.contains("BEGIN PUBLIC KEY"), "解密结果应是 PEM 公钥: {pem}");
+        }
+
+        assert_eq!(mock.requests()[0].path, "/v3/certificates");
+        assert_eq!(mock.requests()[0].method, "GET");
+    }
+}
+dual_test! {
+    fn platform_keys_refresh_window() {
+        let mut keys = wechat_pay_rust_sdk::cert::PlatformKeys::new();
+        assert!(keys.needs_refresh(0), "从未拉取过就该刷新");
+        keys.mark_refreshed(1_000);
+        assert!(!keys.needs_refresh(1_000 + 3600), "一小时后不必刷新");
+        assert!(
+            keys.needs_refresh(1_000 + wechat_pay_rust_sdk::cert::REFRESH_INTERVAL_SECS),
+            "达到刷新间隔就该刷新"
+        );
+        assert_eq!(keys.fetched_at(), Some(1_000));
+    }
+}
+dual_test! {
+    fn verify_notify_selects_key_by_serial_and_rejects_replay() {
+        let body_json = certificates_response(&[("SERIAL_A", "nonce_cert_1")]);
+        let mock = Mock::start(vec![MockResponse::json(200, &body_json)]);
+        let wechat_pay = client_for(&mock.base_url);
+        let keys = call!(wechat_pay.fetch_platform_keys()).expect("拉取平台证书");
+
+        let now: i64 = 1_780_000_000;
+        let callback_body = r#"{"id":"evt_1","event_type":"TRANSACTION.SUCCESS"}"#;
+        let timestamp = now.to_string();
+        let nonce = "notify_nonce_1";
+        let signature = sign_rsa(&format!("{timestamp}\n{nonce}\n{callback_body}\n"));
+        let headers = NotifyHeaders::new("SERIAL_A", &timestamp, nonce, &signature);
+
+        // 1) 新鲜 + serial 命中 -> 通过
+        keys.verify_notify_at(&headers, callback_body, now)
+            .expect("合法回调必须通过");
+
+        // 2) 时间戳超窗 -> 判定重放。缺了这一步，抓到一次合法回调就能无限重放。
+        let err = keys
+            .verify_notify_at(&headers, callback_body, now + 301)
+            .expect_err("超窗必须被拒绝");
+        assert!(matches!(err, PayError::StaleNotify(_)), "应为 StaleNotify，实际 {err:?}");
+
+        // 窗口边界：恰好 300s 仍应接受
+        keys.verify_notify_at(&headers, callback_body, now + 300)
+            .expect("恰好在窗口边界内应接受");
+
+        // 3) serial 不在索引里 -> 提示重新拉取，而不是拿别的密钥去试
+        let unknown = NotifyHeaders::new("SERIAL_UNKNOWN", &timestamp, nonce, &signature);
+        let err = keys
+            .verify_notify_at(&unknown, callback_body, now)
+            .expect_err("未知 serial 必须失败");
+        assert!(
+            matches!(err, PayError::UnknownPlatformSerial(_)),
+            "应为 UnknownPlatformSerial（提示重新拉取），实际 {err:?}"
+        );
+
+        // 4) 篡改 body -> 验签失败
+        let tampered = r#"{"id":"evt_1","event_type":"TRANSACTION.FAIL"}"#;
+        let err = keys
+            .verify_notify_at(&headers, tampered, now)
+            .expect_err("被篡改的回调必须失败");
+        assert!(matches!(err, PayError::VerifyError(_)), "应为 VerifyError，实际 {err:?}");
+
+        // 5) 时间戳不是整数 -> 拒绝，且不能 panic
+        let bad = NotifyHeaders::new("SERIAL_A", "not-a-number", nonce, &signature);
+        let err = keys
+            .verify_notify_at(&bad, callback_body, now)
+            .expect_err("非法时间戳必须被拒绝");
+        assert!(matches!(err, PayError::StaleNotify(_)), "应为 StaleNotify，实际 {err:?}");
+    }
+}
+dual_test! {
+    fn notify_headers_from_pairs_is_case_insensitive_and_requires_all_four() {
+        let headers = NotifyHeaders::from_pairs([
+            ("Wechatpay-Serial", "S1"),
+            ("wechatpay-timestamp", "123"),
+            ("Wechatpay_Nonce", "n1"),
+            ("WECHATPAY-SIGNATURE", "sig"),
+        ])
+        .expect("四个头齐全");
+        assert_eq!(headers.serial, "S1");
+        assert_eq!(headers.timestamp, "123");
+        assert_eq!(headers.nonce, "n1");
+        assert_eq!(headers.signature, "sig");
+
+        // 缺头必须报错，而不是拿空串去验签（那会静默失败）
+        let err = NotifyHeaders::from_pairs([("Wechatpay-Serial", "S1")])
+            .expect_err("缺头应报错");
+        assert!(matches!(err, PayError::VerifyError(_)), "实际 {err:?}");
     }
 }
