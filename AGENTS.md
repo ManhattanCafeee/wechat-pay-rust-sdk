@@ -9,7 +9,10 @@ and callback (notify) decryption + RSA signature verification behind one `Wechat
 Single library crate at the repo root, plus one workspace member binary (`example/`, an actix-web
 notify server). No CLI, no service, no generated code.
 
-- **MSRV:** unstated. `edition = "2024"`, verified working on `rustc 1.98.0`. No `rust-toolchain.toml`.
+- **MSRV: 1.89**（`rust-version = "1.89"`，edition 2024）。CI 有独立的 MSRV 作业用 1.89.0 跑
+  `cargo check --all-targets`。⚠ 声明 `rust-version` 不只是记录下限 —— 它会让 cargo
+  **优先挑兼容该版本的依赖**。本仓库按库的惯例不提交 `Cargo.lock`，不声明的话实际 MSRV
+  会随解析漂移（实测 1.85 / 1.88 都曾因 `icu_*`、`time`、`aes` 的新版本而编译失败）。No `rust-toolchain.toml`.
 - **License: Apache-2.0.** The package previously declared `license = "MIT"` in `Cargo.toml` while
   shipping the Apache-2.0 license text. This fork standardised on Apache-2.0 — the license the code was
   actually received under — and filled in the copyright notice; original author attribution is in
@@ -113,6 +116,7 @@ example/              actix-web notify server; async usage reference
 tests/offline.rs      离线集成测试：本地 mock 微信网关，无需凭证，CI 跑的就是它
 .github/workflows/    CI：两种 feature 模式下的 test / check / clippy
 NOTICE                Apache-2.0 归属声明（上游贡献者名单）
+CHANGELOG.md          破坏性/行为变更记录（含未发布的 0.3.0 变更集）
 ```
 
 没有 scripts、没有 `rustfmt.toml`、没有 clippy 配置文件。
@@ -123,15 +127,21 @@ Run everything from the repo root (tests use CWD-relative fixture paths).
 
 ```bash
 # 完整测试：tests/offline.rs 用本地 mock 服务替代微信网关，不需要凭证或公网
-cargo test                    # PASS — lib 2 passed / 14 ignored，offline 25 passed
+cargo test                    # PASS — lib 2 passed / 14 ignored，offline 30 passed
 cargo test --features async   # PASS — 同一套测试在 async 模式下再跑一遍
 
 # 两种 feature 模式都必须能编译（含测试目标）——这是防回归的关键两条
 cargo check --all-targets
 cargo check --features async --all-targets
 cargo check -p example
-cargo clippy --all-targets --features async
 
+# 零告警是硬门槛（含 missing_docs）。debug-print 会切换 macros 的 cfg 分支，
+# 所以 CI 跑 3 种 feature 组合，本地至少要跑前两条。
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features async -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
+
+cargo fmt --all -- --check    # 全仓已格式化，CI 有门禁
 cargo build --release
 cargo run -p example          # actix server on 0.0.0.0:8080
 
@@ -141,15 +151,12 @@ cargo test --lib -- --ignored
 
 **`cargo test` 现在是绿的，可以当作冒烟测试用。** 改动后请同时跑 sync 与 async 两遍。
 
-⚠ 两条**有意不跑**的命令：
+⚠ 一条**有意不跑**的命令：
 
 - `cargo test --doc` —— README 通过 `#![doc = include_str!("../README.md")]` 充当 crate 文档，
   其示例需要真实商户密钥与公网（还含 actix-web 片段与输出示例）。`[lib] doctest = false` 使普通
   `cargo test` 跳过它们，但**显式**传入 `--doc` 会强制编译 README 代码块并失败（20 个）。
   它不是本仓库受支持的命令；要改 README 示例请自行编译验证。
-- `cargo fmt --check` —— 仓库尚未整体格式化：`src/pay.rs`、`src/async_impl/pay.rs`、
-  `example/src/main.rs` 存在 import 排序等差异。**新增/修改的文件请保持 rustfmt 干净**，
-  不要顺手对整个仓库跑 `cargo fmt`（会让 fork 与上游的 diff 难以审阅）。
 
 `cargo check --no-default-features` 会失败，属**既有问题**（`src/error.rs` 无条件引用
 `reqwest::Error`，而 reqwest 是 optional 依赖），与本次改动无关。
@@ -315,7 +322,7 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
 
 | 层 | 位置 | 内容 |
 | --- | --- | --- |
-| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写 HTTP 服务，支持 keep-alive 与连接计数）替代微信网关；25 个带断言的用例（含编译期 Send/Sync 断言） |
+| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写 HTTP 服务，支持 keep-alive 与连接计数）替代微信网关；30 个带断言的用例（含编译期 Send/Sync 断言） |
 | 纯逻辑单测 | `src/pay.rs`、`src/async_impl/pay.rs` | `test_uuid_v4`、`test_str` 两个无外部依赖用例 |
 
 **`tests/offline.rs` 覆盖的契约（改这些行为必须同步改测试）：**
@@ -334,6 +341,10 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
 - **错误信封**：2xx + `{"code":…}` → `Err`；且成功响应不被误判（含 `code: null` / `code: ""` 两种负例）
 - **连接复用**：同一客户端两次请求只占 1 条 TCP 连接；独立客户端占 2 条（后者同时证明计数不是恒为 1）
 - **超时**：只接受连接不回响应的服务端会触发超时（`reqwest::Error::is_timeout()`）而不是挂死
+- **`sign_data` 前缀**：APP 支付的 `package` 是裸 `prepay_id`，JSAPI / 付款码必须带 `prepay_id=` 前缀（历史回归点，见提交 `95cf80a`）
+- **申请退款成功路径**：解析出退款单并断言 `status == PROCESSING`（受理 ≠ 成功）
+- **`get_weixin`**：能从 H5 页面抠出 `weixin://` 链接、带 Referer、页面无链接时报 `WeixinNotFound`
+- **X.509 助手**：`x509_to_pem` 取出的公钥必须能验证配套私钥的签名（不只是「长得像 PEM」）；非 PEM 输入返回 `Err` 而非 panic
 
 **写新测试请用 `dual_test!`** —— 一份测试体在两种 feature 下各生成一个测试函数：
 
@@ -404,19 +415,19 @@ pub fn test_native_pay() { /* … sync … */ }
 4. **`get_weixin` 是 SSRF 面** —— 对调用方传入的 URL 发 GET 且无白名单；`h5_url` 绝不能来自用户输入。
 5. **`cargo check --no-default-features` 失败** —— 既有问题：`src/error.rs` 无条件引用
    `reqwest::Error`，而 reqwest 是 optional 依赖。
-6. **仓库尚未整体 rustfmt 化** —— 见 Development Commands。
-7. **`.json()` → `from_str` 的解码差异** —— 非法 UTF-8 的 2xx 响应体现在会被有损替换为 U+FFFD
+6. **`.json()` → `from_str` 的解码差异** —— 非法 UTF-8 的 2xx 响应体现在会被有损替换为 U+FFFD
    后解析成功，而不是报错（微信返回的 JSON 始终是合法 UTF-8，实际无影响）。
-8. **自动重试未实现** —— 超时/连接失败的重试策略留给调用方：⚠ 下单类接口**不可**无脑重试
+7. **自动重试未实现** —— 超时/连接失败的重试策略留给调用方：⚠ 下单类接口**不可**无脑重试
    （会重复下单），只对幂等的 GET 查单重试；超时后应先用 `query_order` 确认状态。
-9. **版本号未体现破坏性变更** —— 破坏性变更已累积：`refunds()` 返回类型与语义变更、`WeChatResponse`
+8. **版本号未体现破坏性变更** —— 破坏性变更已累积：`refunds()` 返回类型与语义变更、`WeChatResponse`
    被删除、`WechatPay` 字段私有化、`PayError` 新增变体。按 semver 应把 `Cargo.toml` 的
-   `0.2.21` 提到 **`0.3.0`**。是否 bump / 何时发布由维护者决定，本次未动。
-10. **crate name 与上游冲突** —— `name = "wechat-pay-rust-sdk"` 在 crates.io 已被上游占用。
-    仅当要发布到 crates.io 时才需要改名（改名会牵动 `example/Cargo.toml` 的依赖声明）；
-    作为 path / git 依赖使用则无需改动。
+   `0.2.21` 提到 **`0.3.0`**（`CHANGELOG.md` 的 Unreleased 一节已列全）。
+   是否 bump / 何时发布由维护者决定，本次未动。
+9. **crate name 与上游冲突** —— `name = "wechat-pay-rust-sdk"` 在 crates.io 已被上游占用。
+   仅当要发布到 crates.io 时才需要改名（改名会牵动 `example/Cargo.toml` 的依赖声明）；
+   作为 path / git 依赖使用则无需改动。
 
-### 已完成（P0 / P1 / P2）
+### 已完成（P0 / P1 / P2 / 规范）
 
 - ~~错误吞噬：非 2xx 响应被解析成成功~~ → `send_and_check` 先查状态码，新增 `PayError::ApiError`
 - ~~缺少订单查询 / 关单 / 退款查询~~ → `query_order` / `close_order` / `query_refund`
@@ -430,3 +441,6 @@ pub fn test_native_pay() { /* … sync … */ }
 - ~~`PayError` 只有一个大枚举，无法区分处置策略~~ → `PayError::kind()` 分三层（Network / Api / Local）
 - ~~每次请求 `Client::new()`，无超时、无连接池~~ → `WechatPay` 持有复用客户端 + `HttpTimeouts`（默认 5s / 10s / 90s）
 - ~~HTTP 200 + 错误信封仍返回 `Ok`~~ → `is_error_envelope` 在 `request_json` 兜住；删除已无意义的 `WeChatResponse`
+- ~~179 处公开项缺文档~~ → 全部补齐；`[lints.rust] missing_docs = "warn"` + CI `-D warnings` 作硬门槛
+- ~~仓库未 rustfmt 化~~ → 全仓格式化 + CI `cargo fmt --all -- --check`
+- ~~MSRV 未声明且会随依赖解析漂移~~ → 声明 `rust-version = "1.89"` + CI MSRV 作业（用 1.89.0 验证）

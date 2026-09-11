@@ -2,11 +2,15 @@ use crate::model::PayerInfo;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+/// 响应模型：可从微信返回的 JSON 反序列化。
 pub trait ResponseTrait: DeserializeOwned {}
 
+/// Native 下单响应：返回二维码链接 code_url。
 #[derive(Debug, Deserialize)]
 pub struct NativeResponse {
+    /// 【错误码】 仅在下单失败时返回。
     pub code: Option<String>,
+    /// 【错误信息】 仅在下单失败时返回。
     pub message: Option<String>,
     ///【支付跳转链接】 h5_url为拉起微信支付收银台的中间页面，可通过访问该URL来拉起微信客户端，完成支付，h5_url的有效期为5分钟。
     pub code_url: Option<String>,
@@ -14,9 +18,12 @@ pub struct NativeResponse {
 
 impl ResponseTrait for NativeResponse {}
 
+/// JSAPI 下单响应：返回预支付交易会话标识 prepay_id 与签名数据。
 #[derive(Debug, Deserialize)]
 pub struct JsapiResponse {
+    /// 【错误码】 仅在下单失败时返回。
     pub code: Option<String>,
+    /// 【错误信息】 仅在下单失败时返回。
     pub message: Option<String>,
     ///【预支付交易会话标识】 预支付交易会话标识。用于后续接口调用中使用，该值有效期为2小时
     pub prepay_id: Option<String>,
@@ -24,21 +31,31 @@ pub struct JsapiResponse {
     pub sign_data: Option<SignData>,
 }
 
+/// JSAPI 签名数据：供 wx.requestPayment 拉起支付使用。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SignData {
+    /// 【应用ID】 发起支付的公众号或移动应用的 appid。
     pub app_id: String,
+    /// 【签名类型】 签名算法类型，固定为 RSA。
     pub sign_type: String,
+    /// 【订单详情扩展字符串】 形如 prepay_id=xxx，由预支付会话标识拼装。
     pub package: String,
+    /// 【随机字符串】 参与签名的随机字符串。
     pub nonce_str: String,
+    /// 【时间戳】 参与签名的秒级时间戳。
     pub timestamp: String,
+    /// 【签名值】 使用商户私钥对上述参数生成的签名。
     pub pay_sign: String,
 }
 
 impl ResponseTrait for JsapiResponse {}
 
+/// APP 下单响应：返回预支付交易会话标识 prepay_id 与签名数据。
 #[derive(Debug, Deserialize)]
 pub struct AppResponse {
+    /// 【错误码】 仅在下单失败时返回。
     pub code: Option<String>,
+    /// 【错误信息】 仅在下单失败时返回。
     pub message: Option<String>,
     ///【预支付交易会话标识】 预支付交易会话标识。用于后续接口调用中使用，该值有效期为2小时
     pub prepay_id: Option<String>,
@@ -48,9 +65,12 @@ pub struct AppResponse {
 
 impl ResponseTrait for AppResponse {}
 
+/// 付款码下单响应：返回预支付交易会话标识 prepay_id 与签名数据。
 #[derive(Debug, Deserialize)]
 pub struct MicroResponse {
+    /// 【错误码】 仅在下单失败时返回。
     pub code: Option<String>,
+    /// 【错误信息】 仅在下单失败时返回。
     pub message: Option<String>,
     ///【预支付交易会话标识】 预支付交易会话标识。用于后续接口调用中使用，该值有效期为2小时
     pub prepay_id: Option<String>,
@@ -60,9 +80,12 @@ pub struct MicroResponse {
 
 impl ResponseTrait for MicroResponse {}
 
+/// H5 下单响应：返回拉起微信收银台的 h5_url。
 #[derive(Debug, Deserialize)]
 pub struct H5Response {
+    /// 【错误码】 仅在下单失败时返回。
     pub code: Option<String>,
+    /// 【错误信息】 仅在下单失败时返回。
     pub message: Option<String>,
     ///【二维码链接】 此URL用于生成支付二维码，然后提供给用户扫码支付。
     /// 注意：code_url并非固定值，使用时按照URL格式转成二维码即可。
@@ -71,29 +94,42 @@ pub struct H5Response {
 
 impl ResponseTrait for H5Response {}
 
+/// 平台证书的加密信息。
 #[derive(Debug, Clone, Deserialize)]
 pub struct EncryptCertificate {
+    /// 【加密算法】 证书密文使用的加密算法，固定为 AEAD_AES_256_GCM。
     pub algorithm: String,
+    /// 【随机串】 加密使用的随机串。
     pub nonce: String,
+    /// 【附加数据】 加密使用的附加数据。
     pub associated_data: String,
+    /// 【密文】 证书内容的 Base64 密文。
     pub ciphertext: String,
 }
 
+/// 微信支付平台证书。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Certificate {
+    /// 【证书序列号】 平台证书的序列号。
     pub serial_no: String,
+    /// 【生效时间】 证书生效时间，遵循 rfc3339 格式。
     pub effective_time: String,
+    /// 【失效时间】 证书失效时间，遵循 rfc3339 格式。
     pub expire_time: String,
+    /// 【加密证书】 证书的加密信息。
     pub encrypt_certificate: EncryptCertificate,
 }
 
+/// 获取平台证书响应：GET /v3/certificates 返回的证书列表。
 #[derive(Debug, Deserialize)]
 pub struct CertificateResponse {
+    /// 【证书列表】 微信支付平台证书列表。
     pub data: Option<Vec<Certificate>>,
 }
 
 impl ResponseTrait for CertificateResponse {}
 
+/// 微信支付错误响应：包含错误码与字段级错误详情。
 #[derive(Deserialize, Debug)]
 pub struct ErrorResponse {
     /// 【错误码】 错误码
@@ -119,6 +155,7 @@ impl std::fmt::Display for ErrorResponse {
     }
 }
 
+/// 退款单响应：退款申请受理后返回的退款单信息。
 #[derive(Debug, Deserialize)]
 pub struct RefundsResponse {
     /// 【微信支付退款单号】申请退款受理成功时，该笔退款单在微信支付侧生成的唯一标识。
@@ -180,6 +217,7 @@ pub struct RefundsResponse {
 
 impl ResponseTrait for RefundsResponse {}
 
+/// 退款金额信息。
 #[derive(Debug, Deserialize)]
 pub struct RefundsAmountResponse {
     /// 【订单金额】 订单总金额，单位为分
@@ -206,6 +244,7 @@ pub struct RefundsAmountResponse {
     pub refund_fee: Option<i32>,
 }
 
+/// 退款出资账户及金额信息。
 #[derive(Debug, Deserialize)]
 pub struct RefundsFromResponse {
     /// 【出资账户类型】下面枚举值多选一。
@@ -217,6 +256,7 @@ pub struct RefundsFromResponse {
     pub amount: i32,
 }
 
+/// 退款优惠详情：代金券退款信息。
 #[derive(Debug, Deserialize)]
 pub struct RefundsPromotionDetailResponse {
     /// 【券ID】代金券id，单张代金券的编号
@@ -237,6 +277,7 @@ pub struct RefundsPromotionDetailResponse {
     pub goods_detail: Option<Vec<RefundsGoodsDetailResponse>>,
 }
 
+/// 退款商品详情：指定商品退款时的商品信息。
 #[derive(Debug, Deserialize)]
 pub struct RefundsGoodsDetailResponse {
     /// 【商户侧商品编码】 申请退款的商户侧商品编码。
@@ -253,6 +294,7 @@ pub struct RefundsGoodsDetailResponse {
     pub refund_quantity: i32,
 }
 
+/// 交易订单响应：查询订单返回的交易详情。
 #[derive(Debug, Deserialize)]
 pub struct TransactionResponse {
     /// 【应用ID】 直连商户申请的公众号或移动应用appid。
@@ -300,6 +342,7 @@ pub struct TransactionResponse {
 
 impl ResponseTrait for TransactionResponse {}
 
+/// 交易订单金额信息。
 #[derive(Debug, Deserialize)]
 pub struct TransactionAmountResponse {
     /// 【订单金额】 订单总金额，单位为分。
@@ -312,12 +355,14 @@ pub struct TransactionAmountResponse {
     pub payer_currency: Option<String>,
 }
 
+/// 交易场景信息。
 #[derive(Debug, Deserialize)]
 pub struct TransactionSceneInfo {
     /// 【商户端设备号】 商户端设备号（门店号或收银设备ID）。
     pub device_id: Option<String>,
 }
 
+/// 交易优惠详情：代金券优惠信息。
 #[derive(Debug, Deserialize)]
 pub struct TransactionPromotionDetail {
     /// 【券ID】 代金券id，单张代金券的编号。
@@ -349,6 +394,7 @@ pub struct TransactionPromotionDetail {
     pub goods_detail: Option<Vec<TransactionPromotionGoodsDetail>>,
 }
 
+/// 交易优惠商品详情：单品优惠信息。
 #[derive(Debug, Deserialize)]
 pub struct TransactionPromotionGoodsDetail {
     /// 【商品编码】 商品编码。

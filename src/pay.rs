@@ -5,14 +5,14 @@ use crate::response::SignData;
 use crate::{debug, sign, util};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, USER_AGENT};
 use std::time::Duration;
 use uuid::Uuid;
 
-#[cfg(not(feature = "async"))]
-use reqwest::blocking::Client;
 #[cfg(feature = "async")]
 use reqwest::Client;
+#[cfg(not(feature = "async"))]
+use reqwest::blocking::Client;
 
 /// 默认连接超时：5 秒。
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -93,7 +93,14 @@ impl std::fmt::Debug for WechatPay {
     }
 }
 
+/// 回调与应答相关的能力：验签、解密。
+///
+/// 已为 [`WechatPay`] 实现。签名/解密用的密钥都来自 [`WechatPayTrait`] 的访问器。
 pub trait PayNotifyTrait: WechatPayTrait {
+    /// 用平台公钥验证 `"{timestamp}\n{nonce}\n{body}\n"` 的签名。
+    ///
+    /// ⚠ 只验签名，**不校验时间戳新鲜度**。做回调入口请用
+    /// [`crate::notify`] 里的 `PlatformKeys::verify_notify`，它会额外做防重放检查。
     fn verify_signature<S>(
         &self,
         pub_key: &str,
@@ -113,6 +120,10 @@ pub trait PayNotifyTrait: WechatPayTrait {
         );
         util::verify_rsa_sha256(pub_key, &message, signature.as_ref())
     }
+    /// 解密回调里的 `resource`，并把明文解析成 [`WechatPayDecodeData`]。
+    ///
+    /// 三个参数都来自回调 body 的 `resource` 节点（`ciphertext` / `nonce` /
+    /// `associated_data`）。⚠ 解密**不能替代验签**：先验签再解密。
     fn decrypt_paydata<S>(
         &self,
         ciphertext: S,
@@ -126,6 +137,10 @@ pub trait PayNotifyTrait: WechatPayTrait {
         let data: WechatPayDecodeData = serde_json::from_slice(&plaintext)?;
         Ok(data)
     }
+    /// 用 APIv3 密钥做 AES-256-GCM 解密，返回明文（不解析）。
+    ///
+    /// 平台证书也是加密下发的，用它解出 PEM 证书后再交给
+    /// [`crate::util::x509_to_pem`]。
     fn decrypt_bytes<S>(
         &self,
         ciphertext: S,
@@ -135,9 +150,11 @@ pub trait PayNotifyTrait: WechatPayTrait {
     where
         S: AsRef<str>,
     {
-        let nonce: [u8; 12] = nonce.as_ref().as_bytes().try_into().map_err(|_| {
-            PayError::DecryptError("nonce length must be 12".to_string())
-        })?;
+        let nonce: [u8; 12] = nonce
+            .as_ref()
+            .as_bytes()
+            .try_into()
+            .map_err(|_| PayError::DecryptError("nonce length must be 12".to_string()))?;
         let v3_key = self.v3_key();
         let ciphertext = util::base64_decode(ciphertext.as_ref())?;
         let cipher = Aes256Gcm::new_from_slice(v3_key.as_bytes())
@@ -153,22 +170,39 @@ pub trait PayNotifyTrait: WechatPayTrait {
     }
 }
 
+/// 客户端的配置访问器与签名能力。
+///
+/// 抽成 trait 是为了让 [`PayNotifyTrait`] 的默认方法能在不依赖具体类型的情况下复用。
 pub trait WechatPayTrait {
+    /// 商户 / 小程序 appid。
     fn appid(&self) -> String;
+    /// 商户号。
     fn mch_id(&self) -> String;
+    /// 商户 API 私钥（PEM 内容）。
     fn private_key(&self) -> String;
+    /// 商户 API 证书序列号。
     fn serial_no(&self) -> String;
+    /// APIv3 密钥（32 字节，用于回调解密）。
     fn v3_key(&self) -> String;
+    /// 支付结果通知地址。
     fn notify_url(&self) -> String;
+    /// 网关地址，默认 `https://api.mch.weixin.qq.com`。
     fn base_url(&self) -> String;
+    /// 用商户私钥做 RSA-SHA256（PKCS#1 v1.5）签名，返回 base64。
     fn rsa_sign(&self, content: impl AsRef<str>) -> String;
+    /// 当前 unix 时间戳（秒），用于签名串。
     fn now_timestamp(&self) -> String {
         chrono::Local::now().timestamp().to_string()
     }
+    /// 随机串：UUID v4 去掉连字符后转大写，用于签名串与 Authorization 头。
     fn nonce_str(&self) -> String {
         Uuid::new_v4().to_string().replace("-", "").to_uppercase()
     }
 
+    /// 构造给 `wx.requestPayment` 用的签名数据。
+    ///
+    /// ⚠ `prefix` 按支付方式区分：APP 支付传 `""`，JSAPI / 付款码传 `"prepay_id="`。
+    /// 传错会导致前端拉起支付失败。
     fn mut_sign_data<S>(&self, prefix: S, prepay_id: S) -> SignData
     where
         S: AsRef<str>,
@@ -262,6 +296,11 @@ impl WechatPay {
         self.timeouts
     }
 
+    /// 用商户配置构造客户端。
+    ///
+    /// 参数顺序：`appid` / `mch_id` / `private_key` / `serial_no` / `v3_key` / `notify_url`。
+    /// `private_key` 需要 **PEM 内容本身**（不是文件路径），`v3_key` 必须是 32 字节。
+    /// 网关默认 `https://api.mch.weixin.qq.com`，用 [`WechatPay::with_base_url`] 覆盖。
     pub fn new<S: AsRef<str>>(
         appid: S,
         mch_id: S,
@@ -284,6 +323,10 @@ impl WechatPay {
         }
     }
 
+    /// 初始化全局 `tracing` 订阅器，把 crate 的 `debug!` 输出打到标准输出。
+    ///
+    /// 仅在 `debug-print` feature 下存在。⚠ 它会记录请求体、Authorization 头与被签名的
+    /// 原文（含 openid、订单号、金额），**生产环境不要开启**。
     #[cfg(feature = "debug-print")]
     pub fn open_debug(&self) {
         tracing_subscriber::fmt()
@@ -292,6 +335,11 @@ impl WechatPay {
             .init();
     }
 
+    /// 从环境变量构造客户端：`WECHAT_APPID` / `WECHAT_MCH_ID` / `WECHAT_PRIVATE_KEY` /
+    /// `WECHAT_SERIAL_NO` / `WECHAT_V3_KEY` / `WECHAT_NOTIFY_URL`。
+    ///
+    /// ⚠ 缺任何一个变量都会 panic（内部用 `expect`）。
+    /// ⚠ `WECHAT_PRIVATE_KEY` 是 **PEM 文件路径**，不是密钥内容 —— 这里会读该文件。
     pub fn from_env() -> Self {
         let appid = std::env::var("WECHAT_APPID").expect("WECHAT_APPID not found");
         let mch_id = std::env::var("WECHAT_MCH_ID").expect("WECHAT_MCH_ID not found");
@@ -324,11 +372,7 @@ impl WechatPay {
         let signature = self.rsa_sign(message);
         let authorization = format!(
             "WECHATPAY2-SHA256-RSA2048 mchid=\"{}\",nonce_str=\"{}\",signature=\"{}\",timestamp=\"{}\",serial_no=\"{}\"",
-            self.mch_id,
-            nonce_str,
-            signature,
-            timestamp,
-            serial_no,
+            self.mch_id, nonce_str, signature, timestamp, serial_no,
         );
         debug!("authorization: {}", authorization);
         let mut headers = HeaderMap::new();

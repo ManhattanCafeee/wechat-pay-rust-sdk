@@ -1,12 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
+/// 请求参数模型：可序列化为微信要求的 JSON。
 pub trait ParamsTrait {
+    /// 序列化为微信要求的 JSON 字符串。
     fn to_json(&self) -> String;
 }
 
+/// 货币类型：仅支持人民币 CNY。
 #[derive(Serialize, Debug, Clone)]
 pub enum Currency {
+    /// 人民币。
     CNY,
 }
 
@@ -18,6 +22,7 @@ impl Display for Currency {
     }
 }
 
+/// 订单金额信息。
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AmountInfo {
     ///【标价金额】 订单总金额，单位为分。
@@ -30,6 +35,7 @@ impl From<i32> for AmountInfo {
     }
 }
 
+/// 支付者信息。
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PayerInfo {
     ///【用户标识】 用户在直连商户appid下的唯一标识。
@@ -44,6 +50,7 @@ impl From<&str> for PayerInfo {
     }
 }
 
+/// 单品（商品）信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct GoodsDetail {
     ///【商户侧商品编码】 由半角的大小写字母、数字、中划线、下划线中的一种或几种组成。
@@ -60,6 +67,7 @@ pub struct GoodsDetail {
     pub goods_name: Option<String>,
 }
 
+/// 订单优惠信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct OrderDetail {
     ///【订单原价】
@@ -75,6 +83,7 @@ pub struct OrderDetail {
     pub goods_detail: Vec<GoodsDetail>,
 }
 
+/// 商户门店信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct StoreInfo {
     ///【门店编号】 商户侧门店编号
@@ -90,6 +99,7 @@ pub struct StoreInfo {
     pub address: Option<String>,
 }
 
+/// 支付场景信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct SceneInfo {
     ///【用户终端IP】 用户的客户端IP，支持IPv4和IPv6两种格式的IP地址。
@@ -102,10 +112,14 @@ pub struct SceneInfo {
     pub store_info: Option<StoreInfo>,
 }
 
+/// H5 场景类型：iOS / Android / WAP。
 #[derive(Serialize, Debug, Clone)]
 pub enum H5Type {
+    /// iOS
     Ios,
+    /// Android
     Android,
+    /// WAP
     Wap,
 }
 
@@ -119,6 +133,7 @@ impl Display for H5Type {
     }
 }
 
+/// H5 场景信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct H5Info {
     ///【场景类型】 场景类型
@@ -138,6 +153,7 @@ pub struct H5Info {
     pub package_name: Option<String>,
 }
 
+/// H5 支付场景信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct H5SceneInfo {
     ///【用户终端IP】 用户的客户端IP，支持IPv4和IPv6两种格式的IP地址。
@@ -153,6 +169,7 @@ pub struct H5SceneInfo {
 }
 
 impl H5SceneInfo {
+    /// 构造 H5SceneInfo。
     pub fn new<S: AsRef<str>>(payer_client_ip: S, app_name: S, app_url: S) -> Self {
         Self {
             payer_client_ip: payer_client_ip.as_ref().to_string(),
@@ -175,6 +192,7 @@ impl ParamsTrait for SceneInfo {
     }
 }
 
+/// JSAPI 下单参数：小程序支付。
 #[derive(Serialize, Debug, Clone)]
 pub struct JsapiParams {
     ///【商品描述】 商品描述
@@ -205,6 +223,7 @@ impl ParamsTrait for JsapiParams {
     }
 }
 
+/// 付款码支付参数：商户扫描用户付款码收款。
 #[derive(Serialize, Debug, Clone)]
 pub struct MicroParams {
     ///【商品描述】 商品描述
@@ -236,6 +255,7 @@ impl ParamsTrait for MicroParams {
 }
 
 impl MicroParams {
+    /// 构造 MicroParams。
     pub fn new<S: AsRef<str>>(
         description: S,
         out_trade_no: S,
@@ -256,6 +276,7 @@ impl MicroParams {
 }
 
 impl JsapiParams {
+    /// 构造 NativeParams。
     pub fn new<S: AsRef<str>>(
         description: S,
         out_trade_no: S,
@@ -275,6 +296,7 @@ impl JsapiParams {
     }
 }
 
+/// 结算信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct SettleInfo {
     ///【是否指定分账】 是否指定分账，
@@ -282,6 +304,7 @@ pub struct SettleInfo {
     pub profit_sharing: Option<bool>,
 }
 
+/// Native 下单参数：扫码支付。
 #[derive(Serialize, Debug, Clone)]
 pub struct NativeParams {
     ///【商品描述】 商品描述
@@ -318,6 +341,7 @@ impl ParamsTrait for NativeParams {
     }
 }
 
+/// APP 下单参数：APP 支付。
 #[derive(Serialize, Debug, Clone)]
 pub struct AppParams {
     ///【商品描述】 商品描述
@@ -358,6 +382,7 @@ impl ParamsTrait for AppParams {
 }
 
 impl AppParams {
+    /// 构造 AppParams。
     pub fn new<S: AsRef<str>>(description: S, out_trade_no: S, amount: AmountInfo) -> Self {
         Self {
             description: description.as_ref().to_string(),
@@ -374,6 +399,7 @@ impl AppParams {
     }
 }
 
+/// H5 下单参数：H5 网页支付。
 #[derive(Serialize, Debug, Clone)]
 pub struct H5Params {
     ///【商品描述】 商品描述
@@ -410,6 +436,7 @@ impl ParamsTrait for H5Params {
 }
 
 impl H5Params {
+    /// 构造 H5Params。
     pub fn new<S: AsRef<str>>(
         description: S,
         out_trade_no: S,
@@ -431,6 +458,7 @@ impl H5Params {
 }
 
 impl NativeParams {
+    /// 构造 NativeParams。
     pub fn new<S: AsRef<str>>(description: S, out_trade_no: S, amount: AmountInfo) -> Self {
         Self {
             description: description.as_ref().to_string(),
@@ -446,41 +474,68 @@ impl NativeParams {
     }
 }
 
+/// 微信支付回调通知的加密资源。
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WechatPayNotifySource {
+    /// 【加密算法】 对通知数据进行加密的算法。
     pub algorithm: String,
+    /// 【密文】 通知数据的密文。
     pub ciphertext: String,
+    /// 【附加数据】 参与解密的附加数据。
     pub associated_data: Option<String>,
+    /// 【原始类型】 原始回调类型。
     pub original_type: String,
+    /// 【随机串】 参与解密的随机串。
     pub nonce: String,
 }
 
+/// 微信支付回调通知报文。
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WechatPayNotify {
+    /// 【通知ID】 微信支付回调通知的唯一标识。
     pub id: String,
+    /// 【创建时间】 通知的创建时间。
     pub create_time: String,
+    /// 【事件类型】 通知的事件类型。
     pub event_type: String,
+    /// 【资源类型】 通知中的资源类型。
     pub resource_type: String,
+    /// 【资源】 通知中的加密资源。
     pub resource: WechatPayNotifySource,
+    /// 【摘要】 通知的摘要信息。
     pub summary: String,
 }
 
+/// 微信支付回调通知解密后的支付数据。
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WechatPayDecodeData {
+    /// 【商户号】 商户下单时的商户号。
     pub mchid: String,
+    /// 【应用ID】 商户下单时的应用ID。
     pub appid: String,
+    /// 【商户订单号】 商户系统内部订单号。
     pub out_trade_no: String,
+    /// 【微信支付订单号】 微信支付侧订单的唯一标识。
     pub transaction_id: String,
+    /// 【交易类型】 订单的交易类型。
     pub trade_type: String,
+    /// 【交易状态】 交易状态，如 SUCCESS 等。
     pub trade_state: String,
+    /// 【交易状态描述】 交易状态的文字描述。
     pub trade_state_desc: String,
+    /// 【付款银行】 用户支付所使用的银行。
     pub bank_type: String,
+    /// 【附加数据】 商户下单时传入的附加数据。
     pub attach: String,
+    /// 【支付完成时间】 交易支付完成的时间。
     pub success_time: String,
+    /// 【支付者】 支付者信息。
     pub payer: PayerInfo,
+    /// 【订单金额】 订单金额信息。
     pub amount: AmountInfo,
 }
 
+/// 申请退款参数。
 #[derive(Serialize, Debug, Clone)]
 pub struct RefundsParams {
     /// 【微信支付订单号】 微信支付侧订单的唯一标识，订单支付成功后，查询订单和支付成功回调通知会返回该参数。
@@ -516,6 +571,7 @@ pub struct RefundsParams {
     pub goods_detail: Option<Vec<RefundsGoodsDetailParams>>,
 }
 
+/// 退款金额信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct RefundsAmountParams {
     /// 【退款金额】 退款金额，币种的最小单位，只能为整数，不能超过原订单支付金额。
@@ -531,6 +587,7 @@ pub struct RefundsAmountParams {
     pub from: Option<Vec<RefundsFromParams>>,
 }
 
+/// 退款出资账户信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct RefundsFromParams {
     /// 【出资账户类型】 退款出资的账户类型。
@@ -541,6 +598,7 @@ pub struct RefundsFromParams {
     pub amount: i32,
 }
 
+/// 退款商品信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct RefundsGoodsDetailParams {
     /// 【商户侧商品编码】 订单下单时传入的商户侧商品编码。
@@ -560,6 +618,7 @@ pub struct RefundsGoodsDetailParams {
 }
 
 impl RefundsParams {
+    /// 构造 RefundsParams。
     pub fn new<S: AsRef<str>>(
         out_refund_no: S,
         total: i32,

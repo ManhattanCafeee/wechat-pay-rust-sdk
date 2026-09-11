@@ -1,7 +1,10 @@
 # wechat-pay-rust-sdk
 [![Latest Version](https://img.shields.io/crates/v/wechat-pay-rust-sdk.svg)](https://crates.io/crates/wechat-pay-rust-sdk)
 
-微信支付 © Wechat Pay SDK Official (标准库)
+微信支付 APIv3 的 Rust SDK（**社区维护，非腾讯官方**）。
+
+覆盖：JSAPI / Native / APP / H5 / 付款码下单、申请退款、订单查询、关单、退款查询、
+平台证书获取与轮换、支付回调的验签与解密。
 
 [![QQ群](https://img.shields.io/badge/QQ%E7%BE%A4-799168925-blue)](http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=dLoye8pBcO60zGzqLjGO0l-GgMIaf6wQ&authKey=LfxBdZ5A%2F9eWJbKpzTcuWPjmQu5UdIJ3TVTpqRAQYkCID50WLkYoIXcGxGKzupG3&noverify=0&group_code=799168925)
 
@@ -19,17 +22,25 @@
   - [读取平台证书](#读取平台证书)
   - [签名验证](#签名验证)
   - [退款申请](#退款申请)
+  - [订单查询 / 关单 / 退款查询](#订单查询--关单--退款查询)
+  - [回调通知：验签与防重放](#回调通知验签与防重放)
+  - [平台证书轮换](#平台证书轮换)
+  - [错误处理](#错误处理)
+  - [超时与连接复用](#超时与连接复用)
 
 # 使用指南
 引入依赖
 ```toml
-#异步
-wechat-pay-rust-sdk = {version = "x.x.x"}
-# 同步
-wechat-pay-rust-sdk = {version = "x.x.x", features = ["blocking"]}
-# debug日志开启
-wechat-pay-rust-sdk = {version = "x.x.x", features = ["blocking","debug-print"]}
+# 同步（默认）
+wechat-pay-rust-sdk = { version = "x.x.x" }
+# 异步
+wechat-pay-rust-sdk = { version = "x.x.x", features = ["async"] }
+# 打开调试日志（会输出请求体与 Authorization 头，生产环境不要开）
+wechat-pay-rust-sdk = { version = "x.x.x", features = ["debug-print"] }
 ```
+
+> MSRV 1.89（edition 2024）。
+> ⚠ 不存在 `blocking` feature —— 同步是**默认**行为，异步才需要 feature。
 
 ## native支付
 ```rust
@@ -370,3 +381,129 @@ async fn pay_notify(bytes: Bytes, req: HttpRequest) -> impl Responder {
     }
 
 ```
+
+## 订单查询 / 关单 / 退款查询
+
+```rust
+// 查单：GET /v3/pay/transactions/out-trade-no/{no}?mchid=…
+let order = wechat_pay.query_order("ORDER_0001").await?;
+// trade_state: SUCCESS / REFUND / NOTPAY / CLOSED / REVOKED / USERPAYING / PAYERROR
+if order.trade_state == "SUCCESS" {
+    // transaction_id / amount / payer 只在支付成功后才有值
+    println!("已支付: {:?}", order.transaction_id);
+}
+
+// 关单：已支付的订单不能关，只能退。成功时微信返回 204，本方法返回 Ok(())
+wechat_pay.close_order("ORDER_0001").await?;
+
+// 退款查询：退款是异步的，申请受理后要轮询到终态
+let refund = wechat_pay.query_refund("REFUND_0001").await?;
+match refund.status.as_str() {
+    "SUCCESS" => { /* 退款成功 */ }
+    "PROCESSING" => { /* 官方建议每分钟查一次，5 分钟后降频 */ }
+    "ABNORMAL" | "CLOSED" => { /* 需要人工介入 */ }
+    _ => {}
+}
+```
+
+⚠ 查单的 `mchid` 放在 **query string** 里、且**参与签名**；关单的 body **只有** `mchid`。
+这两点决定了它们不能复用下单接口的字段注入逻辑（那是 `pay()` 独有的）。
+
+订单不存在时微信返回 404 `ORDER_NOT_EXIST`，会变成 `Err(PayError::ApiError)` ——
+这是**正常业务结果**，不是故障。
+
+## 回调通知：验签与防重放
+
+```rust
+use wechat_pay_rust_sdk::notify::NotifyHeaders;
+
+// 启动时拉一次平台证书，之后每 12 小时内刷新
+let mut keys = wechat_pay.fetch_platform_keys().await?;
+let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_secs() as i64;
+keys.mark_refreshed(now);
+
+// 回调入口；raw_body 必须是**原始请求体字符串**
+let headers = NotifyHeaders::from_pairs(req_headers)?; // 任意框架的 (name, value) 迭代器
+keys.verify_notify(&headers, raw_body)?;               // 新鲜度 → 按 serial 选键 → 验签
+
+let data = wechat_pay.decrypt_paydata(ciphertext, nonce, associated_data)?;
+// 然后按 out_trade_no 落库去重 —— 幂等必须你自己做
+```
+
+三点必须记住：
+
+1. **`raw_body` 必须是原始字节。** 若框架先把 body 反序列化成 JSON、再序列化回去，
+   字节变了，验签必然失败。用 `Bytes` 之类的类型拿原始体。
+2. **验签不能省。** 微信会故意发 `WECHATPAY/SIGNTEST/` 开头的坏签名来探测你的验签实现 ——
+   这是正常流量，直接拒绝即可，不要为它开特例。
+3. **SDK 不替你做幂等。** 微信在收到成功应答前会重试（15s/15s/30s/3m/…
+   最多 15 次），必须按 `out_trade_no` / `transaction_id` 落库去重后再发货。
+
+应答要求：**5 秒内**返回，成功时返回 HTTP **200 或 204 且不带 body**；
+校验或处理失败才返回 4xx/5xx + `{"code":"FAIL","message":"…"}`。业务处理请异步化。
+
+遇到 `PayError::UnknownPlatformSerial` 说明微信正在轮换证书 ——
+**立即重新拉取**证书列表再重试，不要拿别的密钥去试。
+
+## 平台证书轮换
+
+轮换期微信会**同时下发新旧两张都在有效期内**的平台证书，所以必须按请求头
+`Wechatpay-Serial` 选键。写死单张证书会让轮换期的回调验签全部失败 —— 也就是订单不发货。
+
+`PlatformKeys` 就是 `serial_no -> 公钥 PEM` 的索引；`fetch_platform_keys()`
+每次返回**全新**的索引，调用方应整体替换而不是逐条合并。
+官方要求至少每 12 小时刷新一次，`PlatformKeys::needs_refresh(now)` 按
+`REFRESH_INTERVAL_SECS` 帮你判断。
+
+## 错误处理
+
+所有失败 —— 包括**非 2xx** 与 **HTTP 200 但 body 是错误信封** —— 都返回
+`Err(PayError::ApiError)`。用 `kind()` 做三层归类决定处置策略：
+
+```rust
+use wechat_pay_rust_sdk::error::{ErrorKind, PayError};
+
+match wechat_pay.jsapi_pay(params).await {
+    Ok(response) => { /* response.prepay_id / response.sign_data */ }
+    Err(err) => match err.kind() {
+        // 传输层失败。可考虑重试，但⚠ 下单接口不可无脑重试（会重复下单），
+        // 超时后应先用 query_order 确认状态。
+        ErrorKind::Network => { /* … */ }
+        // 微信业务拒绝：按 response.code 分支，不要重试。
+        ErrorKind::Api => {
+            if let PayError::ApiError { response, .. } = &err {
+                eprintln!(
+                    "code={:?} message={:?} detail={:?}",
+                    response.code, response.message, response.detail
+                );
+            }
+        }
+        // 本地错误：签名、解密、JSON 解析、验签失败、回调超窗 —— 通常要告警。
+        ErrorKind::Local => { /* … */ }
+    },
+}
+```
+
+`response.detail` 是微信的字段级定位信息（例如 `/payer/openid`），
+而 `Display` 会把它一起渲染出来 —— 日志外发前记得脱敏。
+
+## 超时与连接复用
+
+HTTP 客户端由 `WechatPay` 持有并跨请求复用（连接池共享）。
+默认超时 connect 5s / request 10s / pool idle 90s，要改：
+
+```rust
+use std::time::Duration;
+use wechat_pay_rust_sdk::pay::HttpTimeouts;
+
+let wechat_pay = wechat_pay.with_timeouts(HttpTimeouts {
+    request: Duration::from_secs(30),
+    ..HttpTimeouts::default()
+});
+```
+
+⚠ **超时不代表操作没有发生**：请求很可能已被微信受理，只是响应没回来。
+支付类接口超时后必须用 `query_order` 确认最终状态，**不能**直接重试下单。

@@ -1,19 +1,30 @@
 use crate::response::ErrorResponse;
 
+/// 本 crate 的统一错误类型。
+///
+/// 用 [`PayError::kind`] 做三层归类（网络 / 业务 / 本地）来决定处置策略；
+/// 微信侧的业务错误统一是 [`PayError::ApiError`]，原始错误码与字段级 `detail` 都在里面。
 #[derive(Debug, thiserror::Error)]
 pub enum PayError {
+    /// 传输 / 连接层失败（含超时、TLS、DNS）。
     #[error("http error: {0}")]
     RequestError(#[from] reqwest::Error),
+    /// 通用的微信业务错误文本。
     #[error("pay error: {0}")]
     WechatError(String),
+    /// 响应体不是合法 JSON，或结构与目标类型不符。
     #[error("json error: {0}")]
     JsonError(#[from] serde_json::Error),
+    /// 回调 / 应答解密失败（AES-256-GCM）。
     #[error("Decrypt error: {0}")]
     DecryptError(String),
+    /// Base64 解码失败。
     #[error("Base64 decode error: {0}")]
     DecodeError(#[from] base64::DecodeError),
+    /// 验签失败。
     #[error("verify error: {0}")]
     VerifyError(String),
+    /// 在 H5 页面里没找到 `weixin://` 拉起链接。
     #[error("weixin not found error")]
     WeixinNotFound,
     /// 平台上没有该 `Wechatpay-Serial` 对应的密钥。
@@ -53,8 +64,11 @@ pub enum PayError {
 /// | [`Local`](ErrorKind::Local) | 本地错误：签名、解密、Base64、JSON 解析、验签失败、回调超窗 | 不要重试，通常意味着配置或数据有问题，应当告警 |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
+    /// 传输 / 连接层失败（`reqwest::Error`，含超时）。
     Network,
+    /// 微信侧的业务拒绝：HTTP 非 2xx，或 2xx 但 body 是错误信封。
     Api,
+    /// 本地错误：签名、解密、Base64、JSON 解析、验签失败、回调超窗等。
     Local,
 }
 

@@ -58,6 +58,10 @@ pub struct NotifyHeaders {
 }
 
 impl NotifyHeaders {
+    /// 直接由四个请求头的值构造。
+    ///
+    /// 参数顺序：`serial` / `timestamp` / `nonce` / `signature`。
+    /// 从 web 框架的 header 迭代器构造请用 [`NotifyHeaders::from_pairs`]。
     pub fn new(
         serial: impl Into<String>,
         timestamp: impl Into<String>,

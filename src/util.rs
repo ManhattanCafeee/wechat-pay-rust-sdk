@@ -26,10 +26,14 @@ pub fn verify_rsa_sha256(
         .map_err(|e| PayError::VerifyError(e.to_string()))
 }
 
+/// 生成一个随机的商户订单号：UUID v4 去掉连字符后的 32 位十六进制串。
 pub fn random_trade_no() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
+/// Base64 编码（STANDARD 字母表，带 padding）。
+///
+/// 微信的签名、密文、证书都走这一套，不要换成 URL-safe 字母表。
 pub fn base64_encode<S>(content: S) -> String
 where
     S: AsRef<[u8]>,
@@ -37,6 +41,7 @@ where
     general_purpose::STANDARD.encode(content)
 }
 
+/// Base64 解码（STANDARD 字母表）。
 pub fn base64_decode<S>(content: S) -> Result<Vec<u8>, DecodeError>
 where
     S: AsRef<[u8]>,
@@ -44,6 +49,11 @@ where
     general_purpose::STANDARD.decode(content.as_ref())
 }
 
+/// 把平台的 **PEM 证书**转换为 PEM 格式的**公钥**。
+///
+/// 用于 `GET /v3/certificates`：`encrypt_certificate.ciphertext` 解密出来的证书是
+/// **PEM**（不是 DER），这里取出其中的 SubjectPublicKeyInfo，再重新包成
+/// `-----BEGIN PUBLIC KEY-----`，供 [`verify_rsa_sha256`] 验签。
 pub fn x509_to_pem(content: &[u8]) -> Result<String, Box<dyn Error>> {
     let pem = pem::parse(content)?;
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())?;
@@ -61,6 +71,9 @@ pub fn x509_to_pem(content: &[u8]) -> Result<String, Box<dyn Error>> {
     ))
 }
 
+/// 返回 `(证书当前是否有效, not_after 的 unix 秒时间戳)`。
+///
+/// 配合 [`crate::cert::PlatformKeys::needs_refresh`] 判断平台证书是否该更新。
 pub fn x509_is_valid(content: &[u8]) -> Result<(bool, i64), Box<dyn Error>> {
     let pem = pem::parse(content)?;
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())?;

@@ -39,6 +39,7 @@ pub struct PlatformKeys {
 }
 
 impl PlatformKeys {
+    /// 构造一个空索引。
     pub fn new() -> Self {
         Self::default()
     }
@@ -59,10 +60,12 @@ impl PlatformKeys {
         self.keys.get(serial_no).map(String::as_str)
     }
 
+    /// 索引中已有的密钥数量。轮换期正常会有 2 个。
     pub fn len(&self) -> usize {
         self.keys.len()
     }
 
+    /// 索引是否为空（从未成功拉取过，或返回的证书列表为空）。
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -79,6 +82,7 @@ impl PlatformKeys {
         self.fetched_at = Some(now_unix_secs);
     }
 
+    /// 最近一次成功拉取的时间（unix 秒）；从未拉取过则为 `None`。
     pub fn fetched_at(&self) -> Option<i64> {
         self.fetched_at
     }

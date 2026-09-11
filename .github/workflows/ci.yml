@@ -10,7 +10,7 @@ env:
 
 jobs:
   test:
-    name: Test & check
+    name: Test & lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,12 +18,26 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
-      # 完整测试：tests/offline.rs 用本地 mock 微信网关，
-      # 不需要凭证或公网，因此可以在 CI 中运行。
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # 关键：在**所有 feature 组合**下 clippy 都必须零告警。
+      # 其中 missing_docs 是硬门槛（公开 API 必须写文档），而 debug-print 会切换
+      # src/macros.rs 里两份宏定义 —— 只测一种组合会漏掉一半的 cfg 分支。
+      - name: Clippy (no features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (async)
+        run: cargo clippy --all-targets --features async -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # 完整测试：tests/offline.rs 用本地 mock 微信网关，不需要凭证或公网。
       # src/ 内需要真实商户凭证的冒烟测试已标记 #[ignore]，默认跳过。
       - name: Test (sync)
         run: cargo test
@@ -31,25 +45,27 @@ jobs:
       - name: Test (async)
         run: cargo test --features async
 
-      # 两种 feature 模式都必须能编译（含测试目标）。
-      # 历史上有 7 个测试函数漏了 #[cfg(not(feature = "async"))]，导致
-      # `--features async --all-targets` 编译失败 —— 这两条命令就是那条回归线。
-      - name: Check sync (all targets)
-        run: cargo check --all-targets
-
-      - name: Check async (all targets)
-        run: cargo check --features async --all-targets
-
       - name: Check example
         run: cargo check -p example
 
-      - name: Clippy
-        run: cargo clippy --all-targets --features async
-
-      # 有意不运行：
-      #   * `cargo test --doc` —— README 示例需要真实商户密钥与公网，
-      #     见 Cargo.toml 中的 [lib] doctest = false
-      #   * `cargo fmt --check` —— 仓库尚未整体格式化，见 AGENTS.md 的待办
+      # 有意不运行 `cargo test --doc`：README 作为 crate 文档，但其中的示例需要真实
+      # 商户密钥与公网（还有 actix-web 片段），故设了 [lib] doctest = false。
       #
       # 需要真实凭证的测试可在本机（有 .env 与 PEM fixture）手动运行：
       #   cargo test --lib -- --ignored
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.89.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 本仓库按库的惯例不提交 Cargo.lock，依赖解析结果会漂移，MSRV 可能被悄悄抬高
+      # （实测 1.85 / 1.88 都曾因 icu_*、time、aes 的新版本而失败）。
+      # Cargo.toml 里的 rust-version 会让 cargo 优先挑兼容版本，这个作业保证它不虚报。
+      - name: Check on MSRV
+        run: cargo check --all-targets

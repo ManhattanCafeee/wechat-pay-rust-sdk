@@ -1,11 +1,19 @@
 use std::fmt::{Display, Formatter};
 
+/// HTTP 方法。
+///
+/// 它同时决定签名串（`"{method}\n{url}\n…"`）的第一行和实际发出的请求方法。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpMethod {
+    /// GET
     GET,
+    /// POST
     POST,
+    /// PUT
     PUT,
+    /// DELETE
     DELETE,
+    /// PATCH
     PATCH,
 }
 

@@ -19,10 +19,10 @@ use crate::response::{CertificateResponse, NativeResponse, TransactionResponse};
 use reqwest::header::{HeaderMap, REFERER};
 use serde_json::{Map, Value};
 
-#[cfg(not(feature = "async"))]
-use reqwest::blocking::RequestBuilder;
 #[cfg(feature = "async")]
 use reqwest::RequestBuilder;
+#[cfg(not(feature = "async"))]
+use reqwest::blocking::RequestBuilder;
 
 #[cfg(feature = "async")]
 use maybe_async::maybe_async as maybe_async_attr;
@@ -140,6 +140,10 @@ impl WechatPay {
         Ok(())
     }
 
+    /// 通用下单：把 `params` 序列化后注入 `appid` / `mchid` / `notify_url` 再签名发送。
+    ///
+    /// 字段注入**只发生在这里** —— 其余端点走 [`WechatPay::request_json`]，不注入任何字段
+    /// （关单的 body 只要 `mchid`，查单的 `mchid` 在 query string 里）。
     #[maybe_async_attr]
     pub async fn pay<P: ParamsTrait, R: ResponseTrait>(
         &self,
@@ -157,16 +161,23 @@ impl WechatPay {
         self.request_json(method, url, &body).await
     }
 
+    /// 通用 GET：签名后请求 `url`，把响应解析成 `R`。
+    ///
+    /// ⚠ `url` 会**原样参与签名**，带查询参数时必须把查询串一起传进来。
     #[maybe_async_attr]
     pub async fn get_pay<R: ResponseTrait>(&self, url: &str) -> Result<R, PayError> {
         self.request_json(HttpMethod::GET, url, "").await
     }
 
+    /// H5 支付（外部浏览器）：返回拉起微信收银台的 `h5_url`。
     #[maybe_async_attr]
     pub async fn h5_pay(&self, params: H5Params) -> Result<H5Response, PayError> {
         let url = "/v3/pay/transactions/h5";
         self.pay(HttpMethod::POST, url, params).await
     }
+    /// APP 支付：返回 `prepay_id` 与给客户端拉起支付用的签名数据。
+    ///
+    /// ⚠ 签名数据的 `package` 前缀与其他支付方式不同，见 [`WechatPayTrait::mut_sign_data`]。
     #[maybe_async_attr]
     pub async fn app_pay(&self, params: AppParams) -> Result<AppResponse, PayError> {
         let url = "/v3/pay/transactions/app";
@@ -179,6 +190,7 @@ impl WechatPay {
                 result
             })
     }
+    /// JSAPI 支付（小程序 / 公众号）：返回 `prepay_id` 与给 `wx.requestPayment` 的签名数据。
     #[maybe_async_attr]
     pub async fn jsapi_pay(&self, params: JsapiParams) -> Result<JsapiResponse, PayError> {
         let url = "/v3/pay/transactions/jsapi";
@@ -191,6 +203,7 @@ impl WechatPay {
                 result
             })
     }
+    /// 付款码支付：返回 `prepay_id` 与签名数据。
     #[maybe_async_attr]
     pub async fn micro_pay(&self, params: MicroParams) -> Result<MicroResponse, PayError> {
         let url = "/v3/pay/transactions/jsapi";
@@ -203,17 +216,28 @@ impl WechatPay {
                 result
             })
     }
+    /// 扫码支付：返回 `code_url`，由商户自行生成二维码。
     #[maybe_async_attr]
     pub async fn native_pay(&self, params: NativeParams) -> Result<NativeResponse, PayError> {
         let url = "/v3/pay/transactions/native";
         self.pay(HttpMethod::POST, url, params).await
     }
 
+    /// 获取平台证书列表（`GET /v3/certificates`）。
+    ///
+    /// ⚠ 返回的证书是**加密**的，需要解密后才能用。要做回调验签请直接用
+    /// [`WechatPay::fetch_platform_keys`]，它会把解密与建索引一次做完。
     #[maybe_async_attr]
     pub async fn certificates(&self) -> Result<CertificateResponse, PayError> {
         let url = "/v3/certificates";
         self.get_pay(url).await
     }
+    /// 从 H5 支付返回的页面里抓出 `weixin://` 拉起链接。
+    ///
+    /// ⚠ 实现是**逐行字符串扫描**（找包含 `weixin://` 的行再按 `"` 切分），
+    /// 微信改页面结构就会失效 —— 生产环境建议前端自行处理 `h5_url`。
+    /// ⚠ `h5_url` 会被直接 GET，且**没有白名单**：只能传微信返回的 `h5_url`
+    /// 或你自己服务端的地址，**绝不能来自用户输入**（SSRF）。
     #[maybe_async_attr]
     pub async fn get_weixin<S>(&self, h5_url: S, referer: S) -> Result<Option<String>, PayError>
     where
@@ -302,8 +326,8 @@ impl WechatPay {
 
 #[cfg(test)]
 mod tests {
-    use dotenvy::dotenv;
     use crate::error::PayError;
+    use dotenvy::dotenv;
     // 以下导入只被 `#[cfg(not(feature = "async"))]` 的测试使用，
     // 不加 cfg 会在 async 模式下产生 unused_imports 告警。
     #[cfg(not(feature = "async"))]
