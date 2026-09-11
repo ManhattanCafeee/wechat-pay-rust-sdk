@@ -537,3 +537,89 @@ dual_test! {
         }
     }
 }
+
+dual_test! {
+    fn non_wechat_json_error_body_is_preserved() {
+        // 回归：ErrorResponse 的字段全是 Option 且未加 deny_unknown_fields，
+        // 所以任何 JSON 对象都能解析成功。若只判断「能否解析成 JSON」，
+        // WAF / 反向代理的错误体（{"status":403,...} / {"errcode":...}）会被
+        // 解析成一个三个字段全为 None 的 ErrorResponse，唯一线索就丢了。
+        let mock = Mock::start(vec![MockResponse::json(
+            502,
+            r#"{"errcode":40001,"errmsg":"invalid credential from upstream"}"#,
+        )]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let result = call!(wechat_pay.jsapi_pay(JsapiParams::new(
+            "测试商品",
+            "ORDER_0006",
+            1.into(),
+            "openid".into(),
+        )));
+
+        match result {
+            Err(err @ PayError::ApiError { .. }) => {
+                let text = err.to_string();
+                assert!(
+                    text.contains("invalid credential from upstream"),
+                    "非微信形状的 JSON 错误体也必须保留原文: {text}"
+                );
+            }
+            other => panic!("必须返回 Err(PayError::ApiError)，实际得到 {other:?}"),
+        }
+    }
+}
+
+dual_test! {
+    fn oversized_error_body_is_truncated() {
+        // 网关可能返回整页 HTML；不能让整个 body 复制进错误消息并刷爆日志。
+        let huge = format!("<html>{}</html>", "x".repeat(20_000));
+        let mock = Mock::start(vec![MockResponse::json(504, &huge)]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let result = call!(wechat_pay.jsapi_pay(JsapiParams::new(
+            "测试商品",
+            "ORDER_0007",
+            1.into(),
+            "openid".into(),
+        )));
+
+        match result {
+            Err(err @ PayError::ApiError { .. }) => {
+                let text = err.to_string();
+                assert!(text.contains("truncated"), "超长响应体必须标注截断: {text}");
+                assert!(text.contains("bytes total"), "应标注原始字节数: {text}");
+                assert!(
+                    text.len() < 10_000,
+                    "错误消息不应保留整个响应体，实际长度 {}",
+                    text.len()
+                );
+            }
+            other => panic!("必须返回 Err(PayError::ApiError)，实际得到 {other:?}"),
+        }
+    }
+}
+
+dual_test! {
+    fn empty_error_body_is_marked() {
+        let mock = Mock::start(vec![MockResponse::json(502, "")]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let result = call!(wechat_pay.jsapi_pay(JsapiParams::new(
+            "测试商品",
+            "ORDER_0008",
+            1.into(),
+            "openid".into(),
+        )));
+
+        match result {
+            Err(err @ PayError::ApiError { .. }) => {
+                assert!(
+                    err.to_string().contains("<empty body>"),
+                    "空响应体应有显式标记而不是空 message: {err}"
+                );
+            }
+            other => panic!("必须返回 Err(PayError::ApiError)，实际得到 {other:?}"),
+        }
+    }
+}

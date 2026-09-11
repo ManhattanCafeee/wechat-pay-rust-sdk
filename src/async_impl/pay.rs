@@ -37,6 +37,11 @@ use maybe_async::must_be_sync as maybe_async_attr;
 /// 字段全为 `Option` 的成功响应类型（例如 `JsapiResponse`），于是下单失败会伪装成
 /// `Ok(JsapiResponse { code: Some("PARAM_ERROR"), prepay_id: None })`，
 /// 调用方只能靠 `prepay_id` 为空去猜，且微信的错误码会全部丢失。
+///
+/// ⚠ 本函数只覆盖**非 2xx**。若微信以 HTTP 200 返回错误信封，`pay()` / `get_pay()`
+/// 仍会把它解析进成功类型并返回 `Ok`（那些类型的字段全是 `Option`）。
+/// 因此调用方还必须检查业务字段：`prepay_id` / `code_url` / `h5_url` 是否为空、
+/// `code` 是否非空。只有 `refunds()` 通过 `WeChatResponse` 覆盖了 200 带错误码的情况。
 #[maybe_async_attr]
 async fn send_and_check(builder: RequestBuilder) -> Result<String, PayError> {
     let response = builder.send().await?;
@@ -191,6 +196,7 @@ impl WechatPay {
 #[cfg(test)]
 mod tests {
     use dotenvy::dotenv;
+    use crate::error::PayError;
     use crate::model::{
         AppParams, H5Params, H5SceneInfo, JsapiParams, MicroParams, NativeParams, RefundsParams,
     };
@@ -331,12 +337,13 @@ mod tests {
 
         let req = RefundsParams::new("123456", 1, 1, None, Some("123456"));
 
-        let body = wechat_pay.refunds(req).expect("refunds fail");
-
-        if body.is_success() {
-            debug!("refunds success: {:?}", body.ok());
-        } else {
-            debug!("refunds error: {:?}", body.err());
+        match wechat_pay.refunds(req) {
+            Ok(body) if body.is_success() => debug!("refunds success: {:?}", body.ok()),
+            Ok(body) => debug!("refunds rejected: {:?}", body.err()),
+            Err(PayError::ApiError { status, response }) => {
+                debug!("refunds failed: http {status}, {response}");
+            }
+            Err(e) => debug!("refunds error: {e}"),
         }
     }
 
@@ -384,12 +391,13 @@ mod tests {
 
         let req = RefundsParams::new("123456", 1, 1, None, Some("123456"));
 
-        let body = wechat_pay.refunds(req).await.expect("refunds fail");
-
-        if body.is_success() {
-            debug!("refunds success: {:?}", body.ok());
-        } else {
-            debug!("refunds error: {:?}", body.err());
+        match wechat_pay.refunds(req).await {
+            Ok(body) if body.is_success() => debug!("refunds success: {:?}", body.ok()),
+            Ok(body) => debug!("refunds rejected: {:?}", body.err()),
+            Err(PayError::ApiError { status, response }) => {
+                debug!("refunds failed: http {status}, {response}");
+            }
+            Err(e) => debug!("refunds error: {e}"),
         }
     }
 
@@ -403,12 +411,13 @@ mod tests {
 
         let req = RefundsParams::new("123456", 1, 1, None, Some("123456"));
 
-        let body = wechat_pay.refunds(req).expect("refunds fail");
-
-        if body.is_success() {
-            debug!("refunds success: {:?}", body.ok());
-        } else {
-            debug!("refunds error: {:?}", body.err());
+        match wechat_pay.refunds(req) {
+            Ok(body) if body.is_success() => debug!("refunds success: {:?}", body.ok()),
+            Ok(body) => debug!("refunds rejected: {:?}", body.err()),
+            Err(PayError::ApiError { status, response }) => {
+                debug!("refunds failed: http {status}, {response}");
+            }
+            Err(e) => debug!("refunds error: {e}"),
         }
     }
 }

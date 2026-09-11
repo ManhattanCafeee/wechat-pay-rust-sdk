@@ -352,16 +352,22 @@ async fn pay_notify(bytes: Bytes, req: HttpRequest) -> impl Responder {
 ## 退款申请
 
 ```rust
-    use crate::model::RefundsParams;
-    use crate::pay::WechatPay;
+    use wechat_pay_rust_sdk::error::PayError;
+    use wechat_pay_rust_sdk::model::RefundsParams;
+    use wechat_pay_rust_sdk::pay::WechatPay;
     
     let wechat_pay = WechatPay::from_env();
     let req = RefundsParams::new("123456", 1, 1, None, Some("123456"));
-    let body = wechat_pay.refunds(req).await.expect("refunds fail");
-    if body.is_success() {
-        debug!("refunds success: {:?}", body.ok());
-    } else {
-        debug!("refunds error: {:?}", body.err());
+    match wechat_pay.refunds(req).await {
+        Ok(body) if body.is_success() => debug!("refunds success: {:?}", body.ok()),
+        // HTTP 200 但 body 里带错误码（少见；WeChatResponse 为此保留）
+        Ok(body) => debug!("refunds rejected: {:?}", body.err()),
+        // 非 2xx：微信的业务错误，code / message / detail 都在这里
+        Err(PayError::ApiError { status, response }) => debug!(
+            "refunds failed: http {status}, code={:?}, message={:?}, detail={:?}",
+            response.code, response.message, response.detail
+        ),
+        Err(e) => debug!("refunds error: {e}"),
     }
 
 ```
