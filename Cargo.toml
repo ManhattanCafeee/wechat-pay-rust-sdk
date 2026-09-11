@@ -3,9 +3,9 @@ name = "wechat-pay-rust-sdk"
 version = "0.2.21"
 edition = "2024"
 authors = ["lake"]
-description = "微信支付 © Wechat Pay SDK Official (标准库)"
-repository = "https://github.com/dounine/wechat-pay-rust-sdk"
-license = "MIT"
+description = "微信支付 APIv3 Rust SDK（社区维护 fork，非官方）"
+repository = "https://github.com/ManhattanCafeee/wechat-pay-rust-sdk"
+license = "Apache-2.0"
 keywords = ["wechat", "pay", "weixin", "wechatpay", "weixinpay"]
 exclude = ["example"]
 
