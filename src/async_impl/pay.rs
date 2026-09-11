@@ -21,14 +21,33 @@ use reqwest::header::{HeaderMap, REFERER};
 use serde_json::{Map, Value};
 
 #[cfg(not(feature = "async"))]
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder};
 #[cfg(feature = "async")]
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 
 #[cfg(feature = "async")]
 use maybe_async::maybe_async as maybe_async_attr;
 #[cfg(not(feature = "async"))]
 use maybe_async::must_be_sync as maybe_async_attr;
+
+/// 发送请求并做 HTTP 状态检查，返回响应体文本。
+///
+/// 微信支付在失败时返回**非 2xx 状态码** + `{"code","message","detail"}` 响应体。
+/// 必须先看状态码再看 body：若像 `.json::<R>()` 那样直接解析，错误响应体会被塞进
+/// 字段全为 `Option` 的成功响应类型（例如 `JsapiResponse`），于是下单失败会伪装成
+/// `Ok(JsapiResponse { code: Some("PARAM_ERROR"), prepay_id: None })`，
+/// 调用方只能靠 `prepay_id` 为空去猜，且微信的错误码会全部丢失。
+#[maybe_async_attr]
+async fn send_and_check(builder: RequestBuilder) -> Result<String, PayError> {
+    let response = builder.send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    debug!("status: {} body: {}", status, text);
+    if !status.is_success() {
+        return Err(PayError::api_error(status.as_u16(), &text));
+    }
+    Ok(text)
+}
 
 impl WechatPay {
     #[maybe_async_attr]
@@ -57,14 +76,8 @@ impl WechatPay {
             HttpMethod::PATCH => client.patch(url),
         };
 
-        builder
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?
-            .json::<R>()
-            .await
-            .map(Ok)?
+        let text = send_and_check(builder.headers(headers).body(body)).await?;
+        Ok(serde_json::from_str::<R>(&text)?)
     }
 
     #[maybe_async_attr]
@@ -74,15 +87,8 @@ impl WechatPay {
         let client = Client::new();
         let url = format!("{}{}", self.base_url(), url);
         debug!("url: {} body: {}", url, body);
-        client
-            .get(url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?
-            .json::<R>()
-            .await
-            .map(Ok)?
+        let text = send_and_check(client.get(url).headers(headers).body(body)).await?;
+        Ok(serde_json::from_str::<R>(&text)?)
     }
 
     #[maybe_async_attr]
@@ -175,14 +181,10 @@ impl WechatPay {
         debug!("url: {} body: {}", url, body);
         let builder = client.post(url);
 
-        builder
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?
-            .json::<WeChatResponse<RefundsResponse>>()
-            .await
-            .map(Ok)?
+        let text = send_and_check(builder.headers(headers).body(body)).await?;
+        Ok(serde_json::from_str::<WeChatResponse<RefundsResponse>>(
+            &text,
+        )?)
     }
 }
 

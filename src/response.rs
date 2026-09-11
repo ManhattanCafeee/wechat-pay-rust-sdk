@@ -136,6 +136,23 @@ pub struct ErrorResponse {
     pub code: Option<String>,
     /// 【错误信息】 错误信息
     pub message: Option<String>,
+    /// 【错误详情】 微信返回的字段级错误定位信息，原样保留便于排查。
+    pub detail: Option<serde_json::Value>,
+}
+
+impl std::fmt::Display for ErrorResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "code={} message={}",
+            self.code.as_deref().unwrap_or("<none>"),
+            self.message.as_deref().unwrap_or("<none>"),
+        )?;
+        if let Some(detail) = &self.detail {
+            write!(f, " detail={detail}")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
