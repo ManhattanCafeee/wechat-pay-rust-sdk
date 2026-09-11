@@ -16,7 +16,7 @@ use crate::response::MicroResponse;
 use crate::response::RefundsResponse;
 use crate::response::ResponseTrait;
 use crate::response::WeChatResponse;
-use crate::response::{CertificateResponse, NativeResponse};
+use crate::response::{CertificateResponse, NativeResponse, TransactionResponse};
 use reqwest::header::{HeaderMap, REFERER};
 use serde_json::{Map, Value};
 
@@ -55,6 +55,55 @@ async fn send_and_check(builder: RequestBuilder) -> Result<String, PayError> {
 }
 
 impl WechatPay {
+    /// 底层请求：签名 → 发送 → 状态检查，返回响应体文本。
+    ///
+    /// **不注入任何字段** —— `appid` / `mchid` / `notify_url` 的注入只发生在 `pay()` 里。
+    /// 这是有意的：关单只需要 `mchid`、查单的 `mchid` 要放在 query string，
+    /// 无脑注入这三个字段会让这些端点直接失败。
+    ///
+    /// ⚠ 传入的 `url` 会**原样参与签名**，所以 GET 的查询串必须拼进 `url`
+    /// （微信要求签名串第二行是 path + `?` + query）。
+    #[maybe_async_attr]
+    async fn request(&self, method: HttpMethod, url: &str, body: &str) -> Result<String, PayError> {
+        let headers = self.build_header(method.clone(), url, body)?;
+        let client = Client::new();
+        let full_url = format!("{}{}", self.base_url(), url);
+        debug!("url: {} body: {}", full_url, body);
+        let builder = match method {
+            HttpMethod::GET => client.get(full_url),
+            HttpMethod::POST => client.post(full_url),
+            HttpMethod::PUT => client.put(full_url),
+            HttpMethod::DELETE => client.delete(full_url),
+            HttpMethod::PATCH => client.patch(full_url),
+        };
+
+        send_and_check(builder.headers(headers).body(body.to_owned())).await
+    }
+
+    /// `request` + JSON 解析。
+    #[maybe_async_attr]
+    async fn request_json<R: ResponseTrait>(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        body: &str,
+    ) -> Result<R, PayError> {
+        let text = self.request(method, url, body).await?;
+        Ok(serde_json::from_str::<R>(&text)?)
+    }
+
+    /// `request` + 丢弃响应体，用于 **204 No Content**（例如关单）。
+    #[maybe_async_attr]
+    async fn request_no_content(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        body: &str,
+    ) -> Result<(), PayError> {
+        self.request(method, url, body).await?;
+        Ok(())
+    }
+
     #[maybe_async_attr]
     pub async fn pay<P: ParamsTrait, R: ResponseTrait>(
         &self,
@@ -69,31 +118,12 @@ impl WechatPay {
         map.insert("mchid".to_owned(), self.mch_id().into());
         map.insert("notify_url".to_owned(), self.notify_url().into());
         let body = serde_json::to_string(&map)?;
-        let headers = self.build_header(method.clone(), url, body.as_str())?;
-        let client = Client::new();
-        let url = format!("{}{}", self.base_url(), url);
-        debug!("url: {} body: {}", url, body);
-        let builder = match method {
-            HttpMethod::GET => client.get(url),
-            HttpMethod::POST => client.post(url),
-            HttpMethod::PUT => client.put(url),
-            HttpMethod::DELETE => client.delete(url),
-            HttpMethod::PATCH => client.patch(url),
-        };
-
-        let text = send_and_check(builder.headers(headers).body(body)).await?;
-        Ok(serde_json::from_str::<R>(&text)?)
+        self.request_json(method, url, &body).await
     }
 
     #[maybe_async_attr]
     pub async fn get_pay<R: ResponseTrait>(&self, url: &str) -> Result<R, PayError> {
-        let body = "";
-        let headers = self.build_header(HttpMethod::GET, url, body)?;
-        let client = Client::new();
-        let url = format!("{}{}", self.base_url(), url);
-        debug!("url: {} body: {}", url, body);
-        let text = send_and_check(client.get(url).headers(headers).body(body)).await?;
-        Ok(serde_json::from_str::<R>(&text)?)
+        self.request_json(HttpMethod::GET, url, "").await
     }
 
     #[maybe_async_attr]
@@ -180,16 +210,53 @@ impl WechatPay {
     ) -> Result<WeChatResponse<RefundsResponse>, PayError> {
         let url = "/v3/refund/domestic/refunds";
         let body = params.to_json();
-        let headers = self.build_header(HttpMethod::POST, url, body.as_str())?;
-        let client = Client::new();
-        let url = format!("{}{}", self.base_url(), url);
-        debug!("url: {} body: {}", url, body);
-        let builder = client.post(url);
+        self.request_json(HttpMethod::POST, url, &body).await
+    }
 
-        let text = send_and_check(builder.headers(headers).body(body)).await?;
-        Ok(serde_json::from_str::<WeChatResponse<RefundsResponse>>(
-            &text,
-        )?)
+    /// 查询订单（按商户订单号）。
+    ///
+    /// `GET /v3/pay/transactions/out-trade-no/{out_trade_no}?mchid={mchid}`
+    ///
+    /// ⚠ `mchid` 是**唯一**的查询参数，且必须拼进 URL —— 微信签名串的第二行要求带上
+    /// 查询串，漏掉会直接 401。订单不存在时微信返回 404 `ORDER_NOT_EXIST`，
+    /// 会作为 `PayError::ApiError` 返回（`response.code`）。
+    #[maybe_async_attr]
+    pub async fn query_order(&self, out_trade_no: &str) -> Result<TransactionResponse, PayError> {
+        // out_trade_no 与 mchid 的字符集被微信限制为数字/字母/`_`/`-`/`*`，无需 percent-encoding。
+        let url = format!(
+            "/v3/pay/transactions/out-trade-no/{out_trade_no}?mchid={}",
+            self.mch_id()
+        );
+        self.request_json(HttpMethod::GET, &url, "").await
+    }
+
+    /// 关闭订单。
+    ///
+    /// `POST /v3/pay/transactions/out-trade-no/{out_trade_no}/close`，请求体**只有**
+    /// `mchid` 一个字段。成功时微信返回 **204 No Content 且无响应体**，因此这里不解析
+    /// body（用 `request_no_content` 而不是 `request_json`）。
+    ///
+    /// 注意：关单不是退款的替代 —— 已支付的订单只能退款。
+    #[maybe_async_attr]
+    pub async fn close_order(&self, out_trade_no: &str) -> Result<(), PayError> {
+        let url = format!("/v3/pay/transactions/out-trade-no/{out_trade_no}/close");
+        let body = serde_json::json!({ "mchid": self.mch_id() }).to_string();
+        self.request_no_content(HttpMethod::POST, &url, &body).await
+    }
+
+    /// 查询退款（按商户退款单号）。
+    ///
+    /// `GET /v3/refund/domestic/refunds/{out_refund_no}` —— 该端点**没有查询参数**，
+    /// `mchid` 由 Authorization 头隐含。响应体与「申请退款」一致，因此复用
+    /// [`RefundsResponse`]。
+    ///
+    /// 退款是异步的：申请受理不等于退款成功，需要轮询本接口直到 `status` 离开
+    /// `PROCESSING`（官方建议申请后每分钟查一次，5 分钟后降频）。
+    /// 退款单不存在时微信返回 404 `RESOURCE_NOT_EXISTS`。
+    #[maybe_async_attr]
+    pub async fn query_refund(&self, out_refund_no: &str) -> Result<RefundsResponse, PayError> {
+        let url = format!("/v3/refund/domestic/refunds/{out_refund_no}");
+        self.request_json(HttpMethod::GET, &url, "").await
     }
 }
 

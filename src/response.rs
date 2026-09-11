@@ -1,3 +1,4 @@
+use crate::model::PayerInfo;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -287,4 +288,114 @@ pub struct RefundsGoodsDetailResponse {
     pub refund_amount: i32,
     /// 【商品退货数量】 申请退款的商品退货数量。
     pub refund_quantity: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransactionResponse {
+    /// 【应用ID】 直连商户申请的公众号或移动应用appid。
+    pub appid: String,
+    /// 【直连商户号】 直连商户的商户号，由微信支付生成并下发。
+    pub mchid: String,
+    /// 【商户订单号】 商户系统内部订单号，只能是数字、大小写字母_-*且在同一个商户号下唯一。
+    pub out_trade_no: String,
+    /// 【交易状态】 交易状态
+    /// SUCCESS：支付成功
+    /// REFUND：转入退款
+    /// NOTPAY：未支付
+    /// CLOSED：已关闭
+    /// REVOKED：已撤销（仅付款码支付会返回）
+    /// USERPAYING：用户支付中（仅付款码支付会返回）
+    /// PAYERROR：支付失败（仅付款码支付会返回）
+    pub trade_state: String,
+    /// 【交易状态描述】 交易状态描述
+    pub trade_state_desc: String,
+    /// 【微信支付订单号】 微信支付侧订单的唯一标识，订单支付成功后返回。
+    pub transaction_id: Option<String>,
+    /// 【交易类型】 交易类型
+    /// JSAPI：公众号支付
+    /// NATIVE：扫码支付
+    /// APP：APP支付
+    /// MICROPAY：付款码支付
+    /// MWEB：H5支付
+    /// FACEPAY：刷脸支付
+    pub trade_type: Option<String>,
+    /// 【付款银行】 银行类型，采用字符串类型的银行标识。
+    pub bank_type: Option<String>,
+    /// 【附加数据】 附加数据，在查询API和支付通知中原样返回，可作为自定义参数使用，实际情况下只有支付完成状态才会返回该字段。
+    pub attach: Option<String>,
+    /// 【支付完成时间】 支付完成时间，遵循rfc3339标准格式：yyyy-MM-DDTHH:mm:ss+TIMEZONE。
+    pub success_time: Option<String>,
+    /// 【支付者】 支付者信息。
+    pub payer: Option<PayerInfo>,
+    /// 【订单金额】 订单金额信息。
+    pub amount: Option<TransactionAmountResponse>,
+    /// 【场景信息】 支付场景描述。
+    pub scene_info: Option<TransactionSceneInfo>,
+    /// 【优惠功能】 订单优惠信息，订单使用了代金券时返回。
+    pub promotion_detail: Option<Vec<TransactionPromotionDetail>>,
+}
+
+impl ResponseTrait for TransactionResponse {}
+
+#[derive(Debug, Deserialize)]
+pub struct TransactionAmountResponse {
+    /// 【订单金额】 订单总金额，单位为分。
+    pub total: Option<i32>,
+    /// 【用户支付金额】 用户支付金额，单位为分。
+    pub payer_total: Option<i32>,
+    /// 【货币类型】 货币类型，固定返回CNY，代表人民币。
+    pub currency: Option<String>,
+    /// 【用户支付币种】 用户支付币种，固定返回CNY，代表人民币。
+    pub payer_currency: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransactionSceneInfo {
+    /// 【商户端设备号】 商户端设备号（门店号或收银设备ID）。
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransactionPromotionDetail {
+    /// 【券ID】 代金券id，单张代金券的编号。
+    pub coupon_id: String,
+    /// 【优惠名称】 优惠名称。
+    pub name: String,
+    /// 【优惠金额】 优惠金额，单位为分。
+    pub amount: i32,
+    /// 【优惠范围】 优惠活动中代金券的适用范围
+    /// GLOBAL：全场代金券
+    /// SINGLE：单品优惠
+    pub scope: Option<String>,
+    /// 【优惠类型】 代金券资金类型
+    /// CASH：预充值
+    /// NOCASH：免充值
+    #[serde(rename = "type")]
+    pub r#type: Option<String>,
+    /// 【活动ID】 优惠活动ID。
+    pub stock_id: Option<String>,
+    /// 【微信出资】 微信出资，单位为分。
+    pub wechatpay_contribute: Option<i32>,
+    /// 【商户出资】 商户出资，单位为分。
+    pub merchant_contribute: Option<i32>,
+    /// 【其他出资】 其他出资，单位为分。
+    pub other_contribute: Option<i32>,
+    /// 【优惠币种】 优惠币种，固定返回CNY，代表人民币。
+    pub currency: Option<String>,
+    /// 【单品列表】 单品优惠信息。
+    pub goods_detail: Option<Vec<TransactionPromotionGoodsDetail>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransactionPromotionGoodsDetail {
+    /// 【商品编码】 商品编码。
+    pub goods_id: String,
+    /// 【商品数量】 用户购买的数量。
+    pub quantity: i32,
+    /// 【商品单价】 商品单价，单位为分。
+    pub unit_price: i32,
+    /// 【商品优惠金额】 商品优惠金额，单位为分。
+    pub discount_amount: i32,
+    /// 【商品备注】 商品备注。
+    pub goods_remark: Option<String>,
 }

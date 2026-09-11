@@ -831,3 +831,110 @@ dual_test! {
         assert!(matches!(err, PayError::VerifyError(_)), "实际 {err:?}");
     }
 }
+dual_test! {
+    fn query_order_signs_the_url_including_query_string() {
+        // 微信签名串的第二行是 path + "?" + query。漏掉查询串会直接 401，
+        // 所以这里用捕获到的 Authorization 头独立重建签名串并验签。
+        let mock = Mock::start(vec![MockResponse::json(
+            200,
+            r#"{"appid":"wx_test_appid","mchid":"1900000001","out_trade_no":"ORDER_0009","trade_state":"NOTPAY","trade_state_desc":"订单未支付"}"#,
+        )]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let response = call!(wechat_pay.query_order("ORDER_0009")).expect("200 应解析成功");
+        assert_eq!(response.out_trade_no, "ORDER_0009");
+        assert_eq!(response.trade_state, "NOTPAY");
+        assert_eq!(response.transaction_id, None, "未支付时不下发微信订单号");
+        assert!(response.amount.is_none(), "本响应未带 amount");
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, "GET");
+        assert_eq!(
+            request.path,
+            "/v3/pay/transactions/out-trade-no/ORDER_0009?mchid=1900000001",
+            "mchid 是唯一的查询参数，且必须出现在 URL 里"
+        );
+
+        // 关键断言：签名覆盖的是**含查询串**的 URL
+        let auth = request.header("authorization").expect("authorization header");
+        let message = format!(
+            "GET\n{}\n{}\n{}\n{}\n",
+            request.path,
+            auth_field(auth, "timestamp"),
+            auth_field(auth, "nonce_str"),
+            request.body,
+        );
+        assert_valid_signature(&message, &auth_field(auth, "signature"));
+    }
+}
+dual_test! {
+    fn close_order_sends_only_mchid_and_accepts_204() {
+        // 关单成功返回 204 No Content 且**无响应体**。
+        // 若走 request_json 会因空 body 解析失败 —— 所以它用 request_no_content。
+        let mock = Mock::start(vec![MockResponse::json(204, "")]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        call!(wechat_pay.close_order("ORDER_0010")).expect("204 必须被当作成功");
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.path,
+            "/v3/pay/transactions/out-trade-no/ORDER_0010/close"
+        );
+
+        // 请求体只能有 mchid。这正是把底层 request() 抽出来的原因：
+        // pay() 会无条件注入 appid / mchid / notify_url，而关单不接受后两者。
+        let sent: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+        let object = sent.as_object().expect("json object");
+        assert_eq!(
+            object.len(),
+            1,
+            "关单请求体只应有 mchid 一个字段，实际: {sent}"
+        );
+        assert_eq!(sent["mchid"], TEST_MCH_ID);
+    }
+}
+dual_test! {
+    fn query_refund_sends_no_query_params() {
+        let refund = r#"{"refund_id":"50000000382019052709732678859","out_refund_no":"R_0002","transaction_id":"4200000000000000000000000000","out_trade_no":"ORDER_0011","channel":"ORIGINAL","user_received_account":"支付用户零钱","create_time":"2026-09-11T12:00:00+08:00","status":"SUCCESS","funds_account":"UNSETTLED","amount":{"total":1,"refund":1,"payer_total":1,"payer_refund":1,"settlement_refund":1,"settlement_total":1,"discount_refund":0,"currency":"CNY"}}"#;
+        let mock = Mock::start(vec![MockResponse::json(200, refund)]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let response = call!(wechat_pay.query_refund("R_0002")).expect("200 应解析成功");
+        assert_eq!(response.status, "SUCCESS");
+        assert_eq!(response.amount.refund, 1);
+        assert_eq!(response.amount.total, 1);
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        // 该端点没有任何查询参数：mchid 由 Authorization 头隐含
+        assert_eq!(requests[0].path, "/v3/refund/domestic/refunds/R_0002");
+    }
+}
+dual_test! {
+    fn query_order_surfaces_order_not_exist_as_api_error() {
+        // 订单不存在时微信返回 404 ORDER_NOT_EXIST —— 这是业务结果，不是传输故障，
+        // 调用方需要能从 response.code 里区分出来。
+        let mock = Mock::start(vec![MockResponse::json(
+            404,
+            r#"{"code":"ORDER_NOT_EXIST","message":"订单不存在"}"#,
+        )]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let result = call!(wechat_pay.query_order("ORDER_XXXX"));
+
+        match result {
+            Err(PayError::ApiError { status, response }) => {
+                assert_eq!(status, 404);
+                assert_eq!(response.code.as_deref(), Some("ORDER_NOT_EXIST"));
+            }
+            other => panic!("应返回 Err(PayError::ApiError)，实际得到 {other:?}"),
+        }
+    }
+}

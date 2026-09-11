@@ -39,18 +39,34 @@ Request flow (`pay()` is the single generic path):
 caller ──▶ WechatPay::pay::<P: ParamsTrait, R: ResponseTrait>(method, url, params)
              │  params.to_json()                       # src/model.rs: ParamsTrait
              │  inject appid / mchid / notify_url      # from WechatPay config, NOT from the model
+             ▼
+        WechatPay::request(method, url, body)          # ⚠ 不注入任何字段
              │  build_header(method, url, body)        # RSA-SHA256 sign → Authorization header
              │  Client::new().{get,post,…}(base_url + url).body(body).send()
              ▼
         send_and_check(builder)   # 先取 status + text
              ├── 非 2xx → Err(PayError::ApiError { status, response })
-             └── 2xx    → serde_json::from_str::<R>()  ──▶  R: ResponseTrait (DeserializeOwned)
+             └── 2xx    → 文本交给 request_json / request_no_content 处理
 ```
+
+三个层次（都在 `src/async_impl/pay.rs`）：
+
+| 方法 | 职责 |
+| --- | --- |
+| `send_and_check` | 收 builder，做状态检查，返回响应体文本 |
+| `request` / `request_json` / `request_no_content` | 签名 + 发送；**不注入字段** |
+| `pay` / `get_pay` / `refunds` / `query_order` / `close_order` / `query_refund` | 各端点 |
 
 ⚠ **状态码必须先于 body 处理。** 微信失败时返回非 2xx + `{"code","message","detail"}`。若直接
 `.json::<R>()`，错误体就会被解析进字段全为 `Option` 的成功类型（如 `JsapiResponse`），
 下单失败会伪装成 `Ok(JsapiResponse { code: Some("PARAM_ERROR"), prepay_id: None })`。
-所有请求路径都经过 `send_and_check`（`src/async_impl/pay.rs`），新增端点不要绕过它。
+
+⚠ **`request()` 有意不注入 `appid`/`mchid`/`notify_url`** —— 关单的请求体只需要 `mchid`、
+查单的 `mchid` 要放在 query string，无脑注入这三个字段会让这些端点直接失败。注入只发生在
+`pay()` 里。`request_no_content` 用于 **204 No Content**（关单），它不解析 body。
+
+⚠ GET 的**查询串必须拼进传给 `request` 的 `url`**：微信签名串第二行是 path + `?` + query。
+`query_order` 就是这么拼的，测试会独立重建签名串验签来守住这条。
 
 Post-processing happens in the thin per-endpoint wrappers, e.g. `app_pay` / `jsapi_pay` / `micro_pay`
 attach `sign_data` via `WechatPayTrait::mut_sign_data(prefix, prepay_id)` — the prefix differs
@@ -71,12 +87,14 @@ Crypto is centralized in `src/pay.rs` traits:
 ```
 src/pay.rs            WechatPay struct + config, both traits, from_env(), build_header(), sync tests
 src/async_impl/       ⚠ name is misleading — this is the ONLY HTTP layer and serves sync + async
-  pay.rs              impl WechatPay { pay, get_pay, *_pay, certificates, get_weixin, refunds }
+  pay.rs              send_and_check → request* → 各端点（pay / *_pay / refunds / query_order / close_order / query_refund / certificates / get_weixin）
   mod.rs              `pub mod pay;` (not feature-gated, always compiled)
 src/model.rs          request params + notify models (Serialize); ParamsTrait
-src/response.rs       response types (Deserialize); ResponseTrait, WeChatResponse<T>
+src/response.rs       response types (Deserialize); ResponseTrait, WeChatResponse<T>, TransactionResponse
+src/cert.rs           PlatformKeys：serial_no → 公钥 PEM 索引 + fetch_platform_keys（平台证书轮换）
+src/notify.rs         NotifyHeaders + verify_notify：时间戳新鲜度 → 按 serial 选键 → 验签（防重放）
 src/sign.rs           sha256_sign — RSA PKCS#1 v1.5 + SHA-256, base64 STANDARD
-src/util.rs           base64 helpers, random_trade_no, x509_to_pem, x509_is_valid
+src/util.rs           base64 助手、random_trade_no、verify_rsa_sha256、x509_to_pem、x509_is_valid
 src/error.rs          PayError (thiserror); src/request.rs HttpMethod; src/pay_type.rs PayType
 src/macros.rs         crate-local `debug!` / `error!` (no-ops unless `debug-print`)
 example/              actix-web notify server; async usage reference
@@ -93,7 +111,7 @@ Run everything from the repo root (tests use CWD-relative fixture paths).
 
 ```bash
 # 完整测试：tests/offline.rs 用本地 mock 服务替代微信网关，不需要凭证或公网
-cargo test                    # PASS — lib 2 passed / 14 ignored，offline 6 passed
+cargo test                    # PASS — lib 2 passed / 14 ignored，offline 19 passed
 cargo test --features async   # PASS — 同一套测试在 async 模式下再跑一遍
 
 # 两种 feature 模式都必须能编译（含测试目标）——这是防回归的关键两条
@@ -183,8 +201,16 @@ HTML）会被原样放进 `response.message`，不丢线索。
 unless the `debug-print` feature is on. Prefer them over unconditional `tracing::debug!`.
 
 **Adding an endpoint:** add one `#[maybe_async_attr] pub async fn` inside `impl WechatPay` in
-`src/async_impl/pay.rs`, delegate to `self.pay(HttpMethod::POST, "/v3/…", params)` or
-`self.get_pay(url)`, and add the params/response types to `src/model.rs` / `src/response.rs`.
+`src/async_impl/pay.rs`, then pick the right transport helper — **不要一律套用 `pay()`**：
+
+| 端点形态 | 用哪个 | 例 |
+| --- | --- | --- |
+| 下单类（需要注入 appid/mchid/notify_url） | `self.pay(method, url, params)` | `jsapi_pay` |
+| 普通 JSON 请求（GET 或自定义 body） | `self.request_json(method, url, body)` | `query_order` / `certificates` |
+| 返回 **204 无 body** | `self.request_no_content(method, url, body)` | `close_order` |
+
+⚠ GET 的查询串必须拼进 `url`（参与签名）。新增 params/response 类型放到 `src/model.rs` /
+`src/response.rs`，响应类型需要 `impl ResponseTrait for X {}`。
 
 **Do not propagate this boilerplate:** `unsafe impl Send for …` / `unsafe impl Sync for …` is sprayed
 across `HttpMethod`, `Currency`, `AmountInfo`, `PayerInfo`, `WechatPay` and is redundant — those types
@@ -202,9 +228,11 @@ prepended (`https://api.mch.weixin.qq.com` by default, set in `WechatPay::new`).
 | --- | --- |
 | `src/async_impl/pay.rs` | The single HTTP implementation — every endpoint lives here, for both sync and async |
 | `src/pay.rs` | `WechatPay` definition, `from_env()`, `build_header()`, `WechatPayTrait`, `PayNotifyTrait` |
-| `src/lib.rs` | `#![doc = include_str!("../README.md")]` — the README **is** the crate rustdoc; that makes its fences doctests |
+| `src/lib.rs` | `#![doc = include_str!("../README.md")]` — the README **is** the crate rustdoc（其 ```rust 代码块**不被编译**，见 `[lib] doctest = false`） |
 | `src/model.rs` | All request/notify models + `ParamsTrait` |
-| `src/response.rs` | All response models + `ResponseTrait` + `WeChatResponse<T>` |
+| `src/response.rs` | All response models + `ResponseTrait` + `WeChatResponse<T>` + `TransactionResponse` |
+| `src/cert.rs` | `PlatformKeys`：按 `serial_no` 索引平台公钥 + `fetch_platform_keys` 拉取/解密。**轮换期必须按 serial 选键** |
+| `src/notify.rs` | `NotifyHeaders` + `verify_notify`：新鲜度 → 选键 → 验签。模块文档写明幂等必须由业务侧做 |
 | `src/error.rs` | `PayError` — the single error type |
 | `Cargo.toml` | Feature definitions; `default = ["reqwest/blocking"]`, `async`, `debug-print` |
 | `example/src/main.rs` | actix-web notify server; the async API reference. Registers `/pay/notify`, `/pay/notify2` and `/` — `pay_notify3` is defined but never wired into `App`, and it pre-formats the signed message before passing it as `body`, which would double-format (`verify_signature` formats it itself) |
@@ -252,18 +280,22 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
 
 | 层 | 位置 | 内容 |
 | --- | --- | --- |
-| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写单请求 HTTP 服务）替代微信网关；6 个带断言的用例 |
+| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写单请求 HTTP 服务）替代微信网关；19 个带断言的用例 |
 | 纯逻辑单测 | `src/pay.rs`、`src/async_impl/pay.rs` | `test_uuid_v4`、`test_str` 两个无外部依赖用例 |
 
 **`tests/offline.rs` 覆盖的契约（改这些行为必须同步改测试）：**
 
 - Authorization 头格式 `WECHATPAY2-SHA256-RSA2048 mchid="…",nonce_str="…",signature="…",timestamp="…",serial_no="…"`
 - 签名串 `"{method}\n{url}\n{timestamp}\n{nonce}\n{body}\n"` —— 测试**独立重建并验签**，不复用 SDK 自己的实现
-- `pay()` 注入的 `appid` / `mchid` / `notify_url` 来自配置而非入参
+- **GET 的签名必须覆盖 query string**（`query_order` 的 `?mchid=…`）
+- `pay()` 注入的 `appid` / `mchid` / `notify_url` 来自配置而非入参；`close_order` 的请求体**只有** `mchid`
 - **非 2xx → `Err(PayError::ApiError)`，且 `code` / `message` / `detail` 不丢失**
-- 非 JSON 错误体原样保留
+- 非 JSON / 非微信形状的错误体原样保留、超长体截断、空体有显式标记
+- **关单 204 无 body 必须被当作成功**（走 `request_no_content`）
 - AES-256-GCM 回调解密往返
 - 回调验签：合法通过 / 篡改 body 失败 / 非法签名失败
+- **平台证书轮换**：轮换期两张证书都进索引；按 `Wechatpay-Serial` 选键；未知 serial 报 `UnknownPlatformSerial`
+- **防重放**：±300s 时间窗（含边界）、非法时间戳拒绝
 
 **写新测试请用 `dual_test!`** —— 一份测试体在两种 feature 下各生成一个测试函数：
 
@@ -326,20 +358,28 @@ pub fn test_native_pay() { /* … sync … */ }
 
 来自一次代码 / 依赖 / 许可证审计，按优先级排列：
 
-1. **缺少常用 API** —— 没有订单查询、关单、退款查询、账单下载。⚠ 不能直接复用 `pay()`：它无脑
-   注入 `appid`/`mchid`/`notify_url`，而关单只需要 `mchid`、查单的 `mchid` 要放在 **query
-   string** 里。需先抽出底层 `request(method, url, body)`，把 `pay()` 降级为它的包装。
-2. **回调防护缺失** —— `verify_signature` 只验签名、**不校验时间戳新鲜度**，抓到一次合法回调即可
-   无限重放。必须自行补 ±300s 时间窗 + 事件去重 + 按 `out_trade_no` 做幂等。
-3. **证书轮换未支持** —— 只接受单个公钥，而微信平台证书在轮换期多张并存，需按请求头
-   `Wechatpay-Serial` 选择对应公钥，否则轮换期回调验签会全部失败（订单不发货）。
-4. **连接未复用** —— 每次请求都 `Client::new()`，无超时、无连接池。建议持有 `Client` 并设置超时；
+1. **连接未复用** —— 每次请求都 `Client::new()`，无超时、无连接池。建议持有 `Client` 并设置超时；
    ⚠ 下单接口不可无脑重试（会重复下单），只对幂等的 GET 查单重试。
-5. **`WechatPay` 派生 `Debug` 且字段全 `pub`** —— `{:?}` 会把商户私钥写进日志。建议字段改私有 +
-   手写脱敏 `Debug`（`base_url` 因此也容易被非预期地改写）。
-6. **生产环境不要开 `debug-print`** —— 会记录 Authorization 头（含签名与 serial_no）、完整请求体
+2. **生产环境不要开 `debug-print`** —— 会记录 Authorization 头（含签名与 serial_no）、完整请求体
    （openid、订单号、金额）以及被签名的原文。不含私钥，但属敏感数据。
-7. **`cargo check --no-default-features` 失败** —— 既有问题：`src/error.rs` 无条件引用
+3. **幂等未内建** —— `notify::verify_notify` 只解决「是不是微信发的、是不是刚发的」，
+   按 `out_trade_no` / `transaction_id` 落库去重仍需业务侧实现（微信最多重试 15 次）。
+4. **账单下载未实现** —— 对账用的交易账单接口还没封装。
+5. **`get_weixin` 是 SSRF 面** —— 对调用方传入的 URL 发 GET 且无白名单；`h5_url` 绝不能来自用户输入。
+6. **`cargo check --no-default-features` 失败** —— 既有问题：`src/error.rs` 无条件引用
    `reqwest::Error`，而 reqwest 是 optional 依赖。
-8. **冗余 `unsafe impl Send/Sync`**（6 处）—— 相关类型本就是 `Send + Sync`，不要新增。
-9. **仓库尚未整体 rustfmt 化** —— 见 Development Commands。
+7. **冗余 `unsafe impl Send/Sync`**（6 处）—— 相关类型本就是 `Send + Sync`，不要新增。
+8. **仓库尚未整体 rustfmt 化** —— 见 Development Commands。
+9. **`.json()` → `from_str` 的解码差异** —— 非法 UTF-8 的 2xx 响应体现在会被有损替换为 U+FFFD
+   后解析成功，而不是报错（微信返回的 JSON 始终是合法 UTF-8，实际无影响）。
+
+### 已完成（P0 / P1）
+
+- ~~错误吞噬：非 2xx 响应被解析成成功~~ → `send_and_check` 先查状态码，新增 `PayError::ApiError`
+- ~~缺少订单查询 / 关单 / 退款查询~~ → `query_order` / `close_order` / `query_refund`
+- ~~回调无防重放~~ → `notify::verify_notify`（±300s 窗口 → 按 serial 选键 → 验签）
+- ~~只支持单张平台证书，轮换期验签全挂~~ → `cert::PlatformKeys` + `fetch_platform_keys`
+- ~~`WechatPay` 字段全 `pub`、`Debug` 泄露私钥~~ → 字段私有 + 脱敏 `Debug` + `with_base_url`
+- ~~无离线测试、无 CI~~ → `tests/offline.rs`（19 个用例）+ GitHub Actions
+- ~~README doctest 20/20 红、`--features async --all-targets` 编译失败~~ → `doctest = false` + 补齐 cfg 门
+- ~~许可证元数据与 LICENSE 文件不一致~~ → 统一 Apache-2.0 + `NOTICE`
