@@ -111,7 +111,7 @@ Run everything from the repo root (tests use CWD-relative fixture paths).
 
 ```bash
 # 完整测试：tests/offline.rs 用本地 mock 服务替代微信网关，不需要凭证或公网
-cargo test                    # PASS — lib 2 passed / 14 ignored，offline 19 passed
+cargo test                    # PASS — lib 2 passed / 14 ignored，offline 21 passed
 cargo test --features async   # PASS — 同一套测试在 async 模式下再跑一遍
 
 # 两种 feature 模式都必须能编译（含测试目标）——这是防回归的关键两条
@@ -197,6 +197,16 @@ HTML）会被原样放进 `response.message`，不丢线索。
 
 `src/sign.rs` 与 `from_env()` 仍会 `expect()`/panic —— 属既有债务，不要照抄。
 
+**错误分层：** `PayError::kind()` 返回 `ErrorKind`，把错误归为三层，供调用方决定处置策略：
+
+| 归类 | 含义 | 处置 |
+| --- | --- | --- |
+| `Network` | 传输 / 连接层失败 | 可考虑重试；⚠ 下单接口不可无脑重试（会重复下单） |
+| `Api` | 微信业务拒绝（HTTP 非 2xx） | 不重试，按 `response.code` 分支。`ORDER_NOT_EXIST` 是**正常业务结果**而不是故障 |
+| `Local` | 签名、解密、Base64、JSON 解析、验签失败、回调超窗 | 不重试，通常是配置或数据问题，应当告警 |
+
+`kind()` 用**穷尽匹配**，新增 `PayError` 变体时编译器会强制你在这里做出归类决定。
+
 **Logging:** use the crate-local `debug!` / `error!` from `src/macros.rs`, which compile to no-ops
 unless the `debug-print` feature is on. Prefer them over unconditional `tracing::debug!`.
 
@@ -212,9 +222,16 @@ unless the `debug-print` feature is on. Prefer them over unconditional `tracing:
 ⚠ GET 的查询串必须拼进 `url`（参与签名）。新增 params/response 类型放到 `src/model.rs` /
 `src/response.rs`，响应类型需要 `impl ResponseTrait for X {}`。
 
-**Do not propagate this boilerplate:** `unsafe impl Send for …` / `unsafe impl Sync for …` is sprayed
-across `HttpMethod`, `Currency`, `AmountInfo`, `PayerInfo`, `WechatPay` and is redundant — those types
-are already `Send + Sync`. Leave existing ones alone; don't add new ones.
+**`unsafe` 已全部清除。** 原先有 **22 处** `unsafe impl Send/Sync`（覆盖 `WechatPay`、`HttpMethod`、
+`Currency`、`AmountInfo`、`PayerInfo`、`GoodsDetail`、`OrderDetail`、`SceneInfo`、`SettleInfo`、
+`NativeParams`、`JsapiParams`），全是冗余的 —— 这些类型本来就自动满足 `Send + Sync`，手写的
+`unsafe impl` 只会掩盖将来引入非 Send 字段的问题。现已全部删除，换成两道防线：
+
+- `src/lib.rs` 的 `#![forbid(unsafe_code)]`：**编译期强制**，且 `forbid` 不可被内部 `allow` 覆盖
+- `tests/offline.rs::public_types_are_send_and_sync`：编译期断言上述类型仍是 `Send + Sync`，
+  谁给它们加上 `Rc` / 裸指针，测试会直接编译失败
+
+**不要再为"保证" `Send + Sync` 写 `unsafe impl`。**
 
 **Signing contract** (if you touch headers): `build_header` produces
 `WECHATPAY2-SHA256-RSA2048 mchid="…",nonce_str="…",signature="…",timestamp="…",serial_no="…"` over
@@ -264,6 +281,9 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
   | `features = ["debug-print"]` | real `tracing` output from `debug!`/`error!` + `open_debug()` |
   | `default-features = false, features = ["async"]` | async API without compiling reqwest's blocking client |
 
+- **双模式（sync + async）是有意保留的，不要为了「简化」砍掉 sync**：`maybe-async` 让一份实现
+  同时产出两种 API，现在两种模式都能编译、都有测试覆盖。砍掉会带来一次巨大的 diff、牺牲与上游的
+  可合并性，而收益只是少写一点测试（`dual_test!` 宏已经处理了这件事）。
 - ⚠ **The README's install section is stale.** It claims async is the default and that a `blocking`
   feature selects sync. **No `blocking` feature exists** (`cargo metadata` features are exactly
   `async`, `debug-print`, `default`, `reqwest`, `tracing`, `tracing-subscriber`), and the real
@@ -280,7 +300,7 @@ Dead ends, so you don't chase them: `PayType` (`src/pay_type.rs`) is unused publ
 
 | 层 | 位置 | 内容 |
 | --- | --- | --- |
-| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写单请求 HTTP 服务）替代微信网关；19 个带断言的用例 |
+| 离线集成测试 | `tests/offline.rs` | 用 `Mock`（手写单请求 HTTP 服务）替代微信网关；21 个带断言的用例（含编译期 Send/Sync 断言） |
 | 纯逻辑单测 | `src/pay.rs`、`src/async_impl/pay.rs` | `test_uuid_v4`、`test_str` 两个无外部依赖用例 |
 
 **`tests/offline.rs` 覆盖的契约（改这些行为必须同步改测试）：**
@@ -368,12 +388,17 @@ pub fn test_native_pay() { /* … sync … */ }
 5. **`get_weixin` 是 SSRF 面** —— 对调用方传入的 URL 发 GET 且无白名单；`h5_url` 绝不能来自用户输入。
 6. **`cargo check --no-default-features` 失败** —— 既有问题：`src/error.rs` 无条件引用
    `reqwest::Error`，而 reqwest 是 optional 依赖。
-7. **冗余 `unsafe impl Send/Sync`**（6 处）—— 相关类型本就是 `Send + Sync`，不要新增。
-8. **仓库尚未整体 rustfmt 化** —— 见 Development Commands。
-9. **`.json()` → `from_str` 的解码差异** —— 非法 UTF-8 的 2xx 响应体现在会被有损替换为 U+FFFD
+7. **仓库尚未整体 rustfmt 化** —— 见 Development Commands。
+8. **`.json()` → `from_str` 的解码差异** —— 非法 UTF-8 的 2xx 响应体现在会被有损替换为 U+FFFD
    后解析成功，而不是报错（微信返回的 JSON 始终是合法 UTF-8，实际无影响）。
+9. **版本号未体现破坏性变更** —— `refunds()` 语义变更（非 2xx 现在返回 `Err`）、`WechatPay`
+   字段私有化、`PayError` 新增变体，按 semver 都应把 `Cargo.toml` 的 `0.2.21` 提到 **`0.3.0`**。
+   是否 bump / 何时发布由维护者决定，本次未动。
+10. **crate name 与上游冲突** —— `name = "wechat-pay-rust-sdk"` 在 crates.io 已被上游占用。
+    仅当要发布到 crates.io 时才需要改名（改名会牵动 `example/Cargo.toml` 的依赖声明）；
+    作为 path / git 依赖使用则无需改动。
 
-### 已完成（P0 / P1）
+### 已完成（P0 / P1 / P2）
 
 - ~~错误吞噬：非 2xx 响应被解析成成功~~ → `send_and_check` 先查状态码，新增 `PayError::ApiError`
 - ~~缺少订单查询 / 关单 / 退款查询~~ → `query_order` / `close_order` / `query_refund`
@@ -383,3 +408,5 @@ pub fn test_native_pay() { /* … sync … */ }
 - ~~无离线测试、无 CI~~ → `tests/offline.rs`（19 个用例）+ GitHub Actions
 - ~~README doctest 20/20 红、`--features async --all-targets` 编译失败~~ → `doctest = false` + 补齐 cfg 门
 - ~~许可证元数据与 LICENSE 文件不一致~~ → 统一 Apache-2.0 + `NOTICE`
+- ~~22 处冗余 `unsafe impl Send/Sync`~~ → 全部删除 + `#![forbid(unsafe_code)]` + 编译期 Send/Sync 断言
+- ~~`PayError` 只有一个大枚举，无法区分处置策略~~ → `PayError::kind()` 分三层（Network / Api / Local）

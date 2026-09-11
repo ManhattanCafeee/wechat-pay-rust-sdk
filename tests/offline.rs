@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use wechat_pay_rust_sdk::cert::{PlatformKeys, REFRESH_INTERVAL_SECS};
-use wechat_pay_rust_sdk::error::PayError;
+use wechat_pay_rust_sdk::error::{ErrorKind, PayError};
 use wechat_pay_rust_sdk::model::{
     AmountInfo, Currency, GoodsDetail, JsapiParams, NativeParams, OrderDetail, PayerInfo,
     RefundsParams, SceneInfo, SettleInfo,
@@ -973,4 +973,56 @@ fn public_types_are_send_and_sync() {
     assert_send_sync::<SettleInfo>();
     assert_send_sync::<NativeParams>();
     assert_send_sync::<JsapiParams>();
+}
+
+dual_test! {
+    fn error_kind_classifies_the_three_layers() {
+        // 1) 网络层：指向一个必然拒绝连接的端口
+        let offline = client_for("http://127.0.0.1:1");
+        let err = call!(offline.jsapi_pay(JsapiParams::new(
+            "测试商品",
+            "ORDER_K1",
+            1.into(),
+            "openid".into(),
+        )))
+        .expect_err("连接被拒应报错");
+        assert_eq!(err.kind(), ErrorKind::Network, "实际: {err}");
+
+        // 2) 业务层：微信以非 2xx 拒绝
+        let mock = Mock::start(vec![MockResponse::json(
+            404,
+            r#"{"code":"ORDER_NOT_EXIST","message":"订单不存在"}"#,
+        )]);
+        let wechat_pay = client_for(&mock.base_url);
+        let err = call!(wechat_pay.query_order("ORDER_K2")).expect_err("404 应报错");
+        assert_eq!(err.kind(), ErrorKind::Api, "实际: {err}");
+        // 订单不存在是**正常业务结果**，调用方要能拿到 code 做分支
+        match &err {
+            PayError::ApiError { response, .. } => {
+                assert_eq!(response.code.as_deref(), Some("ORDER_NOT_EXIST"));
+            }
+            other => panic!("应为 ApiError，实际 {other:?}"),
+        }
+
+        // 3) 本地层：v3_key 不对导致解密失败
+        let wrong_key = WechatPay::new(
+            TEST_APPID,
+            TEST_MCH_ID,
+            TEST_PRIVATE_KEY,
+            TEST_SERIAL_NO,
+            "ffffffffffffffffffffffffffffffff",
+            TEST_NOTIFY_URL,
+        );
+        let err = wrong_key
+            .decrypt_paydata("AAAA", "abcdefghijkl", "transaction")
+            .expect_err("错误密钥应解密失败");
+        assert_eq!(err.kind(), ErrorKind::Local, "实际: {err}");
+
+        // 4) 本地层：验签失败
+        //    注意 verify_signature 是同步方法（非 maybe_async），两种模式下都不要用 call!
+        let err = wechat_pay
+            .verify_signature(&public_key_pem(), "1", "n", "bm90LWEtc2lnbmF0dXJl", "{}")
+            .expect_err("非法签名应失败");
+        assert_eq!(err.kind(), ErrorKind::Local, "实际: {err}");
+    }
 }

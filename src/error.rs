@@ -42,6 +42,42 @@ pub enum PayError {
     },
 }
 
+/// `PayError` 的三层归类。
+///
+/// 用来决定处置策略 —— 重试、告警、还是把原因直接展示给用户：
+///
+/// | 归类 | 含义 | 建议处置 |
+/// | --- | --- | --- |
+/// | [`Network`](ErrorKind::Network) | 传输 / 连接层失败 | 可考虑重试。⚠ **但下单类接口不可无脑重试**（会重复下单），只对幂等的 GET 查单重试 |
+/// | [`Api`](ErrorKind::Api) | 微信侧业务拒绝（HTTP 非 2xx） | 不要重试；按 `response.code` 分支。`ORDER_NOT_EXIST` 这类是**正常业务结果**，不是故障 |
+/// | [`Local`](ErrorKind::Local) | 本地错误：签名、解密、Base64、JSON 解析、验签失败、回调超窗 | 不要重试，通常意味着配置或数据有问题，应当告警 |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorKind {
+    Network,
+    Api,
+    Local,
+}
+
+impl PayError {
+    /// 三层归类，见 [`ErrorKind`]。
+    ///
+    /// 这里是**穷尽匹配**：`PayError` 新增变体时编译器会强制你在这里做出归类决定。
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            PayError::RequestError(_) => ErrorKind::Network,
+            PayError::ApiError { .. } => ErrorKind::Api,
+            PayError::WechatError(_)
+            | PayError::JsonError(_)
+            | PayError::DecryptError(_)
+            | PayError::DecodeError(_)
+            | PayError::VerifyError(_)
+            | PayError::WeixinNotFound
+            | PayError::UnknownPlatformSerial(_)
+            | PayError::StaleNotify(_) => ErrorKind::Local,
+        }
+    }
+}
+
 /// 原始响应体保留进错误消息时的最大字符数。
 /// 防止网关 / WAF 返回的整页 HTML 被复制进错误消息并刷爆日志。
 const MAX_RAW_BODY_CHARS: usize = 4096;
