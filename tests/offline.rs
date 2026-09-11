@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use wechat_pay_rust_sdk::cert::{PlatformKeys, REFRESH_INTERVAL_SECS};
 use wechat_pay_rust_sdk::error::{ErrorKind, PayError};
 use wechat_pay_rust_sdk::model::{
-    AmountInfo, Currency, GoodsDetail, JsapiParams, NativeParams, OrderDetail, PayerInfo,
-    RefundsParams, SceneInfo, SettleInfo,
+    AmountInfo, AppParams, Currency, GoodsDetail, JsapiParams, MicroParams, NativeParams,
+    OrderDetail, PayerInfo, RefundsParams, SceneInfo, SettleInfo,
 };
 use wechat_pay_rust_sdk::notify::NotifyHeaders;
 use wechat_pay_rust_sdk::pay::{
@@ -1202,5 +1202,160 @@ dual_test! {
             .verify_signature(&public_key_pem(), "1", "n", "bm90LWEtc2lnbmF0dXJl", "{}")
             .expect_err("非法签名应失败");
         assert_eq!(err.kind(), ErrorKind::Local, "实际: {err}");
+    }
+}
+
+dual_test! {
+    fn sign_data_prefix_differs_between_app_and_jsapi() {
+        // 历史回归点：提交 95cf80a「修复app支付"prepay_id="多余签名参数」。
+        // APP 支付的 package 用裸 prepay_id，JSAPI / 付款码必须带 "prepay_id=" 前缀；
+        // 传错会导致前端拉起支付失败，而且失败现象在客户端，很难排查。
+        let prepay = "wx_prepay_0001";
+        let ok_body = format!(r#"{{"prepay_id":"{prepay}"}}"#);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &ok_body),
+            MockResponse::json(200, &ok_body),
+            MockResponse::json(200, &ok_body),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let app = call!(wechat_pay.app_pay(AppParams::new("测试", "O_APP", 1.into())))
+            .expect("app_pay");
+        let jsapi = call!(wechat_pay.jsapi_pay(JsapiParams::new("测试", "O_JSAPI", 1.into(), "o".into())))
+            .expect("jsapi_pay");
+        let micro = call!(wechat_pay.micro_pay(MicroParams::new("测试", "O_MICRO", 1.into(), "o".into())))
+            .expect("micro_pay");
+
+        let app_sign = app.sign_data.expect("APP 必须返回 sign_data");
+        let jsapi_sign = jsapi.sign_data.expect("JSAPI 必须返回 sign_data");
+        let micro_sign = micro.sign_data.expect("付款码必须返回 sign_data");
+
+        assert_eq!(
+            app_sign.package, prepay,
+            "APP 支付的 package 不应带 `prepay_id=` 前缀"
+        );
+        assert_eq!(
+            jsapi_sign.package,
+            format!("prepay_id={prepay}"),
+            "JSAPI 的 package 必须带 `prepay_id=` 前缀"
+        );
+        assert_eq!(
+            micro_sign.package,
+            format!("prepay_id={prepay}"),
+            "付款码的 package 必须带 `prepay_id=` 前缀"
+        );
+
+        // wx.requestPayment 需要的其余字段
+        assert_eq!(app_sign.sign_type, "RSA");
+        assert_eq!(app_sign.app_id, TEST_APPID);
+        assert!(!app_sign.pay_sign.is_empty());
+        assert!(!app_sign.nonce_str.is_empty());
+        assert!(!app_sign.timestamp.is_empty());
+
+        // 三个端点分别是各自的 URL
+        let paths: Vec<String> = mock.requests().iter().map(|r| r.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/v3/pay/transactions/app",
+                "/v3/pay/transactions/jsapi",
+                "/v3/pay/transactions/jsapi",
+            ]
+        );
+    }
+}
+
+dual_test! {
+    fn refunds_success_returns_refund_order() {
+        // 只测过失败路径还不够：申请退款成功的解析也要有断言。
+        let body = r#"{"refund_id":"50000000382019052709732678859","out_refund_no":"R_S1","transaction_id":"4200000000000000000000000000","out_trade_no":"ORDER_S1","channel":"ORIGINAL","user_received_account":"支付用户零钱","create_time":"2026-09-11T12:00:00+08:00","status":"PROCESSING","funds_account":"UNSETTLED","amount":{"total":1,"refund":1,"payer_total":1,"payer_refund":1,"settlement_refund":1,"settlement_total":1,"discount_refund":0,"currency":"CNY"}}"#;
+        let mock = Mock::start(vec![MockResponse::json(200, body)]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let refund = call!(wechat_pay.refunds(RefundsParams::new(
+            "R_S1",
+            1,
+            1,
+            None,
+            Some("ORDER_S1"),
+        )))
+        .expect("受理成功应返回退款单");
+
+        assert_eq!(refund.out_refund_no, "R_S1");
+        assert_eq!(refund.status, "PROCESSING", "刚受理时是处理中，不是成功");
+        assert_eq!(refund.amount.refund, 1);
+
+        let requests = mock.requests();
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/v3/refund/domestic/refunds");
+    }
+}
+
+dual_test! {
+    fn get_weixin_extracts_deeplink_from_h5_page() {
+        // H5 支付返回的页面里嵌着 weixin:// 拉起链接，SDK 逐行扫描把它抠出来。
+        let page = "<html>\n<body>\n deeplink : \"weixin://wap/pay?prepayid%3Dwx123&package=1&noncestr=2&sign=3\"\n</body>\n</html>";
+        let mock = Mock::start(vec![MockResponse::json(200, page)]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        // 注意：get_weixin 接收的是**绝对 URL**（微信返回的 h5_url），
+        // 不会拼 base_url —— 所以这里直接指向 mock。
+        let page_url = format!("{}/h5-page", mock.base_url);
+        let url = call!(wechat_pay.get_weixin(
+            page_url.as_str(),
+            "https://referer.example.com",
+        ))
+        .expect("页面里有链接时应成功");
+
+        assert_eq!(
+            url.as_deref(),
+            Some("weixin://wap/pay?prepayid%3Dwx123&package=1&noncestr=2&sign=3")
+        );
+        // Referer 会随请求发出（微信 H5 页依赖它）
+        assert_eq!(
+            mock.requests()[0].header("referer"),
+            Some("https://referer.example.com")
+        );
+    }
+}
+
+dual_test! {
+    fn get_weixin_reports_not_found_without_deeplink() {
+        let mock = Mock::start(vec![MockResponse::json(200, "<html>no link here</html>")]);
+        let wechat_pay = client_for(&mock.base_url);
+        let page_url = format!("{}/h5-page", mock.base_url);
+
+        let err = call!(wechat_pay.get_weixin(
+            page_url.as_str(),
+            "https://referer.example.com"
+        ))
+        .expect_err("页面里没有链接时必须是 WeixinNotFound");
+
+        assert!(matches!(err, PayError::WeixinNotFound), "实际: {err}");
+    }
+}
+
+dual_test! {
+    fn x509_helpers_extract_the_certificate_public_key() {
+        // 微信下发的证书是 PEM（不是 DER）。这里验证 x509_to_pem 取出的是**正确**的公钥 ——
+        // 判据是它必须能验证由配套私钥签出的签名，而不只是「长得像 PEM」。
+        let pem = TEST_PLATFORM_CERT_PEM.as_bytes();
+
+        let public_key = util::x509_to_pem(pem).expect("应能从证书中取出公钥");
+        assert!(public_key.contains("-----BEGIN PUBLIC KEY-----"));
+        assert!(public_key.contains("-----END PUBLIC KEY-----"));
+
+        let message = "hello-x509";
+        let signature = sign_rsa(message);
+        util::verify_rsa_sha256(&public_key, message, &signature)
+            .expect("证书里的公钥应能验证配套私钥的签名");
+
+        let (valid, not_after) = util::x509_is_valid(pem).expect("应能读到有效期");
+        assert!(valid, "测试证书自签发起 10 年有效期，应当仍然有效");
+        assert!(not_after > 1_700_000_000, "not_after 应是 unix 秒：{not_after}");
+
+        // 非 PEM 输入必须返回 Err，而不是 panic
+        assert!(util::x509_to_pem(b"not a pem").is_err());
+        assert!(util::x509_is_valid(b"not a pem").is_err());
     }
 }
