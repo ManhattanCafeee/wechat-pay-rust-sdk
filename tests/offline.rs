@@ -426,6 +426,49 @@ dual_test! {
         assert_valid_signature(&message, &auth_field(auth, "signature"));
     }
 }
+
+dual_test! {
+    fn sign_data_serializes_with_the_official_request_payment_keys() {
+        // wx.requestPayment 的参数名由官方定死（timeStamp 的 S 还要大写）。
+        // 键名写错时前端只会报「缺少参数」，**不会**指向 SDK —— 所以拿测试钉住，
+        // 免得 rename 属性被误删。
+        let mock = Mock::start(vec![MockResponse::json(
+            200,
+            r#"{"prepay_id":"wx_keynames"}"#,
+        )]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let response = call!(wechat_pay.jsapi_pay(JsapiParams::new(
+            "测试商品",
+            "ORDER_KEYS",
+            1.into(),
+            "openid".into(),
+        )))
+        .expect("200 响应必须解析成功");
+
+        let sign_data = response.sign_data.expect("sign_data");
+        let json = serde_json::to_value(&sign_data).expect("SignData 必须可序列化");
+        let obj = json.as_object().expect("序列化后应当是 JSON 对象");
+
+        for key in [
+            "timeStamp",
+            "nonceStr",
+            "package",
+            "signType",
+            "paySign",
+            "appId",
+        ] {
+            assert!(obj.contains_key(key), "缺少官方字段名 {key}：{json}");
+        }
+        // 反向断言：留着 snake_case 前端就取不到值
+        for wrong in ["timestamp", "nonce_str", "sign_type", "pay_sign", "app_id"] {
+            assert!(
+                !obj.contains_key(wrong),
+                "键名未对齐官方，仍是 {wrong}：{json}"
+            );
+        }
+    }
+}
 dual_test! {
     fn jsapi_pay_returns_err_on_api_error() {
         // 微信 v3 的真实错误体；HTTP 状态码为 400。

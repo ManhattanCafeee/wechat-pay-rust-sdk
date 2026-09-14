@@ -31,20 +31,42 @@ pub struct JsapiResponse {
     pub sign_data: Option<SignData>,
 }
 
-/// JSAPI 签名数据：供 wx.requestPayment 拉起支付使用。
+/// JSAPI / 小程序签名数据：供 `wx.requestPayment` 拉起支付使用。
+///
+/// # 为什么字段名是 camelCase
+///
+/// `wx.requestPayment` 的参数名由官方定死：`timeStamp` / `nonceStr` / `package` /
+/// `signType` / `paySign` —— 注意 **`timeStamp` 的 `S` 必须大写**。这里用
+/// `#[serde(rename = …)]` 对齐官方，**Rust 侧的字段名保持 snake_case 不变**。
+///
+/// 键名写错时前端只会报「缺少参数」，**不会**指向这里，所以别手写这些名字，
+/// 序列化本结构体即可（有测试钉住键名）。
+///
+/// - [`package`](Self::package) 已经是带 `prepay_id=` 前缀的完整串，直接给前端。
+/// - [`app_id`](Self::app_id) 是**公众号 JSAPI** 才需要的（官方字段名 `appId`）；
+///   **小程序**的 `wx.requestPayment` 参数表里没有这一项，前端忽略或删掉即可。
+///
+/// ⚠ **APP 支付不能复用这里的 JSON 键名**：APP SDK 的拉起参数是
+/// `appid` / `partnerid` / `prepayid` / `package` / `noncestr` / `timestamp` / `sign`，
+/// 与 JSAPI 完全不同，需要自行映射。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SignData {
-    /// 【应用ID】 发起支付的公众号或移动应用的 appid。
+    /// 【应用ID】 发起支付的公众号（或移动应用）的 appid。
+    #[serde(rename = "appId")]
     pub app_id: String,
     /// 【签名类型】 签名算法类型，固定为 RSA。
+    #[serde(rename = "signType")]
     pub sign_type: String,
-    /// 【订单详情扩展字符串】 形如 prepay_id=xxx，由预支付会话标识拼装。
+    /// 【订单详情扩展字符串】 形如 `prepay_id=xxx`，由预支付会话标识拼装。
     pub package: String,
     /// 【随机字符串】 参与签名的随机字符串。
+    #[serde(rename = "nonceStr")]
     pub nonce_str: String,
     /// 【时间戳】 参与签名的秒级时间戳。
+    #[serde(rename = "timeStamp")]
     pub timestamp: String,
     /// 【签名值】 使用商户私钥对上述参数生成的签名。
+    #[serde(rename = "paySign")]
     pub pay_sign: String,
 }
 
