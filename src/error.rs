@@ -9,9 +9,10 @@ pub enum PayError {
     /// 传输 / 连接层失败（含超时、TLS、DNS）。
     #[error("http error: {0}")]
     RequestError(#[from] reqwest::Error),
-    /// 通用的微信业务错误文本。
-    #[error("pay error: {0}")]
-    WechatError(String),
+    /// 本地签名相关失败：商户私钥 PEM 无法解析、RSA 签名运算失败，或签名请求头无法构造
+    /// （商户号 / 序列号含非法 HTTP 头字符）。
+    #[error("sign error: {0}")]
+    SignError(String),
     /// 响应体不是合法 JSON，或结构与目标类型不符。
     #[error("json error: {0}")]
     JsonError(#[from] serde_json::Error),
@@ -37,7 +38,10 @@ pub enum PayError {
     /// 回调/应答的时间戳超出允许窗口，判定为重放，已拒绝处理。
     #[error("stale notify rejected: {0}")]
     StaleNotify(String),
-    /// 微信侧返回的业务错误（HTTP 状态码非 2xx）。
+    /// 微信侧返回的业务错误：HTTP 非 2xx，或 2xx 但 body 是错误信封
+    /// （重试用尽后降级的 202 也走这里）。
+    ///
+    /// ⚠ `status` 是微信返回的**原始**状态码，可能是 200 / 202 —— 不要假设它 ≥ 400。
     ///
     /// 保留微信原始的错误码、错误信息与 detail，便于定位到具体字段。
     /// 匹配方式：`PayError::ApiError { status, response }`，用 `response.code` 分支处理。
@@ -80,7 +84,7 @@ impl PayError {
         match self {
             PayError::RequestError(_) => ErrorKind::Network,
             PayError::ApiError { .. } => ErrorKind::Api,
-            PayError::WechatError(_)
+            PayError::SignError(_)
             | PayError::JsonError(_)
             | PayError::DecryptError(_)
             | PayError::DecodeError(_)

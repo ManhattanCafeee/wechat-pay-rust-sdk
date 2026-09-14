@@ -1,9 +1,10 @@
 use crate::error::PayError;
-use crate::model::WechatPayDecodeData;
+use crate::macros::debug;
+use crate::model::{WechatPayDecodeData, WechatPayRefundDecodeData};
 use crate::request::HttpMethod;
 use crate::response::SignData;
 use crate::retry::{RequestKind, RetryPolicy};
-use crate::{debug, sign, util};
+use crate::{sign, util};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, USER_AGENT};
@@ -64,6 +65,54 @@ fn build_client(timeouts: HttpTimeouts) -> Client {
         .expect("构建 HTTP 客户端失败（TLS 后端初始化失败）")
 }
 
+/// 构造 [`WechatPay`] 所需的全部凭据。
+///
+/// 用具名字段而不是六个位置参数：`appid` / `mch_id` / `serial_no` / `v3_key` 都是同一种
+/// 字符串，位置传参写反了照样编译，要等到网关返回 401 `SIGN_ERROR`（甚至更晚）才暴露。
+///
+/// ```no_run
+/// # use wechat_pay_rust_sdk::pay::{WechatPay, WechatPayConfig};
+/// let config = WechatPayConfig {
+///     appid: "wx123".into(),
+///     mch_id: "1900000001".into(),
+///     private_key: std::fs::read_to_string("apiclient_key.pem")?,
+///     serial_no: "5F2C…".into(),
+///     v3_key: "0123456789abcdef0123456789abcdef".into(),
+///     notify_url: "https://example.com/pay/notify".into(),
+/// };
+/// let wechat_pay = WechatPay::from_config(config);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[derive(Clone)]
+pub struct WechatPayConfig {
+    /// 商户 / 小程序 appid。
+    pub appid: String,
+    /// 商户号。
+    pub mch_id: String,
+    /// 商户 API 私钥（**PEM 内容本身**，不是文件路径）。
+    pub private_key: String,
+    /// 商户 API 证书序列号。
+    pub serial_no: String,
+    /// APIv3 密钥（32 字节，用于回调解密）。
+    pub v3_key: String,
+    /// 支付结果通知地址。
+    pub notify_url: String,
+}
+
+// 与 `WechatPay` 同理：derive 会把私钥与 APIv3 密钥原样打进日志。
+impl std::fmt::Debug for WechatPayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WechatPayConfig")
+            .field("appid", &self.appid)
+            .field("mch_id", &self.mch_id)
+            .field("private_key", &"<redacted>")
+            .field("serial_no", &self.serial_no)
+            .field("v3_key", &"<redacted>")
+            .field("notify_url", &self.notify_url)
+            .finish()
+    }
+}
+
 /// 微信支付客户端。
 ///
 /// 字段全部私有：`private_key` / `v3_key` 是能直接动钱的机密，`base_url` 决定你
@@ -85,6 +134,13 @@ pub struct WechatPay {
     pub(crate) retry: RetryPolicy,
     /// 退款专用重试策略，默认分钟级退避。见 [`WechatPay::with_refund_retry`]。
     pub(crate) refund_retry: RetryPolicy,
+    /// 解析后的商户私钥（首次签名时解析一次）。
+    ///
+    /// PEM 解析会做密钥校验并预计算 CRT 参数，放在每次请求上既慢又只能 panic；
+    /// 这里缓存下来，坏 PEM 则变成 [`PayError::SignError`] 返回给调用方。
+    /// 用 `OnceLock` 而不是 `LazyLock`：初始值来自运行期配置（PEM 字符串），
+    /// 不是声明期常量。
+    pub(crate) parsed_key: std::sync::OnceLock<rsa::RsaPrivateKey>,
 }
 
 // `Debug` 手写而非 derive：derive 会把 `private_key` / `v3_key` 原样打进日志。
@@ -149,6 +205,24 @@ pub trait PayNotifyTrait: WechatPayTrait {
         let data: WechatPayDecodeData = serde_json::from_slice(&plaintext)?;
         Ok(data)
     }
+    /// 解密退款结果通知里的 `resource`，并解析成 [`WechatPayRefundDecodeData`]。
+    ///
+    /// 退款通知的字段与支付通知**不重合**（没有 `appid` / `trade_state`，多了
+    /// `out_refund_no` / `refund_status`），所以走这个入口 —— 拿退款通知去调
+    /// [`Self::decrypt_paydata`] 会以「缺字段」失败。
+    fn decrypt_refund_paydata<S>(
+        &self,
+        ciphertext: S,
+        nonce: S,
+        associated_data: S,
+    ) -> Result<WechatPayRefundDecodeData, PayError>
+    where
+        S: AsRef<str>,
+    {
+        let plaintext = self.decrypt_bytes(ciphertext, nonce, associated_data)?;
+        let data: WechatPayRefundDecodeData = serde_json::from_slice(&plaintext)?;
+        Ok(data)
+    }
     /// 用 APIv3 密钥做 AES-256-GCM 解密，返回明文（不解析）。
     ///
     /// 平台证书也是加密下发的，用它解出 PEM 证书后再交给
@@ -182,29 +256,57 @@ pub trait PayNotifyTrait: WechatPayTrait {
     }
 }
 
+/// `wx.requestPayment` 的 `package` 前缀 —— 不同支付方式的取值规则不同。
+///
+/// 用枚举而不是再给一个字符串参数：`(prefix, prepay_id)` 都是字符串时写反了照样编译，
+/// 只在前端拉起支付时才暴露。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackagePrefix {
+    /// APP 支付：裸 `prepay_id`（多带 `prepay_id=` 前缀会被 APP 端拒绝）。
+    Bare,
+    /// JSAPI / 小程序 / 付款码：`prepay_id=xxx`。
+    PrepayId,
+}
+
+impl PackagePrefix {
+    /// 前缀字符串（[`PackagePrefix::Bare`] 为空串）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PackagePrefix::Bare => "",
+            PackagePrefix::PrepayId => "prepay_id=",
+        }
+    }
+}
+
 /// 客户端的配置访问器与签名能力。
 ///
-/// 抽成 trait 是为了让 [`PayNotifyTrait`] 的默认方法能在不依赖具体类型的情况下复用。
+/// 访问器一律返回借用：它们只是暴露 [`WechatPay`] 的私有配置，交给调用方一份拷贝
+/// 既没必要（`v3_key` 每次解密密文、`base_url` 每次重试都会多拷一份），也让密钥散落到
+/// 更多地方。抽成 trait 是为了让 [`PayNotifyTrait`] 的默认方法能在不依赖具体类型的情况下
+/// 复用。
 pub trait WechatPayTrait {
     /// 商户 / 小程序 appid。
-    fn appid(&self) -> String;
+    fn appid(&self) -> &str;
     /// 商户号。
-    fn mch_id(&self) -> String;
+    fn mch_id(&self) -> &str;
     /// 商户 API 私钥（PEM 内容）。
-    fn private_key(&self) -> String;
+    fn private_key(&self) -> &str;
     /// 商户 API 证书序列号。
-    fn serial_no(&self) -> String;
+    fn serial_no(&self) -> &str;
     /// APIv3 密钥（32 字节，用于回调解密）。
-    fn v3_key(&self) -> String;
+    fn v3_key(&self) -> &str;
     /// 支付结果通知地址。
-    fn notify_url(&self) -> String;
+    fn notify_url(&self) -> &str;
     /// 网关地址，默认 `https://api.mch.weixin.qq.com`。
-    fn base_url(&self) -> String;
+    fn base_url(&self) -> &str;
     /// 用商户私钥做 RSA-SHA256（PKCS#1 v1.5）签名，返回 base64。
-    fn rsa_sign(&self, content: impl AsRef<str>) -> String;
+    ///
+    /// 私钥解析失败（PEM 不对、误填成文件路径）返回 [`PayError::SignError`]，
+    /// **不会 panic** —— 那是配置问题，应当作为错误交给调用方。
+    fn rsa_sign(&self, content: impl AsRef<str>) -> Result<String, PayError>;
     /// 当前 unix 时间戳（秒），用于签名串。
     fn now_timestamp(&self) -> String {
-        chrono::Local::now().timestamp().to_string()
+        util::now_unix_secs().to_string()
     }
     /// 随机串：UUID v4 去掉连字符后转大写，用于签名串与 Authorization 头。
     fn nonce_str(&self) -> String {
@@ -213,61 +315,53 @@ pub trait WechatPayTrait {
 
     /// 构造给 `wx.requestPayment` 用的签名数据。
     ///
-    /// ⚠ `prefix` 按支付方式区分：APP 支付传 `""`，JSAPI / 付款码传 `"prepay_id="`。
-    /// 传错会导致前端拉起支付失败。
-    fn mut_sign_data<S>(&self, prefix: S, prepay_id: S) -> SignData
-    where
-        S: AsRef<str>,
-    {
-        let app_id = self.appid();
+    /// `prefix` 由支付方式决定（见 [`PackagePrefix`]）；传错会导致前端拉起支付失败，
+    /// 而失败现象只出现在客户端，很难排查。
+    fn mut_sign_data(&self, prefix: PackagePrefix, prepay_id: &str) -> Result<SignData, PayError> {
+        let app_id = self.appid().to_string();
         let now_time = self.now_timestamp();
         let nonce_str = self.nonce_str();
-        let ext_str = format!(
-            "{prefix}{prepay_id}",
-            prefix = prefix.as_ref(),
-            prepay_id = prepay_id.as_ref()
-        );
-        let signed_str = self.rsa_sign(format!("{app_id}\n{now_time}\n{nonce_str}\n{ext_str}\n"));
-        SignData {
+        let ext_str = format!("{}{prepay_id}", prefix.as_str());
+        let signed_str =
+            self.rsa_sign(format!("{app_id}\n{now_time}\n{nonce_str}\n{ext_str}\n"))?;
+        Ok(SignData {
             app_id,
             sign_type: "RSA".into(),
             package: ext_str,
             nonce_str,
             timestamp: now_time,
             pay_sign: signed_str,
-        }
+        })
     }
 }
 
 impl PayNotifyTrait for WechatPay {}
 
 impl WechatPayTrait for WechatPay {
-    fn appid(&self) -> String {
-        self.appid.clone()
+    fn appid(&self) -> &str {
+        &self.appid
     }
-    fn mch_id(&self) -> String {
-        self.mch_id.clone()
+    fn mch_id(&self) -> &str {
+        &self.mch_id
     }
-    fn private_key(&self) -> String {
-        self.private_key.clone()
+    fn private_key(&self) -> &str {
+        &self.private_key
     }
-    fn serial_no(&self) -> String {
-        self.serial_no.clone()
+    fn serial_no(&self) -> &str {
+        &self.serial_no
     }
-    fn v3_key(&self) -> String {
-        self.v3_key.clone()
+    fn v3_key(&self) -> &str {
+        &self.v3_key
     }
-    fn notify_url(&self) -> String {
-        self.notify_url.clone()
+    fn notify_url(&self) -> &str {
+        &self.notify_url
+    }
+    fn base_url(&self) -> &str {
+        &self.base_url
     }
 
-    fn base_url(&self) -> String {
-        self.base_url.clone()
-    }
-
-    fn rsa_sign(&self, content: impl AsRef<str>) -> String {
-        let private_key = self.private_key.as_ref();
-        sign::sha256_sign(private_key, content.as_ref())
+    fn rsa_sign(&self, content: impl AsRef<str>) -> Result<String, PayError> {
+        sign::sha256_sign(self.parsed_private_key()?, content.as_ref())
     }
 }
 
@@ -277,6 +371,7 @@ impl WechatPay {
     /// 主要用途是把请求指向本地 mock 服务做离线测试（见 `tests/offline.rs`）。
     /// ⚠ 生产代码绝不能让这个值受用户输入影响：你签好名的请求（含 openid、
     /// 订单信息）会被送到该地址。
+    #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
@@ -290,13 +385,17 @@ impl WechatPay {
     ///
     /// ```no_run
     /// # use std::time::Duration;
-    /// # use wechat_pay_rust_sdk::pay::{HttpTimeouts, WechatPay};
-    /// # let wechat_pay = WechatPay::new("a", "b", "c", "d", "e", "f");
+    /// # use wechat_pay_rust_sdk::pay::{HttpTimeouts, WechatPay, WechatPayConfig};
+    /// # let wechat_pay = WechatPay::from_config(WechatPayConfig {
+    /// #     appid: "a".into(), mch_id: "b".into(), private_key: "c".into(),
+    /// #     serial_no: "d".into(), v3_key: "e".into(), notify_url: "f".into(),
+    /// # });
     /// let wechat_pay = wechat_pay.with_timeouts(HttpTimeouts {
     ///     request: Duration::from_secs(30),
     ///     ..HttpTimeouts::default()
     /// });
     /// ```
+    #[must_use]
     pub fn with_timeouts(mut self, timeouts: HttpTimeouts) -> Self {
         self.client = build_client(timeouts);
         self.timeouts = timeouts;
@@ -314,9 +413,12 @@ impl WechatPay {
     /// **策略只控制次数与间隔；「该不该重试」由失败分类决定**，详见 [`crate::retry`]。
     ///
     /// ```no_run
-    /// # use wechat_pay_rust_sdk::pay::WechatPay;
+    /// # use wechat_pay_rust_sdk::pay::{WechatPay, WechatPayConfig};
     /// # use wechat_pay_rust_sdk::retry::RetryPolicy;
-    /// # let wechat_pay = WechatPay::new("a", "b", "c", "d", "e", "f");
+    /// # let wechat_pay = WechatPay::from_config(WechatPayConfig {
+    /// #     appid: "a".into(), mch_id: "b".into(), private_key: "c".into(),
+    /// #     serial_no: "d".into(), v3_key: "e".into(), notify_url: "f".into(),
+    /// # });
     /// // 只改次数，其余沿用默认
     /// let wechat_pay = wechat_pay.with_retry(RetryPolicy {
     ///     max_attempts: 5,
@@ -325,6 +427,7 @@ impl WechatPay {
     /// // 或者完全关掉
     /// let wechat_pay = wechat_pay.with_retry(RetryPolicy::disabled());
     /// ```
+    #[must_use]
     pub fn with_retry(mut self, policy: RetryPolicy) -> Self {
         self.retry = policy;
         self
@@ -340,6 +443,7 @@ impl WechatPay {
     /// （退避 + 请求超时）。同步调用链里扛不住的话，用
     /// `with_refund_retry(RetryPolicy::disabled())` 关掉，改由业务侧异步重试 ——
     /// 分钟级节奏本来就是异步任务更自然的载体。
+    #[must_use]
     pub fn with_refund_retry(mut self, policy: RetryPolicy) -> Self {
         self.refund_retry = policy;
         self
@@ -356,39 +460,59 @@ impl WechatPay {
     }
 
     /// 按请求的重放语义挑出该用哪个策略。
+    ///
+    /// 显式列出每个 [`RequestKind`] 而不是用 `_`：新增接口类型时编译器会提醒这里
+    /// 也要做出决定，而不是悄悄套用通用策略。
     pub(crate) fn policy_for(&self, kind: RequestKind) -> RetryPolicy {
         match kind {
             RequestKind::Refund => self.refund_retry,
-            _ => self.retry,
+            RequestKind::Read | RequestKind::Write => self.retry,
         }
+    }
+
+    /// 取已解析的商户私钥；首次使用时解析并缓存。
+    fn parsed_private_key(&self) -> Result<&rsa::RsaPrivateKey, PayError> {
+        if let Some(key) = self.parsed_key.get() {
+            return Ok(key);
+        }
+        let key = sign::parse_private_key(&self.private_key)?;
+        Ok(self.parsed_key.get_or_init(|| key))
     }
 
     /// 用商户配置构造客户端。
     ///
-    /// 参数顺序：`appid` / `mch_id` / `private_key` / `serial_no` / `v3_key` / `notify_url`。
     /// `private_key` 需要 **PEM 内容本身**（不是文件路径），`v3_key` 必须是 32 字节。
+    /// 私钥直到第一次签名才解析，解析失败会作为 [`PayError::SignError`] 返回 ——
+    /// 也就是说构造不会 panic，坏配置在第一次请求时才暴露。
     /// 网关默认 `https://api.mch.weixin.qq.com`，用 [`WechatPay::with_base_url`] 覆盖。
-    pub fn new<S: AsRef<str>>(
-        appid: S,
-        mch_id: S,
-        private_key: S,
-        serial_no: S,
-        v3_key: S,
-        notify_url: S,
-    ) -> Self {
+    ///
+    /// ```no_run
+    /// # use wechat_pay_rust_sdk::pay::{WechatPay, WechatPayConfig};
+    /// let wechat_pay = WechatPay::from_config(WechatPayConfig {
+    ///     appid: "wx123".into(),
+    ///     mch_id: "1900000001".into(),
+    ///     private_key: std::fs::read_to_string("apiclient_key.pem")?,
+    ///     serial_no: "5F2C…".into(),
+    ///     v3_key: "32 字节的 APIv3 密钥".into(),
+    ///     notify_url: "https://example.com/pay/notify".into(),
+    /// });
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn from_config(config: WechatPayConfig) -> Self {
         let timeouts = HttpTimeouts::default();
         Self {
-            appid: appid.as_ref().to_string(),
-            mch_id: mch_id.as_ref().to_string(),
-            private_key: private_key.as_ref().to_string(),
-            serial_no: serial_no.as_ref().to_string(),
-            v3_key: v3_key.as_ref().to_string(),
-            notify_url: notify_url.as_ref().to_string(),
+            appid: config.appid,
+            mch_id: config.mch_id,
+            private_key: config.private_key,
+            serial_no: config.serial_no,
+            v3_key: config.v3_key,
+            notify_url: config.notify_url,
             base_url: "https://api.mch.weixin.qq.com".to_string(),
             client: build_client(timeouts),
             timeouts,
             retry: RetryPolicy::default(),
             refund_retry: RetryPolicy::for_refund(),
+            parsed_key: std::sync::OnceLock::new(),
         }
     }
 
@@ -418,9 +542,20 @@ impl WechatPay {
         let v3_key = std::env::var("WECHAT_V3_KEY").expect("WECHAT_V3_KEY not found");
         let notify_url = std::env::var("WECHAT_NOTIFY_URL").expect("WECHAT_NOTIFY_URL not found");
         let private_key = std::fs::read_to_string(private_key).expect("read private key error");
-        Self::new(appid, mch_id, private_key, serial_no, v3_key, notify_url)
+        Self::from_config(WechatPayConfig {
+            appid,
+            mch_id,
+            private_key,
+            serial_no,
+            v3_key,
+            notify_url,
+        })
     }
 
+    /// 组装签名请求头。
+    ///
+    /// ⚠ 每次调用都会生成新的 `timestamp` / `nonce_str` 并重新签名 —— 重试必须如此：
+    /// 复用旧签名可能撞上 5 分钟的签名有效期窗口。
     pub(crate) fn build_header(
         &self,
         method: HttpMethod,
@@ -430,39 +565,53 @@ impl WechatPay {
         let method = method.to_string();
         let url = url.as_ref();
         let body = body.as_ref();
-        let timestamp = chrono::Local::now().timestamp();
-        let serial_no = self.serial_no.to_string();
+        let timestamp = util::now_unix_secs();
         let nonce_str = Uuid::new_v4().to_string().replace("-", "").to_uppercase();
         let message = format!(
             "{}\n{}\n{}\n{}\n{}\n",
             method, url, timestamp, nonce_str, body,
         );
         debug!("rsa_sign message: {}", message);
-        let signature = self.rsa_sign(message);
+        let signature = self.rsa_sign(message)?;
         let authorization = format!(
             "WECHATPAY2-SHA256-RSA2048 mchid=\"{}\",nonce_str=\"{}\",signature=\"{}\",timestamp=\"{}\",serial_no=\"{}\"",
-            self.mch_id, nonce_str, signature, timestamp, serial_no,
+            self.mch_id, nonce_str, signature, timestamp, self.serial_no,
         );
         debug!("authorization: {}", authorization);
+        // 静态字面量用 from_static；Authorization 由配置插值而来，可能含不能进 HTTP 头的
+        // 字符（例如 serial_no 带了个换行）—— 那是配置错误，应当返回 Err 而不是 panic。
         let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, "application/json".parse().unwrap());
+        headers.insert(
+            ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
         let chrome_agent = "Mozilla/5.0 (Linux; Android 10; Redmi K30 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.198 Mobile Safari/537.36";
-        headers.insert(USER_AGENT, chrome_agent.parse().unwrap());
-        headers.insert(AUTHORIZATION, authorization.parse().unwrap());
-        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(
+            USER_AGENT,
+            reqwest::header::HeaderValue::from_static(chrome_agent),
+        );
+        headers.insert(
+            AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&authorization).map_err(|e| {
+                PayError::SignError(format!("商户号 / 序列号含非法 HTTP 头字符: {e}"))
+            })?,
+        );
+        headers.insert(
+            CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
         Ok(headers)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::pay::{PayNotifyTrait, WechatPay, WechatPayTrait};
+    use crate::pay::{PayNotifyTrait, WechatPay, WechatPayConfig, WechatPayTrait};
     use dotenvy::dotenv;
     use rsa::pkcs8::DecodePublicKey;
     use rsa::sha2::{Digest, Sha256};
     use rsa::{Pkcs1v15Sign, RsaPublicKey};
     use tracing::debug;
-    use uuid::Uuid;
 
     #[inline]
     fn init_log() {
@@ -478,18 +627,16 @@ mod tests {
         init_log();
         let private_key_path = "./apiclient_key.pem";
         let private_key = std::fs::read_to_string(private_key_path).unwrap();
-        let wechat_pay = WechatPay::new("", "", private_key.as_ref(), "", "", "");
-        let sign_str = wechat_pay.rsa_sign("hello");
+        let wechat_pay = WechatPay::from_config(WechatPayConfig {
+            appid: String::new(),
+            mch_id: String::new(),
+            private_key,
+            serial_no: String::new(),
+            v3_key: String::new(),
+            notify_url: String::new(),
+        });
+        let sign_str = wechat_pay.rsa_sign("hello").expect("签名必须成功");
         debug!("sign_str: {}", sign_str);
-    }
-
-    #[test]
-    fn test_uuid_v4() {
-        init_log();
-        let timestamp = chrono::Local::now().timestamp();
-        let uuid = Uuid::new_v4().to_string().replace("-", "");
-        debug!("uuid: {}", uuid);
-        debug!("timestamp: {}", timestamp);
     }
 
     /// 支付回调参数解密

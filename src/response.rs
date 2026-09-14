@@ -8,11 +8,8 @@ pub trait ResponseTrait: DeserializeOwned {}
 /// Native 下单响应：返回二维码链接 code_url。
 #[derive(Debug, Deserialize)]
 pub struct NativeResponse {
-    /// 【错误码】 仅在下单失败时返回。
-    pub code: Option<String>,
-    /// 【错误信息】 仅在下单失败时返回。
-    pub message: Option<String>,
-    ///【支付跳转链接】 h5_url为拉起微信支付收银台的中间页面，可通过访问该URL来拉起微信客户端，完成支付，h5_url的有效期为5分钟。
+    ///【二维码链接】 此URL用于生成支付二维码，然后提供给用户扫码支付。
+    /// 注意：code_url并非固定值，使用时按照URL格式转成二维码即可。
     pub code_url: Option<String>,
 }
 
@@ -21,10 +18,6 @@ impl ResponseTrait for NativeResponse {}
 /// JSAPI 下单响应：返回预支付交易会话标识 prepay_id 与签名数据。
 #[derive(Debug, Deserialize)]
 pub struct JsapiResponse {
-    /// 【错误码】 仅在下单失败时返回。
-    pub code: Option<String>,
-    /// 【错误信息】 仅在下单失败时返回。
-    pub message: Option<String>,
     ///【预支付交易会话标识】 预支付交易会话标识。用于后续接口调用中使用，该值有效期为2小时
     pub prepay_id: Option<String>,
     ///【签名数据】
@@ -76,10 +69,6 @@ impl ResponseTrait for JsapiResponse {}
 /// APP 下单响应：返回预支付交易会话标识 prepay_id 与签名数据。
 #[derive(Debug, Deserialize)]
 pub struct AppResponse {
-    /// 【错误码】 仅在下单失败时返回。
-    pub code: Option<String>,
-    /// 【错误信息】 仅在下单失败时返回。
-    pub message: Option<String>,
     ///【预支付交易会话标识】 预支付交易会话标识。用于后续接口调用中使用，该值有效期为2小时
     pub prepay_id: Option<String>,
     ///【签名数据】
@@ -91,10 +80,6 @@ impl ResponseTrait for AppResponse {}
 /// 付款码下单响应：返回预支付交易会话标识 prepay_id 与签名数据。
 #[derive(Debug, Deserialize)]
 pub struct MicroResponse {
-    /// 【错误码】 仅在下单失败时返回。
-    pub code: Option<String>,
-    /// 【错误信息】 仅在下单失败时返回。
-    pub message: Option<String>,
     ///【预支付交易会话标识】 预支付交易会话标识。用于后续接口调用中使用，该值有效期为2小时
     pub prepay_id: Option<String>,
     ///【签名数据】
@@ -106,12 +91,7 @@ impl ResponseTrait for MicroResponse {}
 /// H5 下单响应：返回拉起微信收银台的 h5_url。
 #[derive(Debug, Deserialize)]
 pub struct H5Response {
-    /// 【错误码】 仅在下单失败时返回。
-    pub code: Option<String>,
-    /// 【错误信息】 仅在下单失败时返回。
-    pub message: Option<String>,
-    ///【二维码链接】 此URL用于生成支付二维码，然后提供给用户扫码支付。
-    /// 注意：code_url并非固定值，使用时按照URL格式转成二维码即可。
+    ///【支付跳转链接】 h5_url为拉起微信支付收银台的中间页面，可通过访问该URL来拉起微信客户端，完成支付，h5_url的有效期为5分钟。
     pub h5_url: Option<String>,
 }
 

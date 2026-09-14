@@ -6,12 +6,16 @@
 //!
 //! 本模块提供：
 //!
-//! * [`PlatformKeys`] —— `serial_no -> 公钥 PEM` 的索引，支持按 serial 选键；
-//! * [`WechatPay::fetch_platform_keys`] —— 拉取 `GET /v3/certificates`、逐张解密并建索引。
+//! * [`PlatformKeys`](crate::cert::PlatformKeys) —— `serial_no -> 公钥 PEM` 的索引，
+//!   支持按 serial 选键；
+//! * [`WechatPay::fetch_platform_keys`](crate::pay::WechatPay::fetch_platform_keys) ——
+//!   拉取 `GET /v3/certificates`、逐张解密并建索引。
 //!
-//! 建议用法：启动时拉一次，之后每 [`REFRESH_INTERVAL_SECS`]（或更短）刷新一次；
+//! 建议用法：启动时拉一次，之后每
+//! [`REFRESH_INTERVAL_SECS`](crate::cert::REFRESH_INTERVAL_SECS)（或更短）刷新一次；
 //! 回调验签用 `PlatformKeys::verify_notify`，一旦拿到
-//! [`PayError::UnknownPlatformSerial`] 就**立即重新拉取**再重试。
+//! [`PayError::UnknownPlatformSerial`](crate::error::PayError::UnknownPlatformSerial)
+//! 就**立即重新拉取**再重试。
 
 use std::collections::HashMap;
 

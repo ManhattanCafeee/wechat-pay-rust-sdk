@@ -1,5 +1,5 @@
-use crate::debug;
 use crate::error::PayError;
+use crate::macros::debug;
 use crate::model::AppParams;
 use crate::model::H5Params;
 use crate::model::JsapiParams;
@@ -7,7 +7,7 @@ use crate::model::MicroParams;
 use crate::model::NativeParams;
 use crate::model::ParamsTrait;
 use crate::model::RefundsParams;
-use crate::pay::{WechatPay, WechatPayTrait};
+use crate::pay::{PackagePrefix, WechatPay, WechatPayTrait};
 use crate::request::HttpMethod;
 use crate::response::AppResponse;
 use crate::response::H5Response;
@@ -130,7 +130,7 @@ impl WechatPay {
         let mut attempt: u32 = 1;
 
         loop {
-            let headers = self.build_header(method.clone(), url, body)?;
+            let headers = self.build_header(method, url, body)?;
             // 复用 `WechatPay` 持有的客户端：连接池跨请求共享，不必每次重新建连 / TLS 握手。
             let client = &self.client;
             let full_url = format!("{}{}", self.base_url(), url);
@@ -220,7 +220,7 @@ impl WechatPay {
 
     /// 通用下单：把 `params` 序列化后注入 `appid` / `mchid` / `notify_url` 再签名发送。
     ///
-    /// 字段注入**只发生在这里** —— 其余端点走 [`WechatPay::request_json`]，不注入任何字段
+    /// 字段注入**只发生在这里** —— 其余端点走 `WechatPay::request_json`，不注入任何字段
     /// （关单的 body 只要 `mchid`，查单的 `mchid` 在 query string 里）。
     #[maybe_async_attr]
     pub async fn pay<P: ParamsTrait, R: ResponseTrait>(
@@ -229,7 +229,7 @@ impl WechatPay {
         url: &str,
         json: P,
     ) -> Result<R, PayError> {
-        let json_str = json.to_json();
+        let json_str = json.to_json()?;
         debug!("json_str: {}", json_str);
         let mut map: Map<String, Value> = serde_json::from_str(&json_str)?;
         map.insert("appid".to_owned(), self.appid().into());
@@ -261,40 +261,34 @@ impl WechatPay {
     #[maybe_async_attr]
     pub async fn app_pay(&self, params: AppParams) -> Result<AppResponse, PayError> {
         let url = "/v3/pay/transactions/app";
-        self.pay(HttpMethod::POST, url, params)
-            .await
-            .map(|mut result: AppResponse| {
-                if let Some(prepay_id) = &result.prepay_id {
-                    result.sign_data = Some(self.mut_sign_data("", prepay_id));
-                }
-                result
-            })
+        let mut result: AppResponse = self.pay(HttpMethod::POST, url, params).await?;
+        result.sign_data = match result.prepay_id.as_deref() {
+            Some(prepay_id) => Some(self.mut_sign_data(PackagePrefix::Bare, prepay_id)?),
+            None => None,
+        };
+        Ok(result)
     }
     /// JSAPI 支付（小程序 / 公众号）：返回 `prepay_id` 与给 `wx.requestPayment` 的签名数据。
     #[maybe_async_attr]
     pub async fn jsapi_pay(&self, params: JsapiParams) -> Result<JsapiResponse, PayError> {
         let url = "/v3/pay/transactions/jsapi";
-        self.pay(HttpMethod::POST, url, params)
-            .await
-            .map(|mut result: JsapiResponse| {
-                if let Some(prepay_id) = &result.prepay_id {
-                    result.sign_data = Some(self.mut_sign_data("prepay_id=", prepay_id));
-                }
-                result
-            })
+        let mut result: JsapiResponse = self.pay(HttpMethod::POST, url, params).await?;
+        result.sign_data = match result.prepay_id.as_deref() {
+            Some(prepay_id) => Some(self.mut_sign_data(PackagePrefix::PrepayId, prepay_id)?),
+            None => None,
+        };
+        Ok(result)
     }
     /// 付款码支付：返回 `prepay_id` 与签名数据。
     #[maybe_async_attr]
     pub async fn micro_pay(&self, params: MicroParams) -> Result<MicroResponse, PayError> {
         let url = "/v3/pay/transactions/jsapi";
-        self.pay(HttpMethod::POST, url, params)
-            .await
-            .map(|mut result: MicroResponse| {
-                if let Some(prepay_id) = &result.prepay_id {
-                    result.sign_data = Some(self.mut_sign_data("prepay_id=", prepay_id));
-                }
-                result
-            })
+        let mut result: MicroResponse = self.pay(HttpMethod::POST, url, params).await?;
+        result.sign_data = match result.prepay_id.as_deref() {
+            Some(prepay_id) => Some(self.mut_sign_data(PackagePrefix::PrepayId, prepay_id)?),
+            None => None,
+        };
+        Ok(result)
     }
     /// 扫码支付：返回 `code_url`，由商户自行生成二维码。
     #[maybe_async_attr]
@@ -319,7 +313,7 @@ impl WechatPay {
     /// ⚠ `h5_url` 会被直接 GET，且**没有白名单**：只能传微信返回的 `h5_url`
     /// 或你自己服务端的地址，**绝不能来自用户输入**（SSRF）。
     #[maybe_async_attr]
-    pub async fn get_weixin<S>(&self, h5_url: S, referer: S) -> Result<Option<String>, PayError>
+    pub async fn get_weixin<S>(&self, h5_url: S, referer: S) -> Result<String, PayError>
     where
         S: AsRef<str>,
     {
@@ -327,22 +321,22 @@ impl WechatPay {
         // 但仍比每次新建客户端好；且自动继承统一的超时配置）。
         let client = &self.client;
         let mut headers = HeaderMap::new();
-        headers.insert(REFERER, referer.as_ref().parse().unwrap());
-        let text = client
-            .get(h5_url.as_ref())
-            .headers(headers)
-            .send()
-            .await?
-            .text()
-            .await?;
-        text.split("\n")
+        let referer = reqwest::header::HeaderValue::from_str(referer.as_ref())
+            .map_err(|e| PayError::VerifyError(format!("非法 Referer: {e}")))?;
+        headers.insert(REFERER, referer);
+        let response = client.get(h5_url.as_ref()).headers(headers).send().await?;
+        let status = response.status();
+        let text = response.text().await?;
+        // 以前这里不看状态码：过期的 h5_url 或 CDN 错误页会被当成支付页去扫描，
+        // 结果只报一个与真实原因无关的 `WeixinNotFound`。
+        if !status.is_success() {
+            return Err(PayError::api_error(status.as_u16(), &text));
+        }
+        text.lines()
             .find(|line| line.contains("weixin://"))
-            .map(|line| {
-                line.split(r#"""#)
-                    .find(|line| line.contains("weixin://"))
-                    .map(|line| line.to_string())
-            })
-            .ok_or_else(|| PayError::WeixinNotFound)
+            .and_then(|line| line.split('"').find(|part| part.contains("weixin://")))
+            .map(str::to_owned)
+            .ok_or(PayError::WeixinNotFound)
     }
 
     /// 申请退款。
@@ -353,7 +347,7 @@ impl WechatPay {
     #[maybe_async_attr]
     pub async fn refunds(&self, params: RefundsParams) -> Result<RefundsResponse, PayError> {
         let url = "/v3/refund/domestic/refunds";
-        let body = params.to_json();
+        let body = params.to_json()?;
         self.request_json(HttpMethod::POST, url, &body, RequestKind::Refund)
             .await
     }
@@ -478,12 +472,6 @@ mod tests {
     }
 
     #[test]
-    pub fn test_str() {
-        let str = r#" deeplink : "weixin://wap/pay?prepayid%3Dwx122129234529163c948432e26bc0030000&package=4206921243&noncestr=1705066163&sign=788bc4a9f8f44c6f708aff38c4b48a85""#;
-        let _strs = str.split(r#"""#).find(|line| line.contains("weixin://"));
-    }
-
-    #[test]
     #[cfg(not(feature = "async"))]
     #[ignore = "需要真实商户凭证 / 公网 / 未入库的 PEM fixture；用 `cargo test -- --ignored` 显式运行"]
     pub fn test_h5_pay() {
@@ -501,7 +489,7 @@ mod tests {
         let weixin_url = wechat_pay
             .get_weixin(body.h5_url.unwrap().as_str(), "https://mydomain.com")
             .unwrap();
-        debug!("weixin_url: {}", weixin_url.unwrap());
+        debug!("weixin_url: {}", weixin_url);
     }
 
     #[test]

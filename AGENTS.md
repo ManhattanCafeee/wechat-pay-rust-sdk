@@ -106,7 +106,7 @@ example/             actix-web 回调服务器（workspace 成员，发布时被
 
 ## Development Commands
 
-CI（`.github/workflows/ci.yml`）实际只跑这 8 条命令 —— 本地复现 CI 就照这个来：
+CI（`.github/workflows/ci.yml`）实际只跑这 9 条命令 —— 本地复现 CI 就照这个来：
 
 ```bash
 # Test & lint 作业（stable，已装 clippy/rustfmt）
@@ -114,7 +114,8 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features async -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test                     # lib 11 passed / 14 ignored + offline 44 passed
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo test                     # lib 12 passed / 14 ignored + offline 51 passed
 cargo test --features async    # 同一套测试在 async 模式下再跑一遍
 cargo check -p example
 
@@ -167,11 +168,13 @@ cargo +1.89.0 check --all-targets
 
 ### 敏感数据
 
-- `WechatPay` 的 `Debug` 是**手写**的（`private_key` / `v3_key` 打成 `<redacted>`）；加字段时别退回 `derive`。
+- `WechatPay` / `WechatPayConfig` 的 `Debug` 都是**手写**的（`private_key` / `v3_key` 打成
+  `<redacted>`）；加字段时别退回 `derive`（`tests/offline.rs::debug_output_redacts_secrets` 守着这个）。
 - `debug-print` feature 会把 `Authorization` 头（含签名与 serial_no）、请求体、被签名的原文写进日志 ——
-  **生产环境不要开**。日志宏是 crate 本地的 `debug!` / `error!`（`src/macros.rs`），
-  未启用该 feature 时展开为空操作、**参数不求值**，也正因如此没有直接用 `tracing` 宏。
-  （现状：`error!` 在 `src/` 内零调用点。）
+  **生产环境不要开**。日志宏是 crate 本地的 `debug!`（`src/macros.rs`），未启用该 feature 时展开为
+  空操作、**参数不求值**，也正因如此没有直接用 `tracing` 宏。
+  它用 `pub(crate) use` 暴露（**不是** `#[macro_export]`）—— 后者会把内部宏发布到 crate 根，
+  等于把这段临时语法冻进公开 API。
 
 ### 加密与验签不变量
 
@@ -236,14 +239,14 @@ cargo +1.89.0 check --all-targets
 | 层 | 位置 | 怎么跑 | 需要什么 |
 | --- | --- | --- | --- |
 | 离线集成 | `tests/offline.rs`（唯一） | `cargo test` / `--features async` | 只需要本地监听端口 |
-| 纯逻辑单测 | `src/pay.rs`、`src/retry.rs`、`src/async_impl/pay.rs` 的 `#[cfg(test)]` | 同上，默认执行 | 无 |
+| 纯逻辑单测 | `src/pay.rs`、`src/retry.rs`、`src/util.rs`、`src/pay_type.rs`、`src/async_impl/pay.rs` 的 `#[cfg(test)]` | 同上，默认执行 | 无 |
 | 在线冒烟 | 同上文件里的 `#[ignore]` | `cargo test --lib -- --ignored` | 真实凭证 + 公网 + 仓库根 PEM fixture |
 
-**精确计数（单次运行）**：`cargo test` → lib **11 passed / 14 ignored**，offline **44 passed**；
-`cargo test --features async` → lib **11 passed / 7 ignored**，offline **44 passed**。
+**精确计数（单次运行）**：`cargo test` → lib **12 passed / 14 ignored**，offline **51 passed**；
+`cargo test --features async` → lib **12 passed / 7 ignored**，offline **51 passed**。
 
-- offline 的 44 = 42 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
-  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 42。
+- offline 的 51 = 49 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
+  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 49。
 - ⚠ 计 `#[test]` 时要按**行首**（`^#\[test\]`）锚定：直接数 `#[test]` 会把 `dual_test!` 宏定义体内的
   那一次（缩进）和文档注释里提到的一次也算进去。
 - 「需凭证的用例」有两种口径：跨模式去重共 **16 个函数**，但单次运行只列出 **14**（sync）或 **7**（async），
@@ -301,8 +304,11 @@ dual_test! {
   `paySign` / `appId`，注意 `timeStamp` 的大写 S）：前端报「缺少参数」时不会指向 SDK，
   所以有测试钉住键名，并**反向断言不得残留 snake_case**。
 
-给新增测试定标准时注意：仓内有**两个不构成回归保护的用例**（`src/pay.rs::test_uuid_v4` 只打印，
-`src/async_impl/pay.rs::test_str` 只做 split 且无断言）。别把它们当范例。
+给新增测试定标准时注意：**用例必须能对着一个坏实现失败** —— 例如抖动测试要断言「确实取过上限
+以下的值」（否则「抖动恒等于计算值」的实现照样全绿）、`verify_notify` 有一条走**真实墙钟**的用例
+（否则时间源换成毫秒时真实回调会全线被拒而测试全绿）、回调时间戳的极值用例（`i64::MIN` 曾经
+让偏差计算算术溢出 panic）。原先两个只打印 / 无断言的用例（`test_uuid_v4`、`test_str`）
+已按这个标准删除。
 
 ## 已知限制与陷阱
 
@@ -311,10 +317,12 @@ dual_test! {
 - `cargo check --no-default-features` 失败：`reqwest` 是 optional 依赖，但 `src/error.rs` 的错误枚举
   无条件持有 `reqwest::Error`，`src/pay.rs` / `src/async_impl/pay.rs` 也无条件 `use reqwest::header::…`，
   `src/retry.rs` 还调用 `reqwest::Error` 的方法。要修得同时动这几处，改 `error.rs` 一处不够。
-- `cargo test --doc` 会失败（实际收集 **32** 个 doctest 后编译失败）—— 这是**有意**接受的：
-  README 的示例需要真实凭证与公网，所以设了 `[lib] doctest = false`。CI 不跑它。
-  ⚠ 同一开关也关掉了**源码文档注释里**的示例（`src/retry.rs`、`src/error.rs`、`src/pay.rs`、`src/notify.rs`），
-  改这些示例时没有任何编译兜底。
+- `cargo test --doc` 会失败（实测收集 **33** 个 doctest：`src/` 里 7 个带 `no_run` 的示例能通过，
+  其余 26 个来自 README，需要真实凭证与公网）—— 这是**有意**接受的：README 的示例需要真实凭证与
+  公网，所以设了 `[lib] doctest = false`（默认的 `cargo test` 因此不收集它们），CI 也不跑 `--doc`。
+  ⚠ 但这意味着源码文档注释里的示例（`src/retry.rs`、`src/error.rs`、`src/pay.rs`、`src/notify.rs`、
+  `src/cert.rs`）只在手动跑 `cargo test --doc` 时被**编译**（`no_run` 不执行）；改完请手动跑一次，
+  CI 不会替你跑。
 - README 示例**不被编译**，因此会悄悄腐烂。已修掉一处（小程序支付那段曾调用
   `micro_pay(JsapiParams::new(…))`，与真实签名 `micro_pay(params: MicroParams)` 不符），
   但这只是**已知的一处** —— 改 README 示例时请人工核对 API 签名，CI 不会发现。

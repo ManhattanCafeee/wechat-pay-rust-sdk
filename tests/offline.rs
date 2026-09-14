@@ -19,11 +19,12 @@ use wechat_pay_rust_sdk::cert::{PlatformKeys, REFRESH_INTERVAL_SECS};
 use wechat_pay_rust_sdk::error::{ErrorKind, PayError};
 use wechat_pay_rust_sdk::model::{
     AmountInfo, AppParams, Currency, GoodsDetail, JsapiParams, MicroParams, NativeParams,
-    OrderDetail, PayerInfo, RefundsParams, SceneInfo, SettleInfo,
+    OrderDetail, PayerInfo, RefundsParams, SceneInfo, SettleInfo, WechatPayRefundDecodeData,
 };
 use wechat_pay_rust_sdk::notify::NotifyHeaders;
 use wechat_pay_rust_sdk::pay::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, HttpTimeouts, PayNotifyTrait, WechatPay,
+    WechatPayConfig, WechatPayTrait,
 };
 use wechat_pay_rust_sdk::request::HttpMethod;
 use wechat_pay_rust_sdk::retry::RetryPolicy;
@@ -299,15 +300,19 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<CapturedRequest> {
 /// 构造一个指向本地 mock 服务的客户端。
 /// 走公开的 `with_base_url`，不依赖字段可见性。
 fn client_for(base_url: &str) -> WechatPay {
-    WechatPay::new(
-        TEST_APPID,
-        TEST_MCH_ID,
-        TEST_PRIVATE_KEY,
-        TEST_SERIAL_NO,
-        TEST_V3_KEY,
-        TEST_NOTIFY_URL,
-    )
-    .with_base_url(base_url)
+    WechatPay::from_config(test_config()).with_base_url(base_url)
+}
+
+/// 全部离线用例公用的凭据（测试私钥 / v3 key / 平台证书都在本文件里）。
+fn test_config() -> WechatPayConfig {
+    WechatPayConfig {
+        appid: TEST_APPID.to_string(),
+        mch_id: TEST_MCH_ID.to_string(),
+        private_key: TEST_PRIVATE_KEY.to_string(),
+        serial_no: TEST_SERIAL_NO.to_string(),
+        v3_key: TEST_V3_KEY.to_string(),
+        notify_url: TEST_NOTIFY_URL.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +475,37 @@ dual_test! {
     }
 }
 dual_test! {
+    fn bad_private_key_is_an_error_not_a_panic() {
+        // 商户私钥属于**配置**：填成文件路径、PKCS#1、或被截断的 PEM 时，应当是
+        // `PayError::SignError`，而不是在请求路径上 panic（以前就是 panic）。
+        let mock = Mock::start(vec![MockResponse::json(200, r#"{"prepay_id":"wx"}"#)]);
+        let wechat_pay = WechatPay::from_config(WechatPayConfig {
+            private_key: "./apiclient_key.pem".into(), // 经典错误：填的是路径
+            ..test_config()
+        })
+        .with_base_url(&mock.base_url);
+
+        let err = call!(wechat_pay.jsapi_pay(JsapiParams::new(
+            "测试商品",
+            "ORDER_BAD_KEY",
+            1.into(),
+            "openid".into(),
+        )))
+        .expect_err("坏私钥必须作为错误返回");
+
+        assert!(
+            matches!(err, PayError::SignError(_)),
+            "坏私钥应当映射到 SignError，实际: {err:?}"
+        );
+        assert_eq!(err.kind(), ErrorKind::Local, "实际: {err}");
+        assert!(
+            !err.may_have_taken_effect(),
+            "签名就没成功，请求根本没发出去"
+        );
+        assert!(mock.requests().is_empty(), "签名失败时不应发出请求");
+    }
+}
+dual_test! {
     fn jsapi_pay_returns_err_on_api_error() {
         // 微信 v3 的真实错误体；HTTP 状态码为 400。
         // 回归点：修复前这段会返回 Ok(JsapiResponse { code: Some("PARAM_ERROR"), prepay_id: None })，
@@ -561,6 +597,76 @@ dual_test! {
         assert_eq!(data.out_trade_no, "ORDER_0004");
         assert_eq!(data.trade_state, "SUCCESS");
         assert_eq!(data.amount.total, 1);
+    }
+}
+dual_test! {
+    fn notify_without_attach_still_decodes() {
+        // 官方：下单没传 attach，支付通知就不会带这个字段。它曾经是必填，
+        // 于是**真实**的支付通知会以 `missing field attach` 解析失败。
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        let plaintext = r#"{"mchid":"1900000001","appid":"wx_test_appid","out_trade_no":"ORDER_NO_ATTACH","transaction_id":"4200001234202609110000000001","trade_type":"JSAPI","trade_state":"SUCCESS","trade_state_desc":"支付成功","bank_type":"OTHERS","success_time":"2026-09-14T12:00:00+08:00","payer":{"openid":"oUpF8uMuAJO_M2pxb1Q9zNjWeS6o"},"amount":{"total":1}}"#;
+        let nonce_bytes: [u8; 12] = *b"abcdefghijkl";
+        let associated_data = "transaction";
+        let cipher = Aes256Gcm::new_from_slice(TEST_V3_KEY.as_bytes()).expect("cipher");
+        let encrypted = cipher
+            .encrypt(
+                &Nonce::from(nonce_bytes),
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: associated_data.as_bytes(),
+                },
+            )
+            .expect("encrypt");
+        let ciphertext = util::base64_encode(&encrypted);
+
+        // 此测试不发送任何请求，base_url 无关紧要
+        let wechat_pay = client_for("http://127.0.0.1:1");
+        let data = wechat_pay
+            .decrypt_paydata(ciphertext.as_str(), "abcdefghijkl", associated_data)
+            .expect("缺 attach 的支付通知必须能解析");
+
+        assert_eq!(data.out_trade_no, "ORDER_NO_ATTACH");
+        assert_eq!(data.attach, None, "下单未传 attach 时该字段缺席");
+    }
+}
+dual_test! {
+    fn refund_notification_has_its_own_decode_entry() {
+        // 退款通知的字段与支付通知不重合：拿 decrypt_paydata 解它会报「缺 appid」。
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        let plaintext = r#"{"mchid":"1900000001","out_trade_no":"ORDER_0004","transaction_id":"4200001234202609110000000000","out_refund_no":"R_0004","refund_id":"50300000002026091100000000001","refund_status":"SUCCESS","success_time":"2026-09-14T12:00:00+08:00","user_received_account":"支付用户零钱","amount":{"total":1,"refund":1,"payer_total":1,"payer_refund":1}}"#;
+        let nonce_bytes: [u8; 12] = *b"abcdefghijkl";
+        let associated_data = "refund";
+        let cipher = Aes256Gcm::new_from_slice(TEST_V3_KEY.as_bytes()).expect("cipher");
+        let encrypted = cipher
+            .encrypt(
+                &Nonce::from(nonce_bytes),
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: associated_data.as_bytes(),
+                },
+            )
+            .expect("encrypt");
+        let ciphertext = util::base64_encode(&encrypted);
+
+        let wechat_pay = client_for("http://127.0.0.1:1");
+        let data: WechatPayRefundDecodeData = wechat_pay
+            .decrypt_refund_paydata(ciphertext.as_str(), "abcdefghijkl", associated_data)
+            .expect("退款通知必须能解密");
+
+        assert_eq!(data.out_refund_no, "R_0004");
+        assert_eq!(data.refund_status, "SUCCESS");
+        assert_eq!(data.amount.refund, 1);
+        assert_eq!(data.success_time.as_deref(), Some("2026-09-14T12:00:00+08:00"));
+
+        // 反向断言：退款通知不能被当成支付通知解析（否则说明两者的模型被混到了一起）
+        let err = wechat_pay
+            .decrypt_paydata(ciphertext.as_str(), "abcdefghijkl", associated_data)
+            .expect_err("退款通知不能走支付通知的解码器");
+        assert_eq!(err.kind(), ErrorKind::Local, "实际: {err}");
     }
 }
 dual_test! {
@@ -724,14 +830,14 @@ dual_test! {
     fn debug_output_redacts_secrets() {
         // 用哨兵值而不是真实 PEM：Debug 会把换行转义成 \n，
         // 多行字符串包含判断会失真。
-        let wechat_pay = WechatPay::new(
-            "appid-x",
-            "mch-x",
-            "SENTINEL_PRIVATE_KEY",
-            "serial-x",
-            "SENTINEL_V3_KEY",
-            "https://example.com/notify",
-        );
+        let wechat_pay = WechatPay::from_config(WechatPayConfig {
+            appid: "appid-x".into(),
+            mch_id: "mch-x".into(),
+            private_key: "SENTINEL_PRIVATE_KEY".into(),
+            serial_no: "serial-x".into(),
+            v3_key: "SENTINEL_V3_KEY".into(),
+            notify_url: "https://example.com/notify".into(),
+        });
         let rendered = format!("{wechat_pay:?}");
 
         assert!(
@@ -745,19 +851,41 @@ dual_test! {
         // 非机密字段仍应保留，否则排障时无从判断用的是哪个商户号
         assert!(rendered.contains("mch-x"), "非机密字段应保留: {rendered}");
         assert!(rendered.contains("redacted"), "应显式标注脱敏: {rendered}");
+
+        // `WechatPayConfig` 同样手写了 Debug（derive 一样会把两个密钥写进日志）。
+        // ⚠ 必须用**单行哨兵值**：真实 PEM 是多行的，而 Debug 会把换行转义成 \n，
+        // 拿真实 PEM 做 contains 判断永远不会命中（等于没测）。
+        let config = format!(
+            "{:?}",
+            WechatPayConfig {
+                private_key: "SENTINEL_PRIVATE_KEY".into(),
+                v3_key: "SENTINEL_V3_KEY".into(),
+                ..test_config()
+            }
+        );
+        assert!(
+            !config.contains("SENTINEL_PRIVATE_KEY"),
+            "WechatPayConfig 泄露商户私钥: {config}"
+        );
+        assert!(
+            !config.contains("SENTINEL_V3_KEY"),
+            "WechatPayConfig 泄露 APIv3 密钥: {config}"
+        );
     }
 }
 dual_test! {
     fn with_base_url_overrides_default_gateway() {
         // 默认必须是官方网关；with_base_url 只用于把请求指向 mock / 沙箱。
-        let default = WechatPay::new("a", "b", "c", "d", "e", "f");
-        assert!(
-            format!("{default:?}").contains("https://api.mch.weixin.qq.com"),
+        // 断言走公开的 `base_url()`，不依赖手写 Debug 的输出格式。
+        let default = WechatPay::from_config(test_config());
+        assert_eq!(
+            default.base_url(),
+            "https://api.mch.weixin.qq.com",
             "默认网关应指向微信官方地址"
         );
 
         let overridden = default.with_base_url("http://127.0.0.1:1234");
-        assert!(format!("{overridden:?}").contains("http://127.0.0.1:1234"));
+        assert_eq!(overridden.base_url(), "http://127.0.0.1:1234");
     }
 }
 
@@ -933,6 +1061,54 @@ dual_test! {
         let err = NotifyHeaders::from_pairs([("Wechatpay-Serial", "S1")])
             .expect_err("缺头应报错");
         assert!(matches!(err, PayError::VerifyError(_)), "实际 {err:?}");
+    }
+}
+dual_test! {
+    fn notify_timestamp_extremes_are_rejected_without_overflow() {
+        // `Wechatpay-Timestamp` 是**未鉴权**输入，而且在验签之前就被解析成整数。
+        // i64::MIN 曾让 `now - signed_at` 算术溢出（开启 overflow-checks 的构建里直接 panic）。
+        let keys = PlatformKeys::new();
+        let now: i64 = 1_700_000_000;
+
+        for extreme in [i64::MIN.to_string(), i64::MAX.to_string(), "0".to_string()] {
+            let headers = NotifyHeaders::new("SERIAL_X", extreme.as_str(), "nonce", "sig");
+            let err = keys
+                .verify_notify_at(&headers, "{}", now)
+                .expect_err("极值时间戳必须被拒绝");
+            assert!(
+                matches!(err, PayError::StaleNotify(_)),
+                "应为 StaleNotify，实际 {err:?}"
+            );
+        }
+    }
+}
+dual_test! {
+    fn verify_notify_accepts_a_fresh_wall_clock_timestamp() {
+        // 走**真实**的 `verify_notify`（它自己读墙钟）。其余用例都注入时间，
+        // 万一这个时间源的基准或单位变了（比如改成毫秒），真实回调会全部被判超窗，
+        // 而整套测试仍然是绿的 —— 所以这里必须有一次墙钟用例。
+        let body_json = certificates_response(&[("SERIAL_CLOCK", "nonce_clk_01")]);
+        let mock = Mock::start(vec![MockResponse::json(200, &body_json)]);
+        let wechat_pay = client_for(&mock.base_url);
+        let keys = call!(wechat_pay.fetch_platform_keys()).expect("拉取平台证书");
+
+        let body = r#"{"id":"evt_clock","event_type":"TRANSACTION.SUCCESS"}"#;
+        let nonce = "wall_clock_nonce";
+        let timestamp = util::now_unix_secs().to_string();
+        let signature = sign_rsa(&format!("{timestamp}\n{nonce}\n{body}\n"));
+        let headers = NotifyHeaders::new("SERIAL_CLOCK", &timestamp, nonce, &signature);
+
+        keys.verify_notify(&headers, body)
+            .expect("刚签出的回调必须通过");
+
+        // 反向断言单位：同一时刻的毫秒写法必须被拒
+        let millis = (util::now_unix_secs() * 1000).to_string();
+        let signature = sign_rsa(&format!("{millis}\n{nonce}\n{body}\n"));
+        let headers = NotifyHeaders::new("SERIAL_CLOCK", &millis, nonce, &signature);
+        let err = keys
+            .verify_notify(&headers, body)
+            .expect_err("毫秒级时间戳应被拒绝");
+        assert!(matches!(err, PayError::StaleNotify(_)), "实际 {err:?}");
     }
 }
 dual_test! {
@@ -1168,7 +1344,7 @@ dual_test! {
         );
 
         // 默认配置本身就带超时（不是无限等待）
-        let defaults = WechatPay::new("a", "b", "c", "d", "e", "f").timeouts();
+        let defaults = WechatPay::from_config(test_config()).timeouts();
         assert_eq!(defaults.request, DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(defaults.connect, DEFAULT_CONNECT_TIMEOUT);
     }
@@ -1232,14 +1408,10 @@ dual_test! {
         }
 
         // 3) 本地层：v3_key 不对导致解密失败
-        let wrong_key = WechatPay::new(
-            TEST_APPID,
-            TEST_MCH_ID,
-            TEST_PRIVATE_KEY,
-            TEST_SERIAL_NO,
-            "ffffffffffffffffffffffffffffffff",
-            TEST_NOTIFY_URL,
-        );
+        let wrong_key = WechatPay::from_config(WechatPayConfig {
+            v3_key: "ffffffffffffffffffffffffffffffff".into(),
+            ..test_config()
+        });
         let err = wrong_key
             .decrypt_paydata("AAAA", "abcdefghijkl", "transaction")
             .expect_err("错误密钥应解密失败");
@@ -1356,10 +1528,7 @@ dual_test! {
         ))
         .expect("页面里有链接时应成功");
 
-        assert_eq!(
-            url.as_deref(),
-            Some("weixin://wap/pay?prepayid%3Dwx123&package=1&noncestr=2&sign=3")
-        );
+        assert_eq!(url, "weixin://wap/pay?prepayid%3Dwx123&package=1&noncestr=2&sign=3");
         // Referer 会随请求发出（微信 H5 页依赖它）
         assert_eq!(
             mock.requests()[0].header("referer"),
@@ -1381,6 +1550,37 @@ dual_test! {
         .expect_err("页面里没有链接时必须是 WeixinNotFound");
 
         assert!(matches!(err, PayError::WeixinNotFound), "实际: {err}");
+    }
+}
+dual_test! {
+    fn get_weixin_reports_http_errors_instead_of_scanning_them() {
+        // 过期的 h5_url 或 CDN 错误页会被当成支付页去扫描 —— 以前这里不看状态码，
+        // 结果只报一个与真实原因无关的 `WeixinNotFound`。
+        let mock = Mock::start(vec![MockResponse::json(404, r#"{"code":"NOT_FOUND"}"#)]);
+        let wechat_pay = client_for(&mock.base_url);
+        let page_url = format!("{}/h5-page", mock.base_url);
+
+        let err = call!(wechat_pay.get_weixin(page_url.as_str(), "https://referer.example.com"))
+            .expect_err("非 2xx 必须作为 ApiError 返回");
+
+        match err {
+            PayError::ApiError { status, .. } => assert_eq!(status, 404),
+            other => panic!("应为 ApiError，实际 {other:?}"),
+        }
+    }
+}
+dual_test! {
+    fn get_weixin_rejects_an_illegal_referer() {
+        // Referer 由调用方传入：含换行这类不能进 HTTP 头的字符时应当是错误而不是 panic。
+        let mock = Mock::start(vec![MockResponse::json(200, "<html></html>")]);
+        let wechat_pay = client_for(&mock.base_url);
+        let page_url = format!("{}/h5-page", mock.base_url);
+
+        let err = call!(wechat_pay.get_weixin(page_url.as_str(), "https://bad\nreferer"))
+            .expect_err("非法 Referer 必须作为错误返回");
+
+        assert!(matches!(err, PayError::VerifyError(_)), "实际 {err:?}");
+        assert!(mock.requests().is_empty(), "Referer 非法时不应发出请求");
     }
 }
 

@@ -3,15 +3,15 @@
 //! # 为什么重试要分成三六九等
 //!
 //! 重试安不安全，**只取决于一件事**：上一次尝试到底有没有被微信处理过。
-//! 同样是「失败」，下面四种情况的后果完全不同：
+//! 同样是「失败」，下面五种情况的后果完全不同：
 //!
 //! | 分类 | 典型场景 | 微信侧状态 | 能否重放 |
 //! | --- | --- | --- | --- |
-//! | [`Delivery::NotSent`] | 连接被拒、连接超时 | **确定没收到** | 任何接口都可以 |
-//! | [`Delivery::Rejected`] | 429 / 500 / 502 / 503 | 官方标注「未受理 / 无法处理」 | 任何接口都可以 |
-//! | [`Delivery::Accepted`] | HTTP 202 | **已收到**，只是尚未处理完 | 任何接口都可以 |
-//! | [`Delivery::Unknown`] | 连上了但读不到响应（读写超时） | **可能已经处理** | 只有只读接口敢 |
-//! | [`Delivery::Processed`] | 响应体读了一半断连 | **已经处理过** | 一律不重放 |
+//! | `Delivery::NotSent` | 连接被拒、连接超时 | **确定没收到** | 任何接口都可以 |
+//! | `Delivery::Rejected` | 429 / 500 / 502 / 503 | 官方标注「未受理 / 无法处理」 | 任何接口都可以 |
+//! | `Delivery::Accepted` | HTTP 202 | **已收到**，只是尚未处理完 | 任何接口都可以 |
+//! | `Delivery::Unknown` | 连上了但读不到响应（读写超时） | **可能已经处理** | 只有只读接口敢 |
+//! | `Delivery::Processed` | 响应体读了一半断连 | **已经处理过** | 一律不重放 |
 //!
 //! 前三类的判据来自微信官方文档（HTTP 状态码页把 429 写成「请求未受理」、
 //! 502/503 写成「请求无法处理」，202 写成「已接受请求，但尚未处理，请使用原参数重复
@@ -34,9 +34,11 @@
 //!
 //! 退款失败后官方给的节奏是「间隔 1 分钟」再重试，且接口在**失败时**限流只有 6QPS ——
 //! 秒级退避打过去基本是白打，还会加重限流。所以退款单独走分钟级策略
-//! （[`RetryPolicy::for_refund`]），其余接口走毫秒级。
+//! （[`RetryPolicy::for_refund`](crate::retry::RetryPolicy::for_refund)），
+//! 其余接口走毫秒级。
 //! ⚠ 分钟级退避意味着退款重试会**阻塞到分钟级**，同步调用链里要留意，
-//! 必要时用 [`RetryPolicy::disabled`] 关掉并由业务侧异步重试。
+//! 必要时用 [`RetryPolicy::disabled`](crate::retry::RetryPolicy::disabled)
+//! 关掉并由业务侧异步重试。
 
 use crate::error::PayError;
 use std::time::Duration;
@@ -240,7 +242,18 @@ pub(crate) fn classify(err: &PayError) -> Option<Delivery> {
         // 这个方向判错只会让调用方多查一次单；反方向判错可能导致重复下单。
         PayError::JsonError(_) => Some(Delivery::Processed),
         // 签名、解密、Base64、验签失败等本地错误：重试结果一样，也不可能已生效。
-        _ => None,
+        //
+        // ⚠ 这里刻意**逐个列出**而不是 `_ => None`：`None` 同时意味着
+        // 「不重试」与 `may_have_taken_effect() == false`，后者被文档描述为
+        // 「可以确定微信没有受理这次请求」。新增 `PayError` 变体时若落进通配分支，
+        // 就会静默拿到这个危险结论 —— 让编译器逼着人做决定。
+        PayError::SignError(_)
+        | PayError::DecryptError(_)
+        | PayError::DecodeError(_)
+        | PayError::VerifyError(_)
+        | PayError::WeixinNotFound
+        | PayError::UnknownPlatformSerial(_)
+        | PayError::StaleNotify(_) => None,
     }
 }
 
@@ -317,12 +330,16 @@ mod tests {
             ..RetryPolicy::default()
         };
         let mut seen_nonzero = false;
+        let mut seen_below_cap = false;
         for _ in 0..200 {
             let d = policy.delay_for(1);
             assert!(d <= Duration::from_millis(100), "抖动不得越过上限: {d:?}");
             seen_nonzero |= !d.is_zero();
+            seen_below_cap |= d < Duration::from_millis(100);
         }
         assert!(seen_nonzero, "抖动应当真的随机，而不是恒为 0");
+        // 「抖动被关掉、每次都返回计算值」也是一种坏实现，它会让上界断言照常通过。
+        assert!(seen_below_cap, "抖动退化成了恒定上限值");
     }
 
     #[test]

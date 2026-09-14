@@ -8,8 +8,43 @@
 
 > 相对已打 tag 的 `v0.3.0`。建议按 0.x 语义升 **`0.4.0`**（新增默认开启的行为）。
 
+### 破坏性变更
+
+- **`WechatPay::new(...)` → `WechatPay::from_config(WechatPayConfig { … })`**：六个位置参数
+  （`appid` / `mch_id` / `private_key` / `serial_no` / `v3_key` / `notify_url`）都是同一种字符串，
+  写反了照样编译，要等到网关 401 才暴露。现在用具名字段构造。
+- **`WechatPayTrait` 的访问器改为返回 `&str`**（原先各返回一份 `String` 拷贝：
+  `v3_key` 每次解密、`base_url` 每次重试都会多拷一份）。
+- **签名接口改为可失败**：`rsa_sign` / `mut_sign_data` 返回 `Result<_, PayError>`；
+  `mut_sign_data` 的前缀参数由 `&str` 改为 `PackagePrefix` 枚举（`Bare` / `PrepayId`）——
+  两个同类型字符串参数写反了只会在前端拉起支付时才失败。商户私钥 PEM 解析失败现在是
+  `PayError::SignError`，**不再 panic**（解析结果只在首次签名时做，之后缓存）。
+- **`get_weixin()` 返回 `Result<String, PayError>`**（原先的 `Ok(None)` 不可能出现），
+  并且现在会检查 HTTP 状态码（过期 `h5_url` / CDN 错误页不再被当成支付页扫描）、
+  Referer 含非法字符时返回错误而不是 panic。
+- **`PayError::WechatError(String)` 已删除**（crate 内从无构造点，却逼着下游写一个永远
+  不会命中的 match 分支）；新增 `PayError::SignError(String)`（本地签名失败：私钥 PEM 解析、
+  RSA 签名运算，或签名请求头构造失败）。
+- **五个下单响应类型删除恒为 `None` 的 `code` / `message`**：2xx 错误信封在传输层就归一成
+  `Err`，成功路径下这两个字段不可能有值，留着只会诱导调用方写死代码。
+- **`WechatPayDecodeData::attach` 改为 `Option<String>`**：官方在下单未传 `attach` 时不会返回
+  该字段，原先必填会让**真实支付通知**解密后解析失败。
+- **`OrderDetail::goods_detail` 改为 `Option<Vec<GoodsDetail>>`**：官方取值区间是 1..6000，
+  原先没有「不传」的表达方式，只能发出越界的空数组。
+- **`ParamsTrait` 现在以 `Serialize` 为 supertrait，`to_json` 返回 `Result`**：原先每个实现里各写一份
+  `serde_json::to_string(self).unwrap()`（库路径上的 panic），现在由 trait 提供默认实现（7 个实现体
+  因此变成空 `impl`）。⚠ 自定义请求参数类型需要自己实现 `serde::Serialize`。
+- **`H5Type` 的 `Serialize` 与 `Display` 统一**：序列化改为官方取值 `iOS`（原先输出 `Ios`）。
+- 移除 `error!` 宏与 `chrono` 依赖；内部 `debug!` 宏不再 `#[macro_export]` 到 crate 根。
+
 ### 新增
 
+- **`WechatPayRefundDecodeData` + `PayNotifyTrait::decrypt_refund_paydata`**：退款结果通知的
+  专用解密入口。退款通知的字段与支付通知不重合（没有 `appid` / `trade_state`），此前用
+  `decrypt_paydata` 处理它一律报「缺字段 `appid`」。
+- **`WechatPayConfig`**（具名字段的凭据结构体）与 **`PackagePrefix`**（`wx.requestPayment`
+  的 `package` 前缀枚举）。
+- `util::now_unix_secs()` 等时间助手（`chrono` 依赖随之移除）。
 - **自动重试**（默认开启）：按「这次失败在微信侧到底有没有被处理」分类，只重试
   **确定没送到**（连接被拒 / 连接超时）、**微信明确未受理**（429 / 500 / 502 / 503，
   以及错误码为 `SYSTEM_ERROR` 的 2xx 错误信封）与**已受理但未处理完**（202）的失败。
@@ -66,6 +101,20 @@
   且 `MicroParams` 缺付款码支付必需的 `auth_code`），而且示例把 `JsapiParams` 传给了要求 `MicroParams`
   的参数 —— 那段示例根本编译不过。新示例补上 `openid` 的来源说明与 `sign_data` → `wx.requestPayment`
   的映射，并说明「小程序支付就是 JSAPI，与公众号 JSAPI 只差 openid 来源」。
+- **回调验签的时间戳偏差改用无符号距离**：`Wechatpay-Timestamp` 取 `i64::MIN` 时
+  `now - signed_at` 会算术溢出 —— 开启 overflow-checks 的构建里直接 panic（未鉴权的请求头即可触发），
+  release 构建下则会回绕并**放行**这个明显伪造的时间戳。现在按 `abs_diff` 比较，两种情况都稳定
+  判为 `StaleNotify`，并补了极值回归用例。
+- **支付通知缺 `attach` 时不再解析失败**（见上面的 `Option` 改动），并补了回归用例。
+- **`code_url` / `h5_url` 的文档注释原先互换了**（二维码字段挂着 H5 的说明、H5 字段挂着二维码的
+  说明）—— 已对调，`【…】` 标签一并修正。
+- **`JsapiParams::new` 的文档写着「构造 NativeParams」**；**`PayType::Display` 输出的
+  `MICRO` / `H5` / `QRCODE` 与官方 `trade_type`（`MICROPAY` / `MWEB` / `NATIVE`）不一致** —— 均已修正。
+- **`cargo doc` 的 15 处断链 + 1 处指向私有项的公开文档链接已修**，CI 新增
+  `cargo doc --no-deps --all-features`（`RUSTDOCFLAGS: -D warnings`）门禁防止复发。
+- 删掉两个不构成回归保护的用例（`test_uuid_v4` 只打印、`test_str` 无断言），并补上
+  `PlatformKeys::verify_notify`（真实墙钟路径）、`random_trade_no`、抖动分布与
+  `WechatPayConfig` 脱敏的用例。
 
 ## [0.3.0] - 2026-09-11
 

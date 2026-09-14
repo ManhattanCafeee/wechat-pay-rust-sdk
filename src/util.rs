@@ -4,6 +4,7 @@ use rsa::pkcs8::DecodePublicKey;
 use rsa::sha2::{Digest, Sha256};
 use rsa::{Pkcs1v15Sign, RsaPublicKey};
 use std::error::Error;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::error::PayError;
@@ -31,6 +32,18 @@ pub fn random_trade_no() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
+/// 当前 Unix 时间戳（秒）。
+///
+/// 签名串里的 `timestamp` 字段与回调通知的防重放校验都用它取「现在」。
+/// 直接读系统时钟；若系统时钟早于 1970-01-01（`duration_since` 返回 `Err`），
+/// 返回 0 而不是 panic。
+pub fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Base64 编码（STANDARD 字母表，带 padding）。
 ///
 /// 微信的签名、密文、证书都走这一套，不要换成 URL-safe 字母表。
@@ -54,21 +67,13 @@ where
 /// 用于 `GET /v3/certificates`：`encrypt_certificate.ciphertext` 解密出来的证书是
 /// **PEM**（不是 DER），这里取出其中的 SubjectPublicKeyInfo，再重新包成
 /// `-----BEGIN PUBLIC KEY-----`，供 [`verify_rsa_sha256`] 验签。
+/// 换行由 [`pem::encode_config`] 按 LF、每行 64 列输出。
 pub fn x509_to_pem(content: &[u8]) -> Result<String, Box<dyn Error>> {
-    let pem = pem::parse(content)?;
-    let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())?;
-    let pub_key = base64_encode(cert.public_key().raw);
-    let pub_key_lines = pub_key
-        .chars()
-        .collect::<Vec<char>>()
-        .chunks(64)
-        .map(|chunk| chunk.iter().collect::<String>())
-        .collect::<Vec<String>>()
-        .join("\n");
-    Ok(format!(
-        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
-        pub_key_lines
-    ))
+    let cert_pem = pem::parse(content)?;
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_pem.contents())?;
+    let pub_key = pem::Pem::new("PUBLIC KEY", cert.public_key().raw);
+    let config = pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF);
+    Ok(pem::encode_config(&pub_key, config))
 }
 
 /// 返回 `(证书当前是否有效, not_after 的 unix 秒时间戳)`。
@@ -80,4 +85,24 @@ pub fn x509_is_valid(content: &[u8]) -> Result<(bool, i64), Box<dyn Error>> {
     //读取到证书的有效期
     let expire_time = cert.validity().is_valid();
     Ok((expire_time, cert.validity.not_after.timestamp()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::random_trade_no;
+
+    #[test]
+    fn random_trade_no_is_32_ascii_hex_chars() {
+        let trade_no = random_trade_no();
+        assert_eq!(trade_no.len(), 32);
+        assert!(
+            trade_no.chars().all(|c| c.is_ascii_hexdigit()),
+            "订单号应为 ASCII 十六进制串，实际为 {trade_no}"
+        );
+    }
+
+    #[test]
+    fn random_trade_no_differs_across_calls() {
+        assert_ne!(random_trade_no(), random_trade_no(), "两次调用应不同");
+    }
 }

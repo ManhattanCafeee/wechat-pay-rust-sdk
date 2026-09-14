@@ -37,6 +37,15 @@ jobs:
       - name: Clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # 公开文档里的 intra-doc 链接断裂不会被 clippy 发现（它只看代码，不看 rustdoc 链接），
+      # 这里把 rustdoc 告警升级为错误，防止文档随着重命名/移动悄悄腐坏。
+      # --all-features：debug-print 会切换 src/macros.rs 的两份宏定义，只测一种组合会漏掉一半。
+      # --no-deps：不为依赖建文档，避免把上游的问题算到本仓库头上，也省时间。
+      - name: Doc (deny warnings)
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       # 完整测试：tests/offline.rs 用本地 mock 微信网关，不需要凭证或公网。
       # src/ 内需要真实商户凭证的冒烟测试已标记 #[ignore]，默认跳过。
       - name: Test (sync)

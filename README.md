@@ -60,18 +60,18 @@ wechat-pay-rust-sdk = { path = "../wechat-pay-rust-sdk", features = ["debug-prin
 ## native支付
 ```rust
 use wechat_pay_rust_sdk::model::NativeParams;
-use wechat_pay_rust_sdk::pay::WechatPay;
+use wechat_pay_rust_sdk::pay::{WechatPay, WechatPayConfig};
 
 let private_key_path = "./apiclient_key.pem";
 let private_key = std::fs::read_to_string(private_key_path).unwrap();
-let wechat_pay = WechatPay::new(
-    "app_id",
-    "mch_id",
-    private_key.as_str(),
-    "serial_no",
-    "v3_key",
-    "notifi_url",
-);
+let wechat_pay = WechatPay::from_config(WechatPayConfig {
+    appid: "app_id".into(),
+    mch_id: "mch_id".into(),
+    private_key,
+    serial_no: "serial_no".into(),
+    v3_key: "v3_key".into(),
+    notify_url: "notify_url".into(),
+});
 let body = wechat_pay.native_pay(NativeParams::new(
     "测试支付1分",
     "124324343",
@@ -82,8 +82,6 @@ println!("body: {:?}", body);
 输出
 ```rust
 NativeResponse { 
-    code: None, 
-    message: None, 
     code_url: Some("weixin://wxpay/bizpayurl?pr=yL2aIPzz") 
 }
 ```
@@ -111,8 +109,6 @@ println!("body: {:?}", body);
 输出
 ```
 H5Response { 
-    code: None, 
-    message: None, 
     h5_url: Some("https://wx.tenpay.com/cgi-bin/mmpayweb-bin/checkmweb?prepay_id=wx11154002858116623fasdfasdf&package=760499411") 
 }
 ```
@@ -125,7 +121,7 @@ let body = wechat_pay.h5_pay(H5Params::new(
     H5SceneInfo::new("183.6.105.141", "软件", "https://mydomain.com"),
 )).expect("h5_pay error");
 let weixin_url = wechat_pay.get_weixin(body.h5_url.unwrap().as_str(), "https://mydomain.com").unwrap();
-println!("weixin_url: {}", weixin_url.unwrap());
+println!("weixin_url: {}", weixin_url);
 ```
 输出
 ```
@@ -150,8 +146,6 @@ println!("body: {:?}", body);
  输出
  ```rust
 JsapiResponse { 
-    code: None, 
-    message: None, 
     prepay_id: Some("wx201410272009395522657a690389285100") 
 }
  ```
@@ -173,8 +167,6 @@ println!("body: {:?}", body);
 输出
  ```rust
 AppResponse { 
-    code: None, 
-    message: None, 
     prepay_id: Some("wx201410272009395522657a690389285100") 
 }
  ```
@@ -252,7 +244,7 @@ WechatPayDecodeData {
     trade_state: "SUCCESS",
     trade_state_desc: "支付成功",
     bank_type: "OTHERS",
-    attach: "",
+    attach: Some(""),
     success_time: "2024-01-12T10:36:13+08:00",
     payer: PayerInfo {
         openid: "oAZUY6DittOj59wCzPn6vNgpK2eY",
@@ -287,7 +279,7 @@ async fn pay_notify(data: Json<WechatPayNotify>, req: HttpRequest) -> impl Respo
         nonce, //随机串
         associated_data, //关联数据
     ).unwrap();
-    debug!("result: {:#?}", result);
+    tracing::debug!("result: {:#?}", result);
     HttpResponse::Ok().json(serde_json::json!({
         "code": "SUCCESS",
         "message": "成功"
@@ -340,7 +332,7 @@ let mut pub_key_file = std::fs::File::create("pubkey.pem").unwrap();
 pub_key_file.write_all(pub_key.as_bytes()).unwrap();
 
 let (pub_key_valid, expire_timestamp) = util::x509_is_valid(data.as_slice()).unwrap();
-debug!("pub key valid:{} expire_timestamp:{}", pub_key_valid, expire_timestamp);//检测证书是否可用,打印过期时间
+tracing::debug!("pub key valid:{} expire_timestamp:{}", pub_key_valid, expire_timestamp);//检测证书是否可用,打印过期时间
 println!("pub key: {}", pub_key);
 ```
 输出公钥
@@ -415,13 +407,13 @@ async fn pay_notify(bytes: Bytes, req: HttpRequest) -> impl Responder {
     let req = RefundsParams::new("123456", 1, 1, None, Some("123456"));
     match wechat_pay.refunds(req).await {
         // 受理成功 ≠ 退款成功，需再用 query_refund 轮询 status 到终态
-        Ok(body) => debug!("refunds status: {} refund_id: {}", body.status, body.refund_id),
+        Ok(body) => tracing::debug!("refunds status: {} refund_id: {}", body.status, body.refund_id),
         // 微信的业务错误：非 2xx 与「200 但 body 是错误信封」都会走到这里
-        Err(PayError::ApiError { status, response }) => debug!(
+        Err(PayError::ApiError { status, response }) => tracing::debug!(
             "refunds failed: http {status}, code={:?}, message={:?}, detail={:?}",
             response.code, response.message, response.detail
         ),
-        Err(e) => debug!("refunds error: {e}"),
+        Err(e) => tracing::debug!("refunds error: {e}"),
     }
 
 ```
@@ -485,6 +477,11 @@ let data = wechat_pay.decrypt_paydata(ciphertext, nonce, associated_data)?;
    这是正常流量，直接拒绝即可，不要为它开特例。
 3. **SDK 不替你做幂等。** 微信在收到成功应答前会重试（15s/15s/30s/3m/…
    最多 15 次），必须按 `out_trade_no` / `transaction_id` 落库去重后再发货。
+4. **退款结果通知要换一个解码器。** `decrypt_paydata` 解的是**支付**通知；退款通知
+   （`REFUND.SUCCESS` / `REFUND.ABNORMAL` / `REFUND.CLOSED`）的字段不重合（没有
+   `appid` / `trade_state`，多了 `out_refund_no` / `refund_status`），要用
+   `decrypt_refund_paydata` 解成 `WechatPayRefundDecodeData` —— 否则会以「缺字段」失败。
+   两条通知的验签流程完全一样。
 
 应答要求：**5 秒内**返回，成功时返回 HTTP **200 或 204 且不带 body**；
 校验或处理失败才返回 4xx/5xx + `{"code":"FAIL","message":"…"}`。业务处理请异步化。

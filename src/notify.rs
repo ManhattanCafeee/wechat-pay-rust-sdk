@@ -119,7 +119,7 @@ impl PlatformKeys {
     /// 返回 [`PayError::UnknownPlatformSerial`] 表示该 serial 不在索引里 ——
     /// 应立即重新拉取平台证书列表后重试。
     pub fn verify_notify(&self, headers: &NotifyHeaders, body: &str) -> Result<(), PayError> {
-        self.verify_notify_at(headers, body, chrono::Local::now().timestamp())
+        self.verify_notify_at(headers, body, crate::util::now_unix_secs())
     }
 
     /// 同 [`Self::verify_notify`]，但由调用方显式提供「当前时间」（unix 秒）。
@@ -138,8 +138,10 @@ impl PlatformKeys {
             ))
         })?;
 
-        let skew = (now_unix_secs - signed_at).abs();
-        if skew > MAX_TIMESTAMP_SKEW_SECS {
+        // 用无符号距离比较：`now - signed_at` 在 signed_at 取 i64::MIN 时会算术溢出，
+        // 而这个请求头在验签之前就被解析 —— 也就是未鉴权输入不能把进程打崩。
+        let skew = now_unix_secs.abs_diff(signed_at);
+        if skew > MAX_TIMESTAMP_SKEW_SECS.unsigned_abs() {
             return Err(PayError::StaleNotify(format!(
                 "时间戳偏差 {skew}s 超出 ±{MAX_TIMESTAMP_SKEW_SECS}s，判定为重放（timestamp={}, now={now_unix_secs}）",
                 headers.timestamp

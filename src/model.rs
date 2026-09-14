@@ -2,9 +2,15 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
 /// 请求参数模型：可序列化为微信要求的 JSON。
-pub trait ParamsTrait {
+pub trait ParamsTrait: Serialize {
     /// 序列化为微信要求的 JSON 字符串。
-    fn to_json(&self) -> String;
+    ///
+    /// 默认实现挂在 trait 上：原先每个请求参数类型都复制一份
+    /// `serde_json::to_string(self).unwrap()`，其中 `unwrap` 是库路径上的 panic，
+    /// 而现在失败会作为 [`PayError`](crate::error::PayError) 返回。
+    fn to_json(&self) -> Result<String, crate::error::PayError> {
+        Ok(serde_json::to_string(self)?)
+    }
 }
 
 /// 货币类型：仅支持人民币 CNY。
@@ -67,6 +73,14 @@ pub struct GoodsDetail {
     pub goods_name: Option<String>,
 }
 
+/// `serde` 跳过条件：`None` 与空数组都不写入 JSON。
+///
+/// 用于 `goods_detail` 这类「要么不传，要么至少一条」的字段 —— 显式传 `Some(vec![])`
+/// 与传 `None` 必须得到同一个请求体，否则调用方会发出官方明文禁止的空数组。
+fn is_none_or_empty<T>(value: &Option<Vec<T>>) -> bool {
+    value.as_ref().is_none_or(Vec::is_empty)
+}
+
 /// 订单优惠信息。
 #[derive(Serialize, Debug, Clone)]
 pub struct OrderDetail {
@@ -79,8 +93,10 @@ pub struct OrderDetail {
     ///【商品小票ID】 商家小票ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invoice_id: Option<String>,
-    ///【单品列表】 单品列表信息,条目个数限制：【1，6000】
-    pub goods_detail: Vec<GoodsDetail>,
+    ///【单品列表】 单品列表信息，条目个数限制：【1，6000】。不传（或传空数组）时整个字段
+    /// 都不出现 —— 空数组不在官方允许的取值范围内，`None` 与 `Some(vec![])` 语义相同。
+    #[serde(skip_serializing_if = "is_none_or_empty")]
+    pub goods_detail: Option<Vec<GoodsDetail>>,
 }
 
 /// 商户门店信息。
@@ -113,13 +129,20 @@ pub struct SceneInfo {
 }
 
 /// H5 场景类型：iOS / Android / WAP。
+///
+/// 变体的 `Serialize` 与 `Display` 现在给出同一个字符串（官方取值里 `iOS` 的 `S` 是大写）——
+/// 在这之前同一个变体序列化成 `Ios`，而 `Display` 输出 `iOS`。
+/// ⚠ [`H5Info::h5_type`] 目前是 `String`，请求体并不直接由本枚举序列化。
 #[derive(Serialize, Debug, Clone)]
 pub enum H5Type {
     /// iOS
+    #[serde(rename = "iOS")]
     Ios,
     /// Android
+    #[serde(rename = "Android")]
     Android,
     /// WAP
+    #[serde(rename = "Wap")]
     Wap,
 }
 
@@ -186,11 +209,7 @@ impl H5SceneInfo {
     }
 }
 
-impl ParamsTrait for SceneInfo {
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-}
+impl ParamsTrait for SceneInfo {}
 
 /// JSAPI 下单参数：小程序支付。
 #[derive(Serialize, Debug, Clone)]
@@ -217,11 +236,7 @@ pub struct JsapiParams {
     pub scene_info: Option<SceneInfo>,
 }
 
-impl ParamsTrait for JsapiParams {
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-}
+impl ParamsTrait for JsapiParams {}
 
 /// 付款码支付参数：商户扫描用户付款码收款。
 #[derive(Serialize, Debug, Clone)]
@@ -248,11 +263,7 @@ pub struct MicroParams {
     pub scene_info: Option<SceneInfo>,
 }
 
-impl ParamsTrait for MicroParams {
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-}
+impl ParamsTrait for MicroParams {}
 
 impl MicroParams {
     /// 构造 MicroParams。
@@ -276,7 +287,7 @@ impl MicroParams {
 }
 
 impl JsapiParams {
-    /// 构造 NativeParams。
+    /// 构造 JsapiParams。
     pub fn new<S: AsRef<str>>(
         description: S,
         out_trade_no: S,
@@ -335,11 +346,7 @@ pub struct NativeParams {
     pub settle_info: Option<SettleInfo>,
 }
 
-impl ParamsTrait for NativeParams {
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-}
+impl ParamsTrait for NativeParams {}
 
 /// APP 下单参数：APP 支付。
 #[derive(Serialize, Debug, Clone)]
@@ -375,11 +382,7 @@ pub struct AppParams {
     pub settle_info: Option<SettleInfo>,
 }
 
-impl ParamsTrait for AppParams {
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-}
+impl ParamsTrait for AppParams {}
 
 impl AppParams {
     /// 构造 AppParams。
@@ -429,11 +432,7 @@ pub struct H5Params {
     pub settle_info: Option<SettleInfo>,
 }
 
-impl ParamsTrait for H5Params {
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-}
+impl ParamsTrait for H5Params {}
 
 impl H5Params {
     /// 构造 H5Params。
@@ -525,14 +524,55 @@ pub struct WechatPayDecodeData {
     pub trade_state_desc: String,
     /// 【付款银行】 用户支付所使用的银行。
     pub bank_type: String,
-    /// 【附加数据】 商户下单时传入的附加数据。
-    pub attach: String,
+    /// 【附加数据】 商户下单时传入的附加数据。**下单没传就不会返回**，因此是可选的。
+    pub attach: Option<String>,
     /// 【支付完成时间】 交易支付完成的时间。
     pub success_time: String,
     /// 【支付者】 支付者信息。
     pub payer: PayerInfo,
     /// 【订单金额】 订单金额信息。
     pub amount: AmountInfo,
+}
+
+/// 退款结果通知解密后的数据（`REFUND.SUCCESS` / `REFUND.ABNORMAL` / `REFUND.CLOSED`）。
+///
+/// 退款通知的字段与支付通知**不重合**：没有 `appid` / `trade_state` / `payer`，多了
+/// `out_refund_no` / `refund_id` / `refund_status`，所以不能复用 [`WechatPayDecodeData`]。
+/// 解密入口是
+/// [`PayNotifyTrait::decrypt_refund_paydata`](crate::pay::PayNotifyTrait::decrypt_refund_paydata)。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WechatPayRefundDecodeData {
+    /// 【商户号】 商户下单时的商户号。
+    pub mchid: String,
+    /// 【商户订单号】 商户系统内部订单号。
+    pub out_trade_no: String,
+    /// 【微信支付订单号】 微信支付侧订单的唯一标识。
+    pub transaction_id: String,
+    /// 【商户退款单号】 商户系统内部的退款单号。
+    pub out_refund_no: String,
+    /// 【微信退款单号】 微信支付侧的退款单号。
+    pub refund_id: String,
+    /// 【退款状态】 `SUCCESS` / `CLOSED` / `ABNORMAL`。
+    pub refund_status: String,
+    /// 【退款成功时间】 仅退款成功时返回，格式同支付通知的 `success_time`。
+    pub success_time: Option<String>,
+    /// 【退款入账账户】 退回资金的入账账户。
+    pub user_received_account: String,
+    /// 【退款金额】 退款金额信息。
+    pub amount: RefundNotifyAmount,
+}
+
+/// 退款结果通知里的金额信息（四项，与支付通知的 [`AmountInfo`] 不同）。
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RefundNotifyAmount {
+    /// 【订单金额】 订单总金额，单位为分。
+    pub total: i32,
+    /// 【退款金额】 本次退款金额，单位为分。
+    pub refund: i32,
+    /// 【用户支付金额】 用户实际支付的金额，单位为分。
+    pub payer_total: i32,
+    /// 【用户退款金额】 退给用户的金额，单位为分。
+    pub payer_refund: i32,
 }
 
 /// 申请退款参数。
@@ -646,8 +686,4 @@ impl RefundsParams {
     }
 }
 
-impl ParamsTrait for RefundsParams {
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-}
+impl ParamsTrait for RefundsParams {}

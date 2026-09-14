@@ -35,7 +35,6 @@ members = ["example"]
 
 [dependencies]
 base64 = "0.23"
-chrono = "0.4"
 rsa = { version = "0.9", features = ["sha2"] }
 aes-gcm = "0.11"
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "rustls"] }
