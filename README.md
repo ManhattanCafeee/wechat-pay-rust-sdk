@@ -194,27 +194,24 @@ let response = wechat_pay.jsapi_pay(JsapiParams::new(
      "测试支付1分",
      "1243243",
      1.into(),
-     open_id,            // 小程序的 openid
+     "oXXXX-xxxxxxxx".into(),   // 小程序的 openid（由 jscode2session 换来）
      )).expect("jsapi_pay error");
 
 let sign_data = response.sign_data.expect("下单成功必有签名数据");
 
-// sign_data 的 JSON 键名已经对齐官方（timeStamp / nonceStr / package / signType /
-// paySign / appId），这里重新组一次只是为了去掉小程序用不到的 appId。
-let args = serde_json::json!({
-    "timeStamp": sign_data.timestamp,   // 字符串、秒级
-    "nonceStr":  sign_data.nonce_str,
-    "package":   sign_data.package,     // 已经是 prepay_id=xxx
-    "signType":  sign_data.sign_type,   // RSA
-    "paySign":   sign_data.pay_sign,
-});
+// 序列化出来就是官方键名（timeStamp / nonceStr / package / signType / paySign / appId），
+// 小程序只差一件事：官方参数表里没有 appId，删掉再交给前端。
+let mut args = serde_json::to_value(&sign_data).expect("SignData 必然可序列化");
+args.as_object_mut()
+    .expect("SignData 序列化后是 JSON 对象")
+    .remove("appId");
 println!("{args}");
 ```
 
 输出（交给前端 `wx.requestPayment(args)` 即可拉起支付）
 
 ```json
-{"nonceStr":"5K8264ILTKCH16CQ2502SI8ZNMTM67VS","package":"prepay_id=wx201410272009395522657a690389285100","paySign":"oR9d8PuhnIc+YZ8cBHFCwfgpaK9gd7vaRvkYD7rthRAZ\/X+QBilZosN16P9toCpAcqeJ977dGOz01C80C\/Z9C1w==","signType":"RSA","timeStamp":"1414561699"}
+{"nonceStr":"5K8264ILTKCH16CQ2502SI8ZNMTM67VS","package":"prepay_id=wx201410272009395522657a690389285100","paySign":"oR9d8PuhnIc+YZ8cBHFCwfgpaK9gd7vaRvkYD7rthRAZ/X+QBilZosN16P9toCpAcqeJ977dGOz01C80C/Z9C1w==","signType":"RSA","timeStamp":"1414561699"}
 ```
 
 > ⚠ 字段名的大小写由官方定死（`timeStamp` 的 `S` 是大写），**别手写** —— 拼错时前端只会报

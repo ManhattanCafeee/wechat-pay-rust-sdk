@@ -42,7 +42,8 @@ pub struct JsapiResponse {
 /// 键名写错时前端只会报「缺少参数」，**不会**指向这里，所以别手写这些名字，
 /// 序列化本结构体即可（有测试钉住键名）。
 ///
-/// - [`package`](Self::package) 已经是带 `prepay_id=` 前缀的完整串，直接给前端。
+/// - [`package`](Self::package) 在 JSAPI / 小程序 / 付款码路径下已经是带 `prepay_id=`
+///   前缀的完整串，直接给前端；**APP 支付是裸 `prepay_id`**（见下方 ⚠）。
 /// - [`app_id`](Self::app_id) 是**公众号 JSAPI** 才需要的（官方字段名 `appId`）；
 ///   **小程序**的 `wx.requestPayment` 参数表里没有这一项，前端忽略或删掉即可。
 ///
@@ -57,7 +58,7 @@ pub struct SignData {
     /// 【签名类型】 签名算法类型，固定为 RSA。
     #[serde(rename = "signType")]
     pub sign_type: String,
-    /// 【订单详情扩展字符串】 形如 `prepay_id=xxx`，由预支付会话标识拼装。
+    /// 【订单详情扩展字符串】 形如 `prepay_id=xxx`（APP 支付为裸 `prepay_id`），由预支付会话标识拼装。
     pub package: String,
     /// 【随机字符串】 参与签名的随机字符串。
     #[serde(rename = "nonceStr")]

@@ -114,7 +114,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features async -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test                     # lib 11 passed / 14 ignored + offline 43 passed
+cargo test                     # lib 11 passed / 14 ignored + offline 44 passed
 cargo test --features async    # 同一套测试在 async 模式下再跑一遍
 cargo check -p example
 
@@ -239,11 +239,11 @@ cargo +1.89.0 check --all-targets
 | 纯逻辑单测 | `src/pay.rs`、`src/retry.rs`、`src/async_impl/pay.rs` 的 `#[cfg(test)]` | 同上，默认执行 | 无 |
 | 在线冒烟 | 同上文件里的 `#[ignore]` | `cargo test --lib -- --ignored` | 真实凭证 + 公网 + 仓库根 PEM fixture |
 
-**精确计数（单次运行）**：`cargo test` → lib **11 passed / 14 ignored**，offline **43 passed**；
-`cargo test --features async` → lib **10 passed / 7 ignored**，offline **43 passed**。
+**精确计数（单次运行）**：`cargo test` → lib **11 passed / 14 ignored**，offline **44 passed**；
+`cargo test --features async` → lib **11 passed / 7 ignored**，offline **44 passed**。
 
-- offline 的 43 = 41 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
-  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 41。
+- offline 的 44 = 42 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
+  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 42。
 - ⚠ 计 `#[test]` 时要按**行首**（`^#\[test\]`）锚定：直接数 `#[test]` 会把 `dual_test!` 宏定义体内的
   那一次（缩进）和文档注释里提到的一次也算进去。
 - 「需凭证的用例」有两种口径：跨模式去重共 **16 个函数**，但单次运行只列出 **14**（sync）或 **7**（async），

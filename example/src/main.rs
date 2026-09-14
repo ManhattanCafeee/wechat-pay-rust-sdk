@@ -109,10 +109,16 @@ async fn main() -> std::io::Result<()> {
     // 启动时拉一次平台证书。之后应当按 `PlatformKeys::needs_refresh` 定时刷新
     // （官方要求至少每 12 小时一次），并在验签拿到 `UnknownPlatformSerial` 时立即重拉。
     let bootstrap = WechatPay::from_env();
-    let keys = bootstrap
+    let mut keys = bootstrap
         .fetch_platform_keys()
         .await
         .expect("拉取平台证书失败：检查商户证书、证书序列号与 APIv3 密钥");
+    // 记录拉取时间 —— 不记的话 `needs_refresh` 永远返回 true，刷新循环会每轮重拉一次。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("系统时间早于 Unix 纪元")
+        .as_secs() as i64;
+    keys.mark_refreshed(now);
     tracing::info!(count = keys.len(), serials = ?keys.serials(), "已加载平台密钥");
 
     // `WechatPay` 不实现 Clone（它持有连接池），所以每个 worker 各建一份；
