@@ -25,6 +25,13 @@
 
 ### 行为变更
 
+- **`SignData` 的 JSON 键名改为官方大小写**：`timestamp` → `timeStamp`、`nonce_str` → `nonceStr`、
+  `sign_type` → `signType`、`pay_sign` → `paySign`、`app_id` → `appId`（Rust 字段名不变）。
+  此前序列化出来全是 snake_case，而 `wx.requestPayment` 的参数名是官方定死的 camelCase
+  （`timeStamp` 的 `S` 还必须大写）—— 直接把 `sign_data` 交给前端会**拉起失败**，且前端只会报
+  「缺少参数」，不会指向 SDK。⚠ 若你在前端或用例里手写过这些键名，需要同步改。
+  另注意：**APP 支付的拉起参数名与 JSAPI 完全不同**（`appid` / `partnerid` / `prepayid` /
+  `package` / `noncestr` / `timestamp` / `sign`），不能复用这里的键名，需自行映射。
 - **新增的重试只覆盖三类有官方依据的失败**：确定没送到、微信明确未受理、202。
   **写接口超时（结果未知）不重试** —— 官方口径是先用查单接口确认状态；只读接口
   （查单 / 退款查询 / 平台证书）超时照常重试，因为重放纯读没有副作用。
@@ -42,6 +49,23 @@
 - 每次重试都**重新签名**（新 nonce + 新 timestamp）：重试可能跨过 5 分钟的签名有效窗口，
   复用旧签名会直接 401。
 - `async` feature 新增对 `tokio`（仅 `time`）的依赖，用于退避的异步 sleep。
+
+### 修复
+
+- **重写 `example/` 的回调服务器**：原来三个 handler 里，注册进 `App` 的 `pay_notify`
+  **完全不验签**（只把 body 写进文件就返回成功 —— 照抄等于接受伪造的「支付成功」通知），
+  `pay_notify2` 只解密不验签，而唯一做过验签的 `pay_notify3` **没有注册**（死代码）。
+  现在是一条完整链路：`NotifyHeaders::from_pairs` → `PlatformKeys::verify_notify` →
+  `decrypt_paydata` → 幂等占位 → 204 应答，并注明「拿到 `UnknownPlatformSerial` 要立即重拉证书」。
+  同时**去掉示例的 `debug-print` feature**：它会打印 Authorization 头与请求体（含 openid、金额），
+  而示例会被当成生产范本抄走。
+- **README 两处回调小节补上警告**：`## 支付回调解密` 与 `## actix-web demo` 只演示「只解密、不验签」，
+  现在明确标注「解密不能替代验签」并指向正确流程 —— 解密（AEAD）能挡住伪造的密文，
+  但挡不住**重放**（抓到一次合法回调即可反复投递）。
+- **README 的「小程序支付」小节改用 `jsapi_pay`**：原先指向 `micro_pay`（该方法发往 JSAPI 下单端点
+  且 `MicroParams` 缺付款码支付必需的 `auth_code`），而且示例把 `JsapiParams` 传给了要求 `MicroParams`
+  的参数 —— 那段示例根本编译不过。新示例补上 `openid` 的来源说明与 `sign_data` → `wx.requestPayment`
+  的映射，并说明「小程序支付就是 JSAPI，与公众号 JSAPI 只差 openid 来源」。
 
 ## [0.3.0] - 2026-09-11
 

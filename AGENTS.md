@@ -200,7 +200,7 @@ cargo +1.89.0 check --all-targets
 | `README.md` | **同时是 crate 文档**；含安装方式（git / path）与各能力的使用示例 |
 | `CHANGELOG.md` | 破坏性与行为变更的权威记录，含未发布节 |
 | `NOTICE` / `LICENSE` | Apache-2.0 归属声明与全文；许可证口径必须三处一致 |
-| `example/src/main.rs` | actix-web 回调服务器，异步用法的参考实现 |
+| `example/src/main.rs` | actix-web 回调服务器：**验签 → 解密 → 幂等 → 应答** 的完整参考实现（刻意不开 `debug-print`） |
 | `.github/workflows/ci.yml` | 唯一的 CI；上文的命令清单就来自这里 |
 
 **测试专用的公开 API**：`WechatPay::with_base_url()` 是测试把请求指向本地 mock 的唯一入口
@@ -296,7 +296,10 @@ dual_test! {
 - **重试触发与次数**：429 / 503 会重试，且断言 mock **实际收到的请求次数**；
 - **每次重试重新签名**（两次尝试的 `nonce_str` 必须不同）；
 - **202 与 `SYSTEM_ERROR` 信封**的行为（含关单不再把 200 + 信封当成功）；
-- **退款策略真的被选中**（关掉通用策略后仍会有第 2 次请求）。
+- **退款策略真的被选中**（关掉通用策略后仍会有第 2 次请求）；
+- **`sign_data` 的 JSON 键名对齐官方**（`timeStamp` / `nonceStr` / `package` / `signType` /
+  `paySign` / `appId`，注意 `timeStamp` 的大写 S）：前端报「缺少参数」时不会指向 SDK，
+  所以有测试钉住键名，并**反向断言不得残留 snake_case**。
 
 给新增测试定标准时注意：仓内有**两个不构成回归保护的用例**（`src/pay.rs::test_uuid_v4` 只打印，
 `src/async_impl/pay.rs::test_str` 只做 split 且无断言）。别把它们当范例。
@@ -312,14 +315,16 @@ dual_test! {
   README 的示例需要真实凭证与公网，所以设了 `[lib] doctest = false`。CI 不跑它。
   ⚠ 同一开关也关掉了**源码文档注释里**的示例（`src/retry.rs`、`src/error.rs`、`src/pay.rs`、`src/notify.rs`），
   改这些示例时没有任何编译兜底。
-- README 示例**不被编译**，因此会悄悄腐烂 —— 已经发现一处：小程序支付那段的
-  `micro_pay(JsapiParams::new(...))` 与真实签名 `micro_pay(params: MicroParams)` 不符（此类错误 CI 发现不了）。
+- README 示例**不被编译**，因此会悄悄腐烂。已修掉一处（小程序支付那段曾调用
+  `micro_pay(JsapiParams::new(…))`，与真实签名 `micro_pay(params: MicroParams)` 不符），
+  但这只是**已知的一处** —— 改 README 示例时请人工核对 API 签名，CI 不会发现。
 
 **代码**
 
 - `micro_pay()` 自称「付款码支付」，但实现 POST 到 **JSAPI 下单端点** `/v3/pay/transactions/jsapi`，
   且 `MicroParams` 没有付款码支付必需的 `auth_code` 字段。文档与实现自相矛盾 ——
   使用前请先核实官方端点，不要按方法名假定它可用。
+  （README 已改为指向 `jsapi_pay`：**小程序支付就是 JSAPI**，与公众号 JSAPI 只差 openid 来源。）
 - `get_weixin(h5_url, referer)` 对调用方传入的 URL 发 GET 且**无白名单**，是 SSRF 面：
   `h5_url` 只能来自你自己的服务端或微信返回的 `h5_url`，**绝不能来自用户输入**。
 - `.json()` → `from_str` 的解码差异：非法 UTF-8 的 2xx 响应体会被有损替换为 U+FFFD 后解析成功，

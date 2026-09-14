@@ -181,29 +181,56 @@ AppResponse {
 
 ## 小程序支付
 
+小程序支付走的就是 **JSAPI 下单**接口，所以用 `jsapi_pay` —— 与公众号 JSAPI 的唯一区别是
+`openid` 来自小程序的 `wx.login`（前端拿 `code`，后端调
+`https://api.weixin.qq.com/sns/jscode2session` 换 `openid`；那是小程序 API，不在本 SDK 范围内）。
+
 ```rust
-use wechat_pay_rust_sdk::model::MicroParams;
+use wechat_pay_rust_sdk::model::JsapiParams;
 use wechat_pay_rust_sdk::pay::WechatPay;
 
 let wechat_pay = WechatPay::from_env();
-let body = wechat_pay.micro_pay(JsapiParams::new(
+let response = wechat_pay.jsapi_pay(JsapiParams::new(
      "测试支付1分",
      "1243243",
      1.into(),
-     "open_id".into()
-     )).expect("micro_pay error");
-println!("body: {:?}", body);
- ```
-输出
- ```rust
-MicroResponse { 
-    code: None, 
-    message: None, 
-    prepay_id: Some("wx201410272009395522657a690389285100") 
-}
- ```
+     open_id,            // 小程序的 openid
+     )).expect("jsapi_pay error");
+
+let sign_data = response.sign_data.expect("下单成功必有签名数据");
+
+// sign_data 的 JSON 键名已经对齐官方（timeStamp / nonceStr / package / signType /
+// paySign / appId），这里重新组一次只是为了去掉小程序用不到的 appId。
+let args = serde_json::json!({
+    "timeStamp": sign_data.timestamp,   // 字符串、秒级
+    "nonceStr":  sign_data.nonce_str,
+    "package":   sign_data.package,     // 已经是 prepay_id=xxx
+    "signType":  sign_data.sign_type,   // RSA
+    "paySign":   sign_data.pay_sign,
+});
+println!("{args}");
+```
+
+输出（交给前端 `wx.requestPayment(args)` 即可拉起支付）
+
+```json
+{"nonceStr":"5K8264ILTKCH16CQ2502SI8ZNMTM67VS","package":"prepay_id=wx201410272009395522657a690389285100","paySign":"oR9d8PuhnIc+YZ8cBHFCwfgpaK9gd7vaRvkYD7rthRAZ\/X+QBilZosN16P9toCpAcqeJ977dGOz01C80C\/Z9C1w==","signType":"RSA","timeStamp":"1414561699"}
+```
+
+> ⚠ 字段名的大小写由官方定死（`timeStamp` 的 `S` 是大写），**别手写** —— 拼错时前端只会报
+> 「缺少参数」，不会指向你。
+> ⚠ 小程序**不要**传 `appId`（官方的小程序参数表里没有它，那是公众号 JSAPI 才需要的）。
+> ⚠ **APP 支付不能复用这套键名**：APP SDK 用的是 `appid` / `partnerid` / `prepayid` /
+> `package` / `noncestr` / `timestamp` / `sign`。
 
 ## 支付回调解密
+
+> ⚠ **解密不能替代验签**，下面只是演示解密出来的数据长什么样。
+> 真实的回调入口必须**先验签再解密**：解密（AEAD）虽然能挡住伪造的密文，但挡不住**重放** ——
+> 抓到一次合法回调就能反复投递。而且这段用了 `.unwrap()`，出错会变成 500 让微信一直重投。
+> 正确顺序与完整示例见「[回调通知：验签与防重放](#回调通知验签与防重放)」，
+> 可直接运行的版本见 `example/src/main.rs`。
+
 ```rust
 use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
 let associated_data = "transaction";
@@ -239,6 +266,11 @@ WechatPayDecodeData {
 }
 ```
 ## actix-web demo
+
+> ⚠ 下面这个 handler **只解密、不验签**，不要直接拿去用于生产：它没有防重放，
+> 且每个请求都 `WechatPay::from_env()` 重建一次客户端（连连接池一起重建）。
+> 可直接运行的完整参考实现（**验签 → 解密 → 幂等 → 应答**）见 `example/src/main.rs`。
+
 支付回调json格式为
 ```json
 {"id":"376151be-0eac-5047-b08a-46b52e15d2e2","create_time":"2024-01-12T12:17:33+08:00","resource_type":"encrypt-resource","event_type":"TRANSACTION.SUCCESS","summary":"支付成功","resource":{"original_type":"transaction","algorithm":"AEAD_AES_256_GCM","ciphertext":"u+MVmYPLQO4fjRsGWChm3sc/AXFVsytCI362RzYJyG25RbP6RSxYtkC2TIUA2ECfdhaJ0pIYuv4TwHwB1JE+0dn/MVQIjsBgaL9jx6IxmFIbkvNg0o623PF250ZhC9snTzxKJJtPtKFn3E8bR/pmqO4zbwUjQyQI5B4LqmzFcKpiKqGZSyG0BdvEWV2sDlR8oHD3s5RH/YN6c0aI7pEtVa1n7CR4qqQo9/NLAjTwloXWxB0BB+OnmlXQ9fu1UdJBS8L53W9zpREbEpH3BeCjrML/5qBs2nwcgvRV0OM30LkEdX8/lX7PiR6jzT2SexbinpSzx1QyXy9ZZfLRjFWVfQDTcDOrkMIaem4rhRgkAe5UDx6xdtqbgPSi5Ry/KHPm1+ptAl1GmEe9LIz8fRLleew3U0THXTSjnu5dJaXqk0qEizvK1pQBZ97QuzWuC2sVh4pd/OyqSNn93mlslkJIgT/UjQRcTIUE/CphdI7BGJkKYbEz4pSoqD/lxUiZNlMWbDeP4gEu/B7+Uk8n9vCOzR35VroLpweC0aDnCa3ru8DfMOcLQTvq04M4GJha9aodXec399ma3UcLEuw=","associated_data":"transaction","nonce":"pEw6yyO8XiSj"}}
