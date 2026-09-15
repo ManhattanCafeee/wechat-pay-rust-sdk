@@ -58,8 +58,23 @@ pub(crate) enum ResponseCheck {
 enum SignatureStatus {
     /// 已按规则验签通过；或调用方显式关闭了验签。
     Verified,
-    /// 5xx 且没有签名头：放行，但错误消息里必须标注它没被验签。
+    /// 没验签：5xx 缺签名头（放行但必须标记），或证书列表路径上的非 2xx 应答
+    /// （那条路径的 2xx 由调用方自校验，错误体的签名我们一概没验过）。
     Unsigned,
+}
+
+impl SignatureStatus {
+    /// 未走验签的路径（`ResponseCheck::CertificateSelfCheck`）上的状态。
+    ///
+    /// 那条路径的 **2xx** 由调用方拿响应内下发的证书自校验；**非 2xx** 的错误体
+    /// 则从头到尾没验过 —— 标出来，免得调用方以为那条错误是可信的。
+    fn for_self_checked(status: u16) -> Self {
+        if (200..300).contains(&status) {
+            SignatureStatus::Verified
+        } else {
+            SignatureStatus::Unsigned
+        }
+    }
 }
 
 /// 发送请求并取回**未经处理**的应答。
@@ -208,7 +223,10 @@ impl WechatPay {
                     Err(err) => Err(err),
                 },
                 // 证书列表的应答是密钥来源，由调用方解密后自校验。
-                Ok(raw) => Ok((raw, SignatureStatus::Verified)),
+                Ok(raw) => {
+                    let signature = SignatureStatus::for_self_checked(raw.status);
+                    Ok((raw, signature))
+                }
                 Err(err) => Err(err),
             };
 

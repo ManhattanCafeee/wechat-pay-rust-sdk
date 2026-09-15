@@ -150,8 +150,10 @@ pub enum ResponseVerify {
 pub(crate) struct RefreshState {
     /// 是否已有刷新在飞行中。
     pub(crate) in_flight: AtomicBool,
-    /// 上一次**尝试**刷新的 unix 秒（0 表示从未尝试）。
-    pub(crate) last_attempt: AtomicI64,
+    /// 上一次由未知 serial 触发的**成功**刷新（unix 秒；0 表示从未）。
+    ///
+    /// 只在成功后写入（见 `refresh_platform_keys_for_unknown_serial`）：失败不该把限流窗口烧掉。
+    pub(crate) last_unknown_serial_refresh: AtomicI64,
 }
 
 /// 刷新期间持有 `in_flight` 标记，`Drop` 时释放。
@@ -591,8 +593,14 @@ impl WechatPay {
     /// 代价是轮换要你自己更新 —— 对公钥模式（[`WechatPay::with_platform_public_key`]）
     /// 而言这是唯一正确的语义，因为公钥根本不在平台证书列表里。
     pub fn set_platform_keys(&self, keys: PlatformKeys) {
-        *self.platform_keys_write() = keys;
+        // ⚠ 置位与写入必须在**同一个写锁临界区**内：安装侧（`fetch_and_install_keys_once`）
+        // 是在写锁内复查 `auto_refresh_keys()` 的，若这里先放锁再置位，就会出现
+        // 「索引里已经是调用方的密钥、但标记还说不是静态模式」的窗口 ——
+        // 此刻一次飞行中的拉取会通过复查并把用户密钥整体覆盖，
+        // 而静态模式下不会再有下一次自动拉取 ⇒ 公钥模式永久失效。
+        let mut guard = self.platform_keys_write();
         self.static_keys.store(true, Ordering::SeqCst);
+        *guard = keys;
     }
 
     /// 读锁；锁中毒不 panic（中毒只说明持锁线程 panic 过，索引本身仍然可用）。

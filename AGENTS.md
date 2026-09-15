@@ -82,12 +82,19 @@ send_and_check(builder)              ← 只发请求，取回 (status, headers,
   等待者的完成信号只能是「`in_flight` 已释放」，**不能**用 `needs_refresh`（命中未知 serial 时
   索引可能既新鲜又不含那个 serial）。标记用 **RAII 释放**：异步任务被 `timeout` / `select!` /
   abort 丢弃时手动复位不会执行，标记会永久为真。
-- 未知 serial → `refresh_platform_keys_for_unknown_serial()`（**60s 最小间隔** + 单飞）后**重验**：
+- 未知 serial → `refresh_platform_keys_for_unknown_serial()`（**60s 成功窗口** + 单飞）后**重验**：
   复用已缓冲的响应，**绝不重发业务请求**。该方法**公开**：回调验签拿到
   `UnknownPlatformSerial` 时也用它（回调的 serial 是未鉴权输入，不带限流的
   `refresh_platform_keys()` 会被伪造 serial 变成放大器）。⚠ 刷新失败必须**归一成
   `UnknownPlatformSerial`**：那个错误来自另一条请求，若以原类型逃进业务请求的失败分类，
   可重试类会**重发已收到应答的写请求**，4xx 类会让调用方以为「确定没受理」。
+- ⚠ 两条**顺序**上的不变量（都是窄窗口竞态，改回去不会立刻报错但会偶发/永久失效）：
+  ① 限流判断必须在**抢到单飞标记之后**做 —— 先读 `in_flight` 再判断，会让等待者读到别人
+  刚写入的时间戳，被误判成「刚刷新过」而拿到虚假的 `UnknownPlatformSerial`；
+  ② `set_platform_keys` 里 `static_keys` 的置位必须与写索引在**同一个写锁临界区**内 ——
+  先放锁再置位会留下「索引已是调用方密钥、标记还说不是静态模式」的窗口，
+  此刻飞行中的拉取会通过复查并覆盖用户密钥（静态模式下不再自动拉取 ⇒ 公钥模式永久失效）。
+  限流窗口也只在**成功**后计（失败烧掉窗口会让一次瞬时故障拖死随后一分钟的验签）。
 - 安装前在写锁内**复查**静态密钥模式：`set_platform_keys` / `with_platform_public_key` 与一次
   飞行中的拉取撞上时，覆盖用户密钥是不可逆的（`static_keys` 只挡「发起」，挡不住「安装」）。
 - **`GET /v3/certificates` 的应答一律自校验**（`ResponseCheck::CertificateSelfCheck`，公开的
@@ -161,8 +168,8 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features async -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo test                     # lib 13 passed / 14 ignored + offline 71 passed
-cargo test --features async    # lib 14 passed / 7 ignored + offline 71 passed
+cargo test                     # lib 13 passed / 14 ignored + offline 73 passed
+cargo test --features async    # lib 14 passed / 7 ignored + offline 73 passed
 cargo check -p example
 
 # MSRV 作业（1.89.0）
@@ -303,11 +310,11 @@ cargo +1.89.0 check --all-targets
 | 纯逻辑单测 | `src/pay.rs`、`src/retry.rs`、`src/util.rs`、`src/pay_type.rs`、`src/async_impl/pay.rs` 的 `#[cfg(test)]` | 同上，默认执行 | 无 |
 | 在线冒烟 | 同上文件里的 `#[ignore]` | `cargo test --lib -- --ignored` | 真实凭证 + 公网 + 仓库根 PEM fixture |
 
-**精确计数（单次运行）**：`cargo test` → lib **13 passed / 14 ignored**，offline **71 passed**；
-`cargo test --features async` → lib **14 passed / 7 ignored**，offline **71 passed**。
+**精确计数（单次运行）**：`cargo test` → lib **13 passed / 14 ignored**，offline **73 passed**；
+`cargo test --features async` → lib **14 passed / 7 ignored**，offline **73 passed**。
 
-- offline 的 71 = 69 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
-  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 69。
+- offline 的 73 = 71 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
+  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 71。
 - lib 的 async 多一个用例：`src/async_impl/pay.rs::public_futures_are_send`（`cfg(feature = "async")`）。
 - ⚠ 计 `#[test]` 时要按**行首**（`^#\[test\]`）锚定：直接数 `#[test]` 会把 `dual_test!` 宏定义体内的
   那一次（缩进）和文档注释里提到的一次也算进去。

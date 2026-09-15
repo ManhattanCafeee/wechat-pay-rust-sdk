@@ -2854,3 +2854,82 @@ dual_test! {
         );
     }
 }
+
+dual_test! {
+    fn a_failed_refresh_does_not_burn_the_throttle_window() {
+        // 一次**失败**的刷新不该让随后一分钟内所有需要验签的应答都失败：限流窗口只在成功后
+        // 才计。这里两次请求各自发起一次刷新（而不是第二次被 60s 窗口挡掉）。
+        let bootstrap = certificates_response(&[("SERIAL_OLD", "nonce_rt_001")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &bootstrap)
+                .signed_with_serial("SERIAL_OLD")
+                .for_path("/v3/certificates"),
+            // 第一次：业务应答由未知 serial 签名，刷新**失败**
+            MockResponse::json(204, "").signed_with_serial(TEST_PLATFORM_SERIAL_NEW),
+            MockResponse::json(500, r#"{"code":"SYSTEM_ERROR","message":"系统异常"}"#)
+                .for_path("/v3/certificates"),
+            // 第二次：同一个未知 serial —— 刷新必须**立刻再试**，而不是被限流窗口挡住
+            MockResponse::json(204, "").signed_with_serial(TEST_PLATFORM_SERIAL_NEW),
+            MockResponse::json(200, &bootstrap)
+                .signed_with_serial("SERIAL_OLD")
+                .for_path("/v3/certificates"),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config())
+            .with_base_url(&mock.base_url)
+            .with_retry(fast_retry(1));
+
+        let first = call!(wechat_pay.close_order("THROTTLE_A")).expect_err("刷新失败必须报错");
+        assert!(
+            matches!(first, PayError::UnknownPlatformSerial(_)),
+            "实际 {first:?}"
+        );
+        // 第二次刷新成功了，但列表里仍然没有那个 serial → 仍然是「未知」
+        let second = call!(wechat_pay.close_order("THROTTLE_B")).expect_err("索引里仍没有该 serial");
+        assert!(
+            matches!(second, PayError::UnknownPlatformSerial(_)),
+            "实际 {second:?}"
+        );
+
+        let attempts = mock
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/v3/certificates")
+            .count();
+        assert_eq!(
+            attempts, 3,
+            "冷启动 1 次 + 两次未知 serial 各自发起一次刷新（失败没有烧掉限流窗口）"
+        );
+    }
+}
+
+dual_test! {
+    fn unsigned_error_from_the_certificate_endpoint_is_marked_unverified() {
+        // 证书列表路径上的非 2xx 应答从头到尾没验过（自校验只作用于 2xx 的 body）——
+        // 标记出来，免得调用方以为那条错误是可信的。
+        let mock = Mock::start(vec![
+            MockResponse::json(500, r#"{"code":"SYSTEM_ERROR","message":"系统异常"}"#)
+                .without_signature_headers(),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config())
+            .with_base_url(&mock.base_url)
+            .with_retry(fast_retry(1));
+
+        let err = call!(wechat_pay.close_order("CERTS_5XX")).expect_err("冷启动拉证失败");
+
+        match &err {
+            PayError::ApiError { status, response } => {
+                assert_eq!(*status, 500);
+                assert!(
+                    response
+                        .message
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("[未验签]"),
+                    "证书路径的错误应答也必须标注未验签: {response:?}"
+                );
+            }
+            other => panic!("应为 ApiError，实际 {other:?}"),
+        }
+        assert_eq!(mock.requests().len(), 1, "密钥先行：拉证失败后不得发出业务请求");
+    }
+}

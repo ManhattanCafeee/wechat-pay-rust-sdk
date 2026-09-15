@@ -43,10 +43,14 @@ use maybe_async::must_be_sync as maybe_async_attr;
 /// 官方要求至少每 12 小时重新拉取一次平台证书列表。
 pub const REFRESH_INTERVAL_SECS: i64 = 12 * 60 * 60;
 
-/// 由**未知 `Wechatpay-Serial`** 触发的刷新之间，至少间隔这么多秒。
+/// 由**未知 `Wechatpay-Serial`** 触发的刷新，在**成功**之后至少间隔这么多秒。
 ///
 /// 伪造一个 serial 就能触发刷新，而 `GET /v3/certificates` 是官方要求「至少每 12 小时」
 /// 的接口 —— 没有这道闸，应答验签本身就成了可被外部触发的流量放大器。
+///
+/// ⚠ 窗口只在**成功**后计（见 `refresh_platform_keys_for_unknown_serial`）：一次瞬时失败
+/// 不该让随后一分钟内所有需要验签的应答都失败。代价是刷新**持续**失败时（例如证书权限
+/// 配错），未知 serial 会按请求频率重试证书接口 —— 那种情况下业务本身已经在报错。
 pub const UNKNOWN_SERIAL_REFRESH_MIN_INTERVAL_SECS: i64 = 60;
 
 /// 等待并发刷新结束时的轮询间隔与轮数（有界：异步模式下不能无限等）。
@@ -236,19 +240,37 @@ impl WechatPay {
                  不会自动拉取平台证书"
             )));
         }
-        // 限流只在「没有人正在刷」时判断：等同伴不算「刚刷新过」。
-        if !self.key_refresh.in_flight.load(Ordering::SeqCst) {
-            let now = crate::util::now_unix_secs();
-            let last_attempt = self.key_refresh.last_attempt.load(Ordering::SeqCst);
-            if last_attempt != 0
-                && now.saturating_sub(last_attempt) < UNKNOWN_SERIAL_REFRESH_MIN_INTERVAL_SECS
-            {
-                return Err(PayError::UnknownPlatformSerial(format!(
-                    "{serial}:距上次刷新平台证书不足 {UNKNOWN_SERIAL_REFRESH_MIN_INTERVAL_SECS}s，\
-                     已跳过重复刷新（等微信的证书更新后再试）"
-                )));
-            }
-            self.key_refresh.last_attempt.store(now, Ordering::SeqCst);
+        // ⚠ 顺序：**先抢单飞标记**，再判断限流。反过来的话，等待者可能「读 `in_flight`
+        // 时还没人刷、判断限流时却读到了别人刚写入的时间戳」，被误判成「刚刷新过」而拿到
+        // 一个虚假的 `UnknownPlatformSerial`（窄窗口，但会让并发用例偶发变红）。
+        let Some(_guard) = RefreshGuard::acquire(&self.key_refresh) else {
+            // 已经有人在刷：等它结束（它成功的话索引里就有这个 serial 了），不做限流判断 ——
+            // 等同伴不算「刚刷新过」。
+            self.wait_for_refresh().await?;
+            return Ok(());
+        };
+        let now = crate::util::now_unix_secs();
+        let last_success = self
+            .key_refresh
+            .last_unknown_serial_refresh
+            .load(Ordering::SeqCst);
+        if last_success != 0
+            && now.saturating_sub(last_success) < UNKNOWN_SERIAL_REFRESH_MIN_INTERVAL_SECS
+        {
+            return Err(PayError::UnknownPlatformSerial(format!(
+                "{serial}:距上次刷新平台证书不足 {UNKNOWN_SERIAL_REFRESH_MIN_INTERVAL_SECS}s，\
+                 已跳过重复刷新（等微信的证书更新后再试）"
+            )));
+        }
+        let result = self.fetch_and_install_keys_once().await;
+        // ⚠ 只在**成功**后计窗口：一次瞬时失败（网络抖动、上游 5xx）不该让随后一分钟内所有
+        // 需要验签的应答都失败 —— 下一批请求应当能立刻再试。代价是刷新**持续**失败时，
+        // 未知 serial 会按请求频率重试证书接口；那种情况下业务本身已经在报错，可观测性足够，
+        // 而「一次失败 = 一分钟全挂」的代价更常见也更难受。
+        if result.is_ok() {
+            self.key_refresh
+                .last_unknown_serial_refresh
+                .store(now, Ordering::SeqCst);
         }
         // ⚠ 刷新失败必须归一到 `UnknownPlatformSerial`（R7）：这个错误来自**另一条请求**
         // （拉证书）。若让它以原类型逃进业务请求的失败分类，会同时踩两个坑：
@@ -256,18 +278,13 @@ impl WechatPay {
         // （R4 明确要求绝不重发业务请求）；4xx 又会让调用方拿到
         // `may_have_taken_effect() == false`（「确定没受理」），可微信明明已经回过它 ——
         // 正是这条无法验签的应答触发了本次刷新。
-        self.fetch_and_install_keys()
-            .await
-            .map(|_| ())
-            .map_err(|err| match err {
-                // 等待并发刷新超时这类错误已经是同一个结论，别套娃。
-                PayError::UnknownPlatformSerial(message) => {
-                    PayError::UnknownPlatformSerial(message)
-                }
-                other => PayError::UnknownPlatformSerial(format!(
-                    "{serial}:应答由未知 serial 签名，刷新平台证书也失败了（{other}），无法完成验签"
-                )),
-            })
+        result.map(|_| ()).map_err(|err| match err {
+            // 等待并发刷新超时这类错误已经是同一个结论，别套娃。
+            PayError::UnknownPlatformSerial(message) => PayError::UnknownPlatformSerial(message),
+            other => PayError::UnknownPlatformSerial(format!(
+                "{serial}:应答由未知 serial 签名，刷新平台证书也失败了（{other}），无法完成验签"
+            )),
+        })
     }
 
     /// 确保密钥索引可用：Auto 模式下按 12 小时窗口刷新（索引为空时就是冷启动引导）。
@@ -305,17 +322,28 @@ impl WechatPay {
     /// 「至少每 12 小时一次」的接口发出 N 次请求。
     #[maybe_async_attr]
     async fn fetch_and_install_keys(&self) -> Result<PlatformKeys, PayError> {
+        // ⚠ 抢不到标记时只**等**，不要用 `needs_refresh` 当完成信号：命中未知 serial 时索引
+        // 可能既新鲜又不含那个 serial（正轮到别人去装），用它判断会让等待者抢在安装之前
+        // 返回旧索引。
+        if let Some(_guard) = RefreshGuard::acquire(&self.key_refresh) {
+            return self.fetch_and_install_keys_once().await;
+        }
+        self.wait_for_refresh().await?;
+        Ok(self.platform_keys())
+    }
+
+    /// 有界等待正在进行的刷新结束（轮询 `in_flight`，最多 `REFRESH_WAIT_ROUNDS` 轮）。
+    #[maybe_async_attr]
+    async fn wait_for_refresh(&self) -> Result<(), PayError> {
         for _ in 0..REFRESH_WAIT_ROUNDS {
-            if let Some(_guard) = RefreshGuard::acquire(&self.key_refresh) {
-                return self.fetch_and_install_keys_once().await;
-            }
-            // ⚠ 等待的判据只能是「标记已释放」，不能用 `needs_refresh`：命中未知 serial 时
-            // 索引可能**既新鲜又不含那个 serial**（轮到别人去装），用它当完成信号会让等待者
-            // 抢在安装之前返回旧索引。
-            sleep_for(REFRESH_WAIT_INTERVAL).await;
             if !self.key_refresh.in_flight.load(Ordering::SeqCst) {
-                return Ok(self.platform_keys());
+                return Ok(());
             }
+            sleep_for(REFRESH_WAIT_INTERVAL).await;
+        }
+        // 睡完最后一轮再确认一次，避免刚好卡在边界上。
+        if !self.key_refresh.in_flight.load(Ordering::SeqCst) {
+            return Ok(());
         }
         Err(PayError::UnknownPlatformSerial(format!(
             "平台证书正在刷新中，等待超过 {}ms 仍未完成",

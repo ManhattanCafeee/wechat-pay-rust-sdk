@@ -577,7 +577,8 @@ let config = WechatPayConfig {
   `wechat_pay.refresh_platform_keys_for_unknown_serial(&serial)` 刷新后重验 ——
   ⚠ **不要**在回调里用不带限流的 `refresh_platform_keys()`：回调的 serial 是未鉴权输入，
   伪造一个就能触发刷新，那等于把证书接口（官方要求 12 小时一次）变成放大器。
-  （`example/` 的回调实现就是这么写的。）
+  （`example/` 的回调实现就是这么写的。限流窗口只在刷新**成功**后计 —— 瞬时失败会尽快再试，
+  不会把随后一分钟的验签全拖死。）
 - 官方要求至少每 12 小时刷新一次；`PlatformKeys::needs_refresh(now)` 按
   `REFRESH_INTERVAL_SECS` 帮你判断。⚠ 用 `set_platform_keys` /
   `with_platform_public_key` 设置的索引属于**调用方负责**：SDK 不会自动拉取或替换它
