@@ -6,7 +6,10 @@
 
 ## [Unreleased]
 
-> 相对已打 tag 的 `v0.3.0`。建议按 0.x 语义升 **`0.4.0`**（新增默认开启的行为）。
+> 相对已打 tag 的 `v0.3.0`，按 0.x 语义升 **`0.4.0`**（新增默认开启的行为）——
+> `Cargo.toml` 的 `version` 已同步为 `0.4.0`，打上 `v0.4.0` tag 后把本节改名为 `[0.4.0]` 即可
+> （README 的安装片段也是按 `v0.4.0` 写的：`v0.3.0` 是 `WechatPay::new(...)` 时代，
+> 与本文档的 `WechatPayConfig` / `from_config` 示例对不上）。
 
 ### 破坏性变更
 
@@ -36,6 +39,14 @@
   因此变成空 `impl`）。⚠ 自定义请求参数类型需要自己实现 `serde::Serialize`。
 - **`H5Type` 的 `Serialize` 与 `Display` 统一**：序列化改为官方取值 `iOS`（原先输出 `Ios`）。
 - 移除 `error!` 宏与 `chrono` 依赖；内部 `debug!` 宏不再 `#[macro_export]` 到 crate 根。
+- **`WechatPayConfig` 新增必填字段 `response_verify`**：用具名字面量构造配置的地方都要补
+  `response_verify: ResponseVerify::Required,`（不留 `Default` 是有意的 —— 这是一个需要显式
+  做出的安全选择，漏写就是编译错误而不是静默放行）。
+- **默认强制应答验签**：对**指向本地 mock 网关的测试**是破坏性的 —— 未签名的应答会被
+  `VerifyError` 拒绝。迁移方式：让测试网关也签名（参考 `tests/offline.rs` 的 mock），
+  或显式 `with_response_verify(ResponseVerify::Disabled)`。
+- **微信支付公钥模式的商户必须配置公钥**（`with_platform_public_key`），否则所有应答都会以
+  `UnknownPlatformSerial` 失败。
 
 ### 新增
 
@@ -57,6 +68,28 @@
   「可能立刻重发」。用 `with_refund_retry` 单独覆盖或关闭。
 - `PayError::may_have_taken_effect()`：区分「结果未知 / 可能已生效」（读写超时、响应体没读
   完、202、响应体解析失败）与「确定没生效」，供调用方决定是否该去查单，而不是换个单号重开。
+- **出站应答验签（默认强制）**：微信不只给回调签名，**每个应答**都带 `Wechatpay-Serial` /
+  `-Timestamp` / `-Nonce` / `-Signature` 四个头（验签串 `{时间戳}\n{随机串}\n{应答体}\n`，
+  用的是同一批平台证书 / 微信支付公钥）。此前 SDK **完全不看应答签名**，而调用方也无法补偿
+  （端点方法只返回已解析类型，拿不到响应头）—— 一个能改应答的中间层可以伪造
+  `ORDER_NOT_EXIST`、「请求未受理」这类结论，诱导调用方做出错误处置。
+  现在验签在**错误归一之前**完成：伪造的 4xx 信封不会被当成微信的业务拒绝。
+  实现要点：`send_and_check` 改为返回「状态码 + 响应头 + **原始字节** body」，
+  JSON 解析走 `from_slice`；密钥索引由 SDK 自己维护（首个请求前自动拉取、12 小时窗口刷新、
+  未知 serial 刷新一次后重验、`/v3/certificates` 自校验、单飞 + 60s 限流）。
+- **`ResponseVerify` + `WechatPayConfig::response_verify` + `WechatPay::with_response_verify`**：
+  `Required`（推荐，也是唯一该在生产用的值） / `Disabled`（仅 mock 网关与离线测试）。
+- **`WechatPay::with_platform_public_key(id, pem)`**：微信支付公钥模式（`PUB_KEY_ID_…`）
+  的支持 —— 该公钥不在平台证书列表里，必须显式配置；配置后客户端进入**静态密钥模式**
+  （不自动拉取、不自动替换）。
+- **`WechatPay::platform_keys()` / `set_platform_keys()` / `refresh_platform_keys()` /
+  `refresh_platform_keys_for_unknown_serial(serial)`**：查看当前索引快照、灌入固定证书
+  （测试 / 自建密钥源）、手动刷新，以及**回调轮换兜底**用的限流刷新入口。
+- **`cert::UNKNOWN_SERIAL_REFRESH_MIN_INTERVAL_SECS`**（60s）：未知 serial 触发的刷新限流 ——
+  伪造一个 serial 就能触发刷新，而该接口官方要求 12 小时一次。
+- 离线用例从 51 增到 71：应答验签的正向 / 篡改 / 超窗（含 `i64::MIN`）/ 缺头（2xx、4xx、204、5xx）
+  / 冷启动自校验 / 轮换自锁 / 刷新后仍未知 / 刷新失败不重发 / 公钥模式 / 并发单飞（含冷启动）
+  / 静态密钥不被飞行中的拉取覆盖 / 关闭开关，以及「写接口坏签名只发一次且可能已生效」。
 
 ### 行为变更
 
@@ -84,6 +117,25 @@
 - 每次重试都**重新签名**（新 nonce + 新 timestamp）：重试可能跨过 5 分钟的签名有效窗口，
   复用旧签名会直接 401。
 - `async` feature 新增对 `tokio`（仅 `time`）的依赖，用于退避的异步 sleep。
+- **无签名头的 4xx 现在返回 `VerifyError`（`Local`）而不是 `ApiError`** —— 这是有意的：
+  这类应答的 `code` 会被当成业务结论，不能让它来自无法验证的来源。代价是**拿不到**
+  `response.code`：`ORDER_NOT_EXIST` 这条处置路径在验签失败时**不适用**，必须按「结果未知」
+  处置（查单 + 告警），不得当成「订单不存在」。
+- **无签名头的 5xx 仍是 `ApiError`，但消息带 `[未验签]` 标记**：5xx 不含可被对手用来误判业务
+  的语义（伪造它只能诱发重试），而严格拒绝会把 CDN / 网关的 5xx 从「自动重试」变成「不重试」
+  —— 正好抹掉本仓的重试设计。`code` / `detail` 保留，`SYSTEM_ERROR` 照常重试。
+- **`may_have_taken_effect()` 对验签类错误由 `false` 变为 `true`**（`VerifyError` /
+  `UnknownPlatformSerial` / `StaleNotify` 在 `classify()` 里归 `Delivery::Processed`）。
+  理由：应答是**完整收到之后**才验签的，请求早已送达微信；官方还会故意下发带
+  `WECHATPAY/SIGNTEST/` 前缀的错误签名探测验签实现。判 `false`（= 确定没发生）会诱导写接口
+  换个单号重开，正是本 crate 一直在避免的方向。**重试行为不变**（仍然一律不重试）。
+- **非法 UTF-8 的 2xx 响应体现在报 `JsonError`**（此前会被有损替换成 U+FFFD 后「解析成功」）：
+  JSON 解析改走 `serde_json::from_slice`，不再先转 `String`。
+- **`WechatPay::fetch_platform_keys()` 会丢弃已过期的平台证书**（`x509_is_valid`），
+  且 `/v3/certificates` 的应答（含公开的 `WechatPay::certificates()`）一律**自校验**
+  （用响应内下发的那张证书验它自己）；返回的仍是全新索引，调用方应整体替换。
+- `WechatPay` 的 `Debug` 增加 `response_verify` 与平台证书 serial 列表（都不是机密，
+  且是「是不是误关了验签 / 现在认了哪几张证书」的唯一排查线索）。
 
 ### 修复
 
@@ -115,6 +167,33 @@
 - 删掉两个不构成回归保护的用例（`test_uuid_v4` 只打印、`test_str` 无断言），并补上
   `PlatformKeys::verify_notify`（真实墙钟路径）、`random_trade_no`、抖动分布与
   `WechatPayConfig` 脱敏的用例。
+- **平台证书到期过滤**：`GET /v3/certificates` 返回的已过期证书此前会被照单收进索引
+  （轮换期新旧并存时尤其危险：留着过期证书会让「拿别的密钥去试」看起来可行）。
+- **`util::x509_is_valid` 的返回类型由 `Box<dyn Error>` 改为 `PayError`**（公开签名变更）：
+  与库其余错误类型一致，调用方可以直接 `?`。
+- **`/v3/certificates` 的应答不再可能「自锁」**：轮换期该应答由**新**证书签名，而本地索引里
+  还没有新证书 —— 若按普通端点严格验签，刷新请求自己就验不过，永远学不到新证书。
+  现在这条应答一律用响应内下发的证书自校验（唯一豁免，且不限「索引为空」，
+  公开的 `certificates()` 也走同一条路）。
+- **刷新失败不再污染业务请求的失败分类**：证书刷新的错误来自**另一条请求**，
+  此前会以原类型逃进 `classify()` —— 连接类 / 429 / 5xx 会被判成「可重试」，
+  导致**重发那条应答已经收到的写请求**；4xx 又会让调用方拿到「确定没受理」。
+  现在统一归一成 `UnknownPlatformSerial`（不重试 + 「可能已生效」）。
+- **刷新标记改为 RAII 释放**：异步任务被 `timeout` / `select!` / abort 丢弃时，
+  原先的手动复位不会执行，`in_flight` 会永久为真 —— 之后所有需要刷新的请求都会失败。
+- **单飞覆盖全部刷新路径**（原先只有「未知 serial」那条）：冷启动与 12 小时窗口到期的瞬间，
+  N 个并发请求会各自打一次 `/v3/certificates`（官方要求 12 小时一次的接口）。
+- **安装拉取结果前复查静态密钥模式**：与一次飞行中的拉取撞上时，`set_platform_keys` /
+  `with_platform_public_key` 灌入的密钥会被**不可逆地**覆盖（静态模式下不再自动拉取）。
+- **应答路径的时间戳极值不再有溢出风险**：与回调共用 `check_timestamp_skew`（`abs_diff`）。
+- **非 UTF-8 的 2xx 错误信封仍会被识别**：信封判据先吃原始字节、失败再退回有损文本，
+  免得关单那条路（`request_no_content` 不解析 JSON）把这种应答当成成功。
+- **`example/` 的证书索引改为用 SDK 那份**：示例原先自己 `fetch_platform_keys` 出一份
+  `PlatformKeys` 放进 `App`，与 SDK 内部那份**互不同步** —— 轮换后回调那条链路会用旧索引。
+  现在：启动用 `refresh_platform_keys()` 预热（顺带 fail-fast 暴露凭证问题），回调里取
+  `platform_keys()` 快照，拿到 `UnknownPlatformSerial` 就
+  `refresh_platform_keys_for_unknown_serial()`（带 60s 限流，避免未鉴权的伪造 serial
+  把证书接口变成放大器）后重验。
 
 ## [0.3.0] - 2026-09-11
 

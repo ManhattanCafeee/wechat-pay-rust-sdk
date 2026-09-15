@@ -23,8 +23,8 @@ use wechat_pay_rust_sdk::model::{
 };
 use wechat_pay_rust_sdk::notify::NotifyHeaders;
 use wechat_pay_rust_sdk::pay::{
-    DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, HttpTimeouts, PayNotifyTrait, WechatPay,
-    WechatPayConfig, WechatPayTrait,
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, HttpTimeouts, PayNotifyTrait, ResponseVerify,
+    WechatPay, WechatPayConfig, WechatPayTrait,
 };
 use wechat_pay_rust_sdk::request::HttpMethod;
 use wechat_pay_rust_sdk::retry::RetryPolicy;
@@ -72,6 +72,18 @@ const TEST_APPID: &str = "wx_test_appid";
 const TEST_MCH_ID: &str = "1900000001";
 const TEST_SERIAL_NO: &str = "TEST_SERIAL_NO";
 const TEST_NOTIFY_URL: &str = "https://example.com/notify";
+
+/// 应答签名用的平台证书序列号（与商户证书序列号 [`TEST_SERIAL_NO`] 无关）。
+///
+/// mock 默认用它签名，`client_for` 也用它预置公钥 —— 两边一致，应答才能验签通过。
+const TEST_PLATFORM_SERIAL: &str = "TEST_PLATFORM_SERIAL";
+
+/// 轮换期「新」证书的序列号。测试里新旧两张用的是**同一张**证书（公钥相同），
+/// 只有 serial 不同 —— 这样不需要第二对密钥就能复现「本地索引里没有这个 serial」。
+const TEST_PLATFORM_SERIAL_NEW: &str = "TEST_PLATFORM_SERIAL_NEW";
+
+/// 微信支付公钥模式的 serial（官方文档里的形状），它**不在**平台证书列表里。
+const TEST_PUBLIC_KEY_ID: &str = "PUB_KEY_ID_0000000000000024101100397200006";
 
 // ---------------------------------------------------------------------------
 // 双模式测试骨架
@@ -125,9 +137,46 @@ impl CapturedRequest {
     }
 }
 
+/// 应答的签名方式。
+///
+/// 默认是**正确签名**：mock 在写响应时为每条应答现算四个签名头（见
+/// [`response_signature_headers`]），于是既有用例不必逐个改动 —— 需要「坏签名 / 缺头 /
+/// 超窗 / 未知 serial」的用例显式覆盖即可。
+#[derive(Clone)]
+enum Signing {
+    /// 正确签名。`serial` 为 `None` 时用 [`TEST_PLATFORM_SERIAL`]；
+    /// `timestamp` 为 `None` 时用当前时间。
+    Valid {
+        serial: Option<String>,
+        timestamp: Option<i64>,
+    },
+    /// 用**别的消息**签名：签名值本身是合法 base64，但验不过 —— 等价于应答被篡改。
+    Invalid,
+    /// 一个签名头都不写（模拟代理 / CDN 过滤掉 `Wechatpay-*` 头）。
+    Missing,
+    /// 签名正确，但时间戳超窗（1 小时前）。
+    Stale,
+    /// 官方探测流量：签名值带 `WECHATPAY/SIGNTEST/` 前缀。
+    Probe,
+}
+
+impl Default for Signing {
+    fn default() -> Self {
+        Signing::Valid {
+            serial: None,
+            timestamp: None,
+        }
+    }
+}
+
 struct MockResponse {
     status: u16,
     body: String,
+    signing: Signing,
+    /// 写响应前先睡一会儿：并发用例需要「刷新确实在飞行中」这个窗口。
+    delay: Option<Duration>,
+    /// 只服务这个路径（`None` = 按到达顺序 FIFO）。
+    expect_path: Option<String>,
 }
 
 impl MockResponse {
@@ -135,6 +184,124 @@ impl MockResponse {
         Self {
             status,
             body: body.to_string(),
+            signing: Signing::default(),
+            delay: None,
+            expect_path: None,
+        }
+    }
+
+    /// 用指定 serial 签名（默认 [`TEST_PLATFORM_SERIAL`]）。
+    fn signed_with_serial(mut self, serial: &str) -> Self {
+        self.signing = Signing::Valid {
+            serial: Some(serial.to_string()),
+            timestamp: None,
+        };
+        self
+    }
+
+    /// 签名对不上 body。
+    fn invalid_signature(mut self) -> Self {
+        self.signing = Signing::Invalid;
+        self
+    }
+
+    /// 不写任何签名头。
+    fn without_signature_headers(mut self) -> Self {
+        self.signing = Signing::Missing;
+        self
+    }
+
+    /// 时间戳超出 ±300s 窗口（签名本身正确）。
+    fn stale_timestamp(mut self) -> Self {
+        self.signing = Signing::Stale;
+        self
+    }
+
+    /// 官方探测签名（`WECHATPAY/SIGNTEST/` 前缀）。
+    fn probe_signature(mut self) -> Self {
+        self.signing = Signing::Probe;
+        self
+    }
+
+    /// 延迟这么久再写响应。
+    fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
+        self
+    }
+
+    /// 用指定时间戳签名（保留已设置的 serial），用于超窗与极值用例。
+    fn signed_at(mut self, timestamp: i64) -> Self {
+        let serial = match &self.signing {
+            Signing::Valid { serial, .. } => serial.clone(),
+            _ => None,
+        };
+        self.signing = Signing::Valid {
+            serial,
+            timestamp: Some(timestamp),
+        };
+        self
+    }
+
+    /// 声明这条响应只服务某个路径（不声明则严格按到达顺序 FIFO）。
+    ///
+    /// 并发用例里响应队列是**跨连接**的全局 FIFO，出队顺序取决于 mock 先读到哪条连接；
+    /// 给「刷新用的证书响应」打上路径标记，它就不会被误发给业务请求（那会报出一个与
+    /// 真实原因无关的 JSON 错误）。
+    fn for_path(mut self, path: &str) -> Self {
+        self.expect_path = Some(path.to_string());
+        self
+    }
+}
+
+/// 四个签名头的名字（与微信一致；客户端按 `Wechatpay-Serial` 选键）。
+const SIGNATURE_HEADER_NAMES: [&str; 4] = [
+    "Wechatpay-Serial",
+    "Wechatpay-Timestamp",
+    "Wechatpay-Nonce",
+    "Wechatpay-Signature",
+];
+
+/// 按 `signing` 方式为一条应答生成四个签名头。
+///
+/// 签名串固定是 `{timestamp}\n{nonce}\n{body}\n`，`body` 必须是**实际写出去的字节**。
+fn response_signature_headers(body: &str, signing: &Signing) -> Vec<(&'static str, String)> {
+    let pairs = |serial: &str, timestamp: &str, nonce: &str, signature: &str| {
+        vec![
+            (SIGNATURE_HEADER_NAMES[0], serial.to_string()),
+            (SIGNATURE_HEADER_NAMES[1], timestamp.to_string()),
+            (SIGNATURE_HEADER_NAMES[2], nonce.to_string()),
+            (SIGNATURE_HEADER_NAMES[3], signature.to_string()),
+        ]
+    };
+    match signing {
+        Signing::Missing => Vec::new(),
+        Signing::Valid { serial, timestamp } => {
+            let serial = serial
+                .clone()
+                .unwrap_or_else(|| TEST_PLATFORM_SERIAL.to_string());
+            let timestamp = timestamp.unwrap_or_else(util::now_unix_secs).to_string();
+            let nonce = "mock_response_nonce";
+            let signature = sign_rsa(&format!("{timestamp}\n{nonce}\n{body}\n"));
+            pairs(&serial, &timestamp, nonce, &signature)
+        }
+        Signing::Invalid => {
+            let timestamp = util::now_unix_secs().to_string();
+            let nonce = "mock_response_nonce";
+            // 对别的消息签名：base64 合法、内容对不上。
+            let signature = sign_rsa(&format!("{timestamp}\n{nonce}\n{body}\n "));
+            pairs(TEST_PLATFORM_SERIAL, &timestamp, nonce, &signature)
+        }
+        Signing::Stale => {
+            let timestamp = (util::now_unix_secs() - 3600).to_string();
+            let nonce = "mock_response_nonce";
+            let signature = sign_rsa(&format!("{timestamp}\n{nonce}\n{body}\n"));
+            pairs(TEST_PLATFORM_SERIAL, &timestamp, nonce, &signature)
+        }
+        Signing::Probe => {
+            let timestamp = util::now_unix_secs().to_string();
+            let nonce = "mock_response_nonce";
+            let signature = format!("WECHATPAY/SIGNTEST/{}", sign_rsa("probe"));
+            pairs(TEST_PLATFORM_SERIAL, &timestamp, nonce, &signature)
         }
     }
 }
@@ -212,6 +379,28 @@ fn hanging_mock_base_url() -> String {
     format!("http://{addr}")
 }
 
+/// 取一条要返回的响应。
+///
+/// 默认**严格 FIFO**（既有用例依赖这个）；但对声明了
+/// [`MockResponse::for_path`] 的响应按路径匹配 —— 并发用例里响应队列是跨连接的全局 FIFO，
+/// 出队顺序取决于 mock 先读到哪条连接，让「刷新用的证书响应」被误发给业务请求会报出与
+/// 真实原因无关的 JSON 错误。
+fn take_response(responses: &mut VecDeque<MockResponse>, path: &str) -> MockResponse {
+    // 第一条「可以发给这个路径」的响应：没打标记的，或标记正好是这个路径的。
+    // 打了**别的**路径标记的会被跳过 —— 否则并发用例里业务请求会吃掉刷新用的证书响应。
+    let index = responses
+        .iter()
+        .position(|response| match &response.expect_path {
+            None => true,
+            Some(expected) => expected == path,
+        });
+    let response = match index {
+        Some(index) => responses.remove(index),
+        None => responses.pop_front(),
+    };
+    response.unwrap_or_else(|| MockResponse::json(500, "{}"))
+}
+
 /// 在一条连接上循环处理请求（keep-alive），直到对端关闭。
 fn handle_connection(
     stream: TcpStream,
@@ -222,13 +411,12 @@ fn handle_connection(
     let mut writer = stream;
 
     while let Some(request) = read_request(&mut reader) {
+        // 取响应与捕获请求都在**写响应之前**（既有保证不变），顺序无所谓。
+        let response = take_response(
+            &mut responses.lock().expect("lock responses"),
+            &request.path,
+        );
         captured.lock().expect("lock captured").push(request);
-
-        let response = responses
-            .lock()
-            .expect("lock responses")
-            .pop_front()
-            .unwrap_or(MockResponse::json(500, "{}"));
 
         let reason = match response.status {
             200 => "OK",
@@ -240,8 +428,16 @@ fn handle_connection(
         };
         // 刻意不发 `Connection: close`：客户端会把连接放回池里复用，
         // 这正是 connections() 计数能验证的东西。
+        if let Some(delay) = response.delay {
+            thread::sleep(delay);
+        }
+        let signature_headers = response_signature_headers(&response.body, &response.signing);
+        let headers: String = signature_headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
         let out = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\n\r\n{}",
             response.status,
             reason,
             response.body.len(),
@@ -299,8 +495,18 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<CapturedRequest> {
 
 /// 构造一个指向本地 mock 服务的客户端。
 /// 走公开的 `with_base_url`，不依赖字段可见性。
+///
+/// **预置平台密钥**（并因此进入静态密钥模式）：应答验签默认强制，若让每个用例都从
+/// 「索引为空」开始，首个请求前都会先拉一次 `/v3/certificates` —— 而 `Mock` 的脚本
+/// 响应条数是精确的（队列耗尽后返回 `500 {}`），多个用例还断言 `requests()[0].path`，
+/// 会集体错位且失败信息误导到「服务端错误」。冷启动那条路径由
+/// `cold_start_fetches_and_self_checks_platform_certificates` 单独覆盖。
 fn client_for(base_url: &str) -> WechatPay {
-    WechatPay::from_config(test_config()).with_base_url(base_url)
+    let wechat_pay = WechatPay::from_config(test_config()).with_base_url(base_url);
+    let mut keys = PlatformKeys::new();
+    keys.insert(TEST_PLATFORM_SERIAL, public_key_pem());
+    wechat_pay.set_platform_keys(keys);
+    wechat_pay
 }
 
 /// 全部离线用例公用的凭据（测试私钥 / v3 key / 平台证书都在本文件里）。
@@ -312,6 +518,8 @@ fn test_config() -> WechatPayConfig {
         serial_no: TEST_SERIAL_NO.to_string(),
         v3_key: TEST_V3_KEY.to_string(),
         notify_url: TEST_NOTIFY_URL.to_string(),
+        // 默认强制验签：绝大多数用例走这条路，mock 也默认为应答签名。
+        response_verify: ResponseVerify::Required,
     }
 }
 
@@ -837,6 +1045,7 @@ dual_test! {
             serial_no: "serial-x".into(),
             v3_key: "SENTINEL_V3_KEY".into(),
             notify_url: "https://example.com/notify".into(),
+            response_verify: ResponseVerify::Required,
         });
         let rendered = format!("{wechat_pay:?}");
 
@@ -961,7 +1170,9 @@ dual_test! {
         // 轮换期微信会同时下发新旧两张且都在有效期内 —— 两张都要索引，
         // 否则灰度期间会有一半回调验签失败。
         let body = certificates_response(&[("SERIAL_OLD", "nonce_old_01"), ("SERIAL_NEW", "nonce_new_01")]);
-        let mock = Mock::start(vec![MockResponse::json(200, &body)]);
+        // 证书列表的应答由它自己下发的某张证书签名 —— 微信就是这么发的，
+        // 客户端也据此自校验（R5）。
+        let mock = Mock::start(vec![MockResponse::json(200, &body).signed_with_serial("SERIAL_OLD")]);
         let wechat_pay = client_for(&mock.base_url);
 
         let keys = call!(wechat_pay.fetch_platform_keys()).expect("拉取并解密平台证书");
@@ -993,7 +1204,9 @@ dual_test! {
 dual_test! {
     fn verify_notify_selects_key_by_serial_and_rejects_replay() {
         let body_json = certificates_response(&[("SERIAL_A", "nonce_cert_1")]);
-        let mock = Mock::start(vec![MockResponse::json(200, &body_json)]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &body_json).signed_with_serial("SERIAL_A"),
+        ]);
         let wechat_pay = client_for(&mock.base_url);
         let keys = call!(wechat_pay.fetch_platform_keys()).expect("拉取平台证书");
 
@@ -1088,7 +1301,9 @@ dual_test! {
         // 万一这个时间源的基准或单位变了（比如改成毫秒），真实回调会全部被判超窗，
         // 而整套测试仍然是绿的 —— 所以这里必须有一次墙钟用例。
         let body_json = certificates_response(&[("SERIAL_CLOCK", "nonce_clk_01")]);
-        let mock = Mock::start(vec![MockResponse::json(200, &body_json)]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &body_json).signed_with_serial("SERIAL_CLOCK"),
+        ]);
         let wechat_pay = client_for(&mock.base_url);
         let keys = call!(wechat_pay.fetch_platform_keys()).expect("拉取平台证书");
 
@@ -2018,6 +2233,624 @@ dual_test! {
             mock.requests().len(),
             2,
             "错误码应当优先于状态码：HTTP 200 的 SYSTEM_ERROR 同样要重试"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 出站应答验签
+// ---------------------------------------------------------------------------
+
+dual_test! {
+    fn unsigned_success_response_is_rejected() {
+        // 2xx 必须带四个签名头。缺头不得静默放行 —— 官方文档承认代理 / CDN 会过滤
+        // `Wechatpay-*` 头，那正是需要一个明确失败（而不是「看起来成功」）的场景。
+        let mock = Mock::start(vec![
+            MockResponse::json(200, r#"{"prepay_id":"wx_unsigned"}"#).without_signature_headers(),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let err = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect_err("无签名头的 2xx 必须被拒绝");
+
+        match err {
+            PayError::VerifyError(message) => {
+                assert!(
+                    message.contains("Wechatpay-Signature"),
+                    "错误消息必须点名缺了哪个头（唯一的排查线索）: {message}"
+                );
+                assert!(message.contains("200"), "应带状态码: {message}");
+            }
+            other => panic!("应为 VerifyError，实际 {other:?}"),
+        }
+        assert_eq!(mock.requests().len(), 1);
+    }
+}
+
+dual_test! {
+    fn tampered_response_is_rejected_after_exactly_one_request() {
+        // 写接口 + 坏签名：**不重试**（重放语义），但结论必须是「可能已生效」——
+        // 应答是完整收到之后才验签的，请求早已送达微信；官方还会故意下发错误签名探测。
+        // 判成「确定没发生」会诱导调用方换个单号重开。
+        let mock = Mock::start(vec![MockResponse::json(204, "").invalid_signature()]);
+        let wechat_pay = client_for(&mock.base_url).with_retry(fast_retry(3));
+
+        let err = call!(wechat_pay.close_order("TAMPERED")).expect_err("坏签名必须被拒绝");
+
+        assert!(matches!(err, PayError::VerifyError(_)), "实际 {err:?}");
+        assert!(
+            err.may_have_taken_effect(),
+            "验签失败 ≠ 没发生：应答都回来了，写接口必须按「可能已生效」处置"
+        );
+        assert_eq!(mock.requests().len(), 1, "验签失败不得重试");
+    }
+}
+
+dual_test! {
+    fn stale_response_timestamp_is_rejected_as_replay() {
+        // 与回调同一时间窗（±300s）：应答签名不绑定请求，窗口是唯一的防重放手段。
+        let mock = Mock::start(vec![
+            MockResponse::json(200, r#"{"prepay_id":"wx_stale"}"#).stale_timestamp(),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let err = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect_err("超窗时间戳必须被拒绝");
+
+        assert!(matches!(err, PayError::StaleNotify(_)), "实际 {err:?}");
+        assert_eq!(mock.requests().len(), 1);
+    }
+}
+
+dual_test! {
+    fn probe_signature_takes_the_same_path_as_a_bad_signature() {
+        // 微信会在极少数应答里下发 `WECHATPAY/SIGNTEST/` 前缀的错误签名，探测商户是否
+        // 真的验签，并要求「不应对探测流量进行特殊处理」—— 它必须与普通坏签名同路径。
+        for build in [
+            MockResponse::invalid_signature as fn(MockResponse) -> MockResponse,
+            MockResponse::probe_signature,
+        ] {
+            let mock = Mock::start(vec![build(MockResponse::json(
+                200,
+                r#"{"prepay_id":"wx_probe"}"#,
+            ))]);
+            let wechat_pay = client_for(&mock.base_url);
+
+            let err = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+                .expect_err("探测流量也必须被拒绝");
+
+            assert_eq!(err.kind(), ErrorKind::Local, "实际 {err:?}");
+            assert!(matches!(err, PayError::VerifyError(_)), "实际 {err:?}");
+            assert_eq!(mock.requests().len(), 1, "不得重试");
+        }
+    }
+}
+
+dual_test! {
+    fn unsigned_4xx_is_rejected_before_the_business_error() {
+        // 4xx 严格：伪造的 404 `ORDER_NOT_EXIST` 会被当成「这笔订单不存在」这种**业务结论**，
+        // 而调用方在超时兜底时正是靠查单结果决定要不要换个单号重开。
+        let mock = Mock::start(vec![
+            MockResponse::json(
+                404,
+                r#"{"code":"ORDER_NOT_EXIST","message":"订单不存在"}"#,
+            )
+            .without_signature_headers(),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let err = call!(wechat_pay.query_order("NOPE")).expect_err("无签名头的 404 必须被拒绝");
+
+        assert!(
+            matches!(err, PayError::VerifyError(_)),
+            "不得退化成 ApiError（那会让调用方当成真实业务拒绝）: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("404"), "应带状态码: {message}");
+        assert!(
+            message.contains("ORDER_NOT_EXIST"),
+            "应保留原始响应体，否则诊断链路断了: {message}"
+        );
+        assert_eq!(mock.requests().len(), 1, "未验签的应答也不得重试");
+    }
+}
+
+dual_test! {
+    fn unsigned_5xx_stays_an_api_error_with_an_unverified_marker() {
+        // 5xx 不含可被对手用来误判业务的语义（伪造 5xx 只能诱发重试，与丢包等价），
+        // 而严格拒绝会把 CDN / 网关的 5xx 从「自动重试」变成「不重试」—— 正好抹掉
+        // 本 crate 的重试设计。所以：放行，但必须在错误里标明它没被验签。
+        let unavailable = r#"{"code":"SYSTEM_ERROR","message":"系统异常"}"#;
+        let mock = Mock::start(vec![
+            MockResponse::json(500, unavailable).without_signature_headers(),
+            MockResponse::json(500, unavailable).without_signature_headers(),
+            MockResponse::json(500, unavailable).without_signature_headers(),
+        ]);
+        let wechat_pay = client_for(&mock.base_url).with_retry(fast_retry(3));
+
+        let err = call!(wechat_pay.close_order("UNVERIFIED_5XX")).expect_err("5xx 仍是错误");
+
+        match &err {
+            PayError::ApiError { status, response } => {
+                assert_eq!(*status, 500);
+                assert_eq!(
+                    response.code.as_deref(),
+                    Some("SYSTEM_ERROR"),
+                    "code 必须保留：重试判定与调用方分支都依赖它"
+                );
+                assert!(
+                    response
+                        .message
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("[未验签]"),
+                    "必须标注这条应答没被验签: {response:?}"
+                );
+            }
+            other => panic!("应为 ApiError，实际 {other:?}"),
+        }
+        assert_eq!(
+            mock.requests().len(),
+            3,
+            "无签名头的 5xx 仍要按 SYSTEM_ERROR 重试到底"
+        );
+    }
+}
+
+dual_test! {
+    fn response_verification_can_be_disabled_for_mock_gateways() {
+        // Disabled 的唯一正当用途：本地 mock 网关，或网关暂时无法回传签名头。
+        let mock = Mock::start(vec![
+            MockResponse::json(200, r#"{"prepay_id":"wx_no_verify"}"#).without_signature_headers(),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config())
+            .with_base_url(&mock.base_url)
+            .with_response_verify(ResponseVerify::Disabled);
+
+        let response = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect("关闭验签后无签名头也应放行");
+
+        assert_eq!(response.prepay_id.as_deref(), Some("wx_no_verify"));
+        assert_eq!(wechat_pay.response_verify(), ResponseVerify::Disabled);
+        assert_eq!(mock.requests().len(), 1, "关闭验签时不该去拉证书");
+        assert!(wechat_pay.platform_keys().is_empty());
+    }
+}
+
+dual_test! {
+    fn cold_start_fetches_and_self_checks_platform_certificates() {
+        // 空索引的客户端：首个请求前先拉一次证书列表（用响应里下发的证书自校验），
+        // 之后按索引严格验签。
+        let certificates = certificates_response(&[("SERIAL_OLD", "nonce_cold01")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &certificates).signed_with_serial("SERIAL_OLD"),
+            MockResponse::json(200, r#"{"prepay_id":"wx_cold"}"#).signed_with_serial("SERIAL_OLD"),
+        ]);
+        // 刻意**不**预置密钥：这条路走的就是冷启动。
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+
+        let response = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect("冷启动后应能验签成功");
+
+        assert_eq!(response.prepay_id.as_deref(), Some("wx_cold"));
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].path, "/v3/certificates", "首个请求应当是拉证书");
+        assert_eq!(requests[1].path, "/v3/pay/transactions/jsapi");
+        assert_eq!(wechat_pay.platform_keys().serials(), vec!["SERIAL_OLD"]);
+    }
+}
+
+dual_test! {
+    fn rotation_unknown_serial_recovers_via_self_checked_refresh() {
+        // 轮换的真实顺序：微信改用新证书签名 → 本地没有这个 serial → 刷新证书列表，
+        // **而这份列表本身也是用新证书签的**。若把自校验限制在「索引为空」的冷启动，
+        // 这里就会自锁：刷新请求自己验不过 → 永远学不到新证书 → 之后全部失败。
+        let bootstrap = certificates_response(&[("SERIAL_OLD", "nonce_rot_01")]);
+        let refreshed = certificates_response(&[
+            ("SERIAL_OLD", "nonce_rot_02"),
+            (TEST_PLATFORM_SERIAL_NEW, "nonce_rot_03"),
+        ]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &bootstrap).signed_with_serial("SERIAL_OLD"),
+            MockResponse::json(200, r#"{"prepay_id":"wx_rotated"}"#)
+                .signed_with_serial(TEST_PLATFORM_SERIAL_NEW),
+            MockResponse::json(200, &refreshed).signed_with_serial(TEST_PLATFORM_SERIAL_NEW),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+
+        let response = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect("未知 serial 应刷新一次后重验成功");
+
+        assert_eq!(response.prepay_id.as_deref(), Some("wx_rotated"));
+        let paths: Vec<String> = mock
+            .requests()
+            .iter()
+            .map(|request| request.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/v3/certificates",
+                "/v3/pay/transactions/jsapi",
+                "/v3/certificates"
+            ],
+            "期望：冷启动拉证 → 业务请求（未知 serial）→ 刷新证书"
+        );
+        assert_eq!(
+            wechat_pay.platform_keys().serials(),
+            vec!["SERIAL_OLD", TEST_PLATFORM_SERIAL_NEW],
+            "刷新后新旧两张都要在索引里（整体替换，不是合并）"
+        );
+    }
+}
+
+dual_test! {
+    fn public_key_id_mode_gives_an_actionable_error_without_fetching_certificates() {
+        // 微信支付公钥模式的公钥**不在**平台证书列表里，刷新也拿不到 ——
+        // 必须直接给可操作的错误，而不是白打一次证书接口再报同一个错。
+        let bootstrap = certificates_response(&[("SERIAL_OLD", "nonce_pk_001")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &bootstrap).signed_with_serial("SERIAL_OLD"),
+            MockResponse::json(200, r#"{"prepay_id":"wx_pubkey"}"#).signed_with_serial(TEST_PUBLIC_KEY_ID),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+
+        let err = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect_err("未配置的公钥必须报错");
+
+        match err {
+            PayError::UnknownPlatformSerial(message) => {
+                assert!(message.contains(TEST_PUBLIC_KEY_ID), "消息应含 serial: {message}");
+                assert!(
+                    message.contains("with_platform_public_key"),
+                    "必须给出可操作的下一步: {message}"
+                );
+            }
+            other => panic!("应为 UnknownPlatformSerial，实际 {other:?}"),
+        }
+        assert_eq!(
+            mock.requests().len(),
+            2,
+            "公钥模式的 serial 不得触发平台证书刷新（那只是白打限流接口）"
+        );
+    }
+}
+
+dual_test! {
+    fn configured_public_key_verifies_responses() {
+        // 公钥模式的正向路径：`with_platform_public_key` 之后应答能验签通过，
+        // 且不会去拉平台证书（静态密钥模式）。
+        let mock = Mock::start(vec![
+            MockResponse::json(200, r#"{"prepay_id":"wx_pk_ok"}"#)
+                .signed_with_serial(TEST_PUBLIC_KEY_ID),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config())
+            .with_base_url(&mock.base_url)
+            .with_platform_public_key(TEST_PUBLIC_KEY_ID, public_key_pem());
+
+        let response = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect("配置公钥后应验签通过");
+
+        assert_eq!(response.prepay_id.as_deref(), Some("wx_pk_ok"));
+        assert_eq!(mock.requests().len(), 1, "公钥模式不应拉取平台证书");
+    }
+}
+
+dual_test! {
+    fn static_platform_keys_never_trigger_a_certificate_fetch() {
+        // `set_platform_keys` / `with_platform_public_key` 之后是静态密钥模式：
+        // 即使索引的 `fetched_at` 为空（`needs_refresh` 恒为 true），也不得自动拉取 ——
+        // 否则手工灌入的密钥会在「整体替换」时被抹掉，且每个请求前都会多打一次证书接口。
+        let mock = Mock::start(vec![
+            MockResponse::json(200, r#"{"prepay_id":"wx_static"}"#).signed_with_serial("SERIAL_OLD"),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+        // 覆盖 client_for 预置的 serial，改用响应头里的那个（静态模式下由调用方负责）。
+        let mut keys = PlatformKeys::new();
+        keys.insert("SERIAL_OLD", public_key_pem());
+        wechat_pay.set_platform_keys(keys);
+
+        let response = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect("预置的密钥必须能验签");
+
+        assert_eq!(response.prepay_id.as_deref(), Some("wx_static"));
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "静态密钥模式不得拉取平台证书"
+        );
+    }
+}
+
+dual_test! {
+    fn concurrent_unknown_serial_refreshes_platform_keys_once() {
+        // 两个并发请求同时遇到未知 serial：只允许一次刷新，且两个请求都要成功。
+        // 单飞靠 in-flight 标志 + 有界等待实现（`tokio` 只开了 `time`，没有可 await 的锁）。
+        let bootstrap = certificates_response(&[("SERIAL_OLD", "nonce_cc_001")]);
+        let refreshed = certificates_response(&[
+            ("SERIAL_OLD", "nonce_cc_002"),
+            (TEST_PLATFORM_SERIAL_NEW, "nonce_cc_003"),
+        ]);
+        let mock = Mock::start(vec![
+            // 冷启动拉证 + 预热请求：让索引里只有 SERIAL_OLD
+            MockResponse::json(200, &bootstrap).signed_with_serial("SERIAL_OLD"),
+            MockResponse::json(204, "").signed_with_serial("SERIAL_OLD"),
+            // 两个并发请求都由「新」证书签名 —— 本地索引里没有它
+            MockResponse::json(204, "").signed_with_serial(TEST_PLATFORM_SERIAL_NEW),
+            MockResponse::json(204, "").signed_with_serial(TEST_PLATFORM_SERIAL_NEW),
+            // 刷新：延迟一下，保证第二个请求能观察到「刷新在飞行中」。
+            // 用 `for_path` 钉死路径：响应队列是跨连接的全局 FIFO，出队顺序取决于 mock
+            // 先读到哪条连接 —— 这份证书响应绝不能被误发给业务请求。
+            MockResponse::json(200, &refreshed)
+                .signed_with_serial(TEST_PLATFORM_SERIAL_NEW)
+                .with_delay(Duration::from_millis(500))
+                .for_path("/v3/certificates"),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+
+        call!(wechat_pay.close_order("WARMUP")).expect("预热请求应成功");
+
+        #[cfg(feature = "async")]
+        let (first, second) = tokio::join!(
+            wechat_pay.close_order("CONCURRENT_A"),
+            wechat_pay.close_order("CONCURRENT_B")
+        );
+        #[cfg(not(feature = "async"))]
+        let (first, second) = thread::scope(|scope| {
+            let first = scope.spawn(|| wechat_pay.close_order("CONCURRENT_A"));
+            let second = scope.spawn(|| wechat_pay.close_order("CONCURRENT_B"));
+            (first.join().expect("join A"), second.join().expect("join B"))
+        });
+
+        first.expect("第一个并发请求应成功");
+        second.expect("第二个并发请求应成功");
+
+        let certificate_fetches = mock
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/v3/certificates")
+            .count();
+        assert_eq!(
+            certificate_fetches, 2,
+            "冷启动 1 次 + 并发刷新 1 次；单飞失效就会是 3 次以上"
+        );
+    }
+}
+
+dual_test! {
+    fn unsigned_204_is_rejected() {
+        // 关单的 204 是「2xx + 空 body」，但空 body 的验签串是 `{时间戳}\n{随机串}\n\n`，
+        // 微信照签。豁免它会留一个「任何人都能伪造关单成功」的口子。
+        let mock = Mock::start(vec![
+            MockResponse::json(204, "").without_signature_headers(),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let err = call!(wechat_pay.close_order("UNSIGNED_204")).expect_err("无签名头的 204 必须被拒绝");
+
+        match err {
+            PayError::VerifyError(message) => {
+                assert!(message.contains("204"), "消息应带状态码: {message}");
+                assert!(
+                    message.contains("Wechatpay-Signature"),
+                    "消息应点名缺哪个头: {message}"
+                );
+            }
+            other => panic!("应为 VerifyError，实际 {other:?}"),
+        }
+        assert_eq!(mock.requests().len(), 1);
+    }
+}
+
+dual_test! {
+    fn certificate_list_response_signed_by_an_absent_serial_is_rejected() {
+        // R5 的自校验必须**只认响应体里下发的那张证书**：签名头的 serial 在响应体里
+        // 找不到就说明这份列表不能自证。退化成「拿响应体里任意一张证书去试」也能验过
+        // （测试 fixture 里新旧两张证书公钥相同），所以要显式钉住。
+        let certificates = certificates_response(&[("SERIAL_OLD", "nonce_mism_1")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &certificates).signed_with_serial("SERIAL_NOPE"),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+
+        let err = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect_err("响应体里没有该 serial 时必须报错");
+
+        match err {
+            PayError::UnknownPlatformSerial(message) => {
+                assert!(message.contains("SERIAL_NOPE"), "消息应含 serial: {message}");
+            }
+            other => panic!("应为 UnknownPlatformSerial，实际 {other:?}"),
+        }
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "拉证书失败后不得再发业务请求（密钥先行）"
+        );
+    }
+}
+
+dual_test! {
+    fn refresh_that_still_lacks_the_serial_reports_unknown_serial() {
+        // 刷新成功但列表里仍然没有那个 serial（轮换尚未走完）：重验必须失败，
+        // 而且是 `UnknownPlatformSerial`，不是「刷新成功就算过」。
+        let bootstrap = certificates_response(&[("SERIAL_OLD", "nonce_re1_01")]);
+        let refreshed = certificates_response(&[("SERIAL_OLD", "nonce_re1_02")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &bootstrap).signed_with_serial("SERIAL_OLD"),
+            MockResponse::json(200, r#"{"prepay_id":"wx_still_unknown"}"#)
+                .signed_with_serial(TEST_PLATFORM_SERIAL_NEW),
+            MockResponse::json(200, &refreshed).signed_with_serial("SERIAL_OLD"),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+
+        let err = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect_err("刷新后仍未知必须失败");
+
+        match err {
+            PayError::UnknownPlatformSerial(message) => {
+                assert!(
+                    message.contains(TEST_PLATFORM_SERIAL_NEW),
+                    "消息应含未知的 serial: {message}"
+                );
+            }
+            other => panic!("应为 UnknownPlatformSerial，实际 {other:?}"),
+        }
+        let business_requests = mock
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/v3/pay/transactions/jsapi")
+            .count();
+        assert_eq!(business_requests, 1, "重验不得重发业务请求");
+    }
+}
+
+dual_test! {
+    fn refresh_failure_is_reported_as_unknown_serial_without_resending() {
+        // 刷新平台证书**自己失败**时，那个错误来自另一条请求（拉证书）。若让它以原类型
+        // 逃进业务请求的失败分类：500 会被判成「可重试」→ 重发那条**应答已经收到**的请求；
+        // 4xx 又会让调用方拿到「确定没受理」。所以必须归一成 UnknownPlatformSerial。
+        let bootstrap = certificates_response(&[("SERIAL_OLD", "nonce_rf_001")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &bootstrap).signed_with_serial("SERIAL_OLD"),
+            // 业务应答：由本地还没有的新证书签名
+            MockResponse::json(204, "").signed_with_serial(TEST_PLATFORM_SERIAL_NEW),
+            // 刷新失败（5xx；队列耗尽后 mock 还会继续回 500）
+            MockResponse::json(500, r#"{"code":"SYSTEM_ERROR","message":"系统异常"}"#),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config())
+            .with_base_url(&mock.base_url)
+            .with_retry(fast_retry(3));
+
+        let err = call!(wechat_pay.close_order("REFRESH_FAILED")).expect_err("刷新失败必须报错");
+
+        assert!(
+            matches!(err, PayError::UnknownPlatformSerial(_)),
+            "刷新失败必须归一成 UnknownPlatformSerial（否则会被当成可重试 / 确定没发生）: {err:?}"
+        );
+        assert!(
+            err.may_have_taken_effect(),
+            "业务应答已经收到了，结论必须是「可能已生效」"
+        );
+        let business_requests = mock
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/v3/pay/transactions/out-trade-no/REFRESH_FAILED/close")
+            .count();
+        assert_eq!(
+            business_requests, 1,
+            "刷新失败绝不能导致业务请求被重发（R4）"
+        );
+    }
+}
+
+dual_test! {
+    fn response_timestamp_extremes_are_rejected_without_overflow() {
+        // `Wechatpay-Timestamp` 是**未鉴权输入**，且在验签之前就被解析成整数。
+        // 与回调共用同一个 `check_timestamp_skew`（`abs_diff`），极值不得 panic。
+        for extreme in [i64::MIN, i64::MAX, 0] {
+            let mock = Mock::start(vec![
+                MockResponse::json(200, r#"{"prepay_id":"wx_extreme"}"#).signed_at(extreme),
+            ]);
+            let wechat_pay = client_for(&mock.base_url);
+
+            let err = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+                .expect_err("极值时间戳必须被拒绝");
+
+            assert!(
+                matches!(err, PayError::StaleNotify(_)),
+                "timestamp={extreme} 应为 StaleNotify，实际 {err:?}"
+            );
+        }
+    }
+}
+
+dual_test! {
+    fn concurrent_cold_start_fetches_platform_keys_once() {
+        // 冷启动同样要单飞：索引为空时每个请求都会判「需要刷新」，
+        // 没有单飞的话 N 个并发请求会各自去打一次 `/v3/certificates`
+        // （官方要求 12 小时一次的接口）。
+        let certificates = certificates_response(&[("SERIAL_OLD", "nonce_cs_001")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &certificates)
+                .signed_with_serial("SERIAL_OLD")
+                .with_delay(Duration::from_millis(300))
+                .for_path("/v3/certificates"),
+            MockResponse::json(204, "").signed_with_serial("SERIAL_OLD"),
+            MockResponse::json(204, "").signed_with_serial("SERIAL_OLD"),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+
+        #[cfg(feature = "async")]
+        let (first, second) = tokio::join!(
+            wechat_pay.close_order("COLD_A"),
+            wechat_pay.close_order("COLD_B")
+        );
+        #[cfg(not(feature = "async"))]
+        let (first, second) = thread::scope(|scope| {
+            let first = scope.spawn(|| wechat_pay.close_order("COLD_A"));
+            let second = scope.spawn(|| wechat_pay.close_order("COLD_B"));
+            (first.join().expect("join A"), second.join().expect("join B"))
+        });
+
+        first.expect("第一个并发请求应在冷启动后成功");
+        second.expect("第二个并发请求应在冷启动后成功");
+
+        let certificate_fetches = mock
+            .requests()
+            .iter()
+            .filter(|request| request.path == "/v3/certificates")
+            .count();
+        assert_eq!(
+            certificate_fetches, 1,
+            "冷启动的并发请求只允许拉一次证书（单飞）"
+        );
+    }
+}
+
+dual_test! {
+    fn keys_set_while_a_refresh_is_in_flight_are_not_overwritten() {
+        // `set_platform_keys` / `with_platform_public_key` 与一次飞行中的拉取撞上时，
+        // **安装点**必须复查静态模式：`static_keys` 只挡「发起」，挡不住「安装」——
+        // 覆盖掉调用方刚灌进来的密钥是不可逆的（静态模式下不会再有下一次自动拉取），
+        // 此后所有由该 serial 签名的应答都会失败。
+        let certificates = certificates_response(&[("SERIAL_OLD", "nonce_st_001")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &certificates)
+                .signed_with_serial("SERIAL_OLD")
+                .with_delay(Duration::from_millis(400))
+                .for_path("/v3/certificates"),
+            // 业务应答由**调用方**配置的 serial 签名
+            MockResponse::json(204, "").signed_with_serial("USER_SERIAL"),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+        let mut user_keys = PlatformKeys::new();
+        user_keys.insert("USER_SERIAL", public_key_pem());
+
+        #[cfg(feature = "async")]
+        let result = {
+            let setting = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                wechat_pay.set_platform_keys(user_keys.clone());
+            };
+            let (result, ()) = tokio::join!(wechat_pay.close_order("STATIC_RACE"), setting);
+            result
+        };
+        #[cfg(not(feature = "async"))]
+        let result = thread::scope(|scope| {
+            let handle = scope.spawn(|| wechat_pay.close_order("STATIC_RACE"));
+            // 等拉取确实在飞行中（mock 延迟 400ms）再灌密钥
+            thread::sleep(Duration::from_millis(100));
+            wechat_pay.set_platform_keys(user_keys.clone());
+            handle.join().expect("join")
+        });
+
+        result.expect("灌入的密钥必须能验签成功（拉取结果不得覆盖它）");
+        assert_eq!(
+            wechat_pay.platform_keys().serials(),
+            vec!["USER_SERIAL"],
+            "飞行中的拉取结果覆盖了调用方配置的密钥"
         );
     }
 }

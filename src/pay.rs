@@ -1,3 +1,4 @@
+use crate::cert::PlatformKeys;
 use crate::error::PayError;
 use crate::macros::debug;
 use crate::model::{WechatPayDecodeData, WechatPayRefundDecodeData};
@@ -8,6 +9,8 @@ use crate::{sign, util};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, USER_AGENT};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -71,7 +74,7 @@ fn build_client(timeouts: HttpTimeouts) -> Client {
 /// 字符串，位置传参写反了照样编译，要等到网关返回 401 `SIGN_ERROR`（甚至更晚）才暴露。
 ///
 /// ```no_run
-/// # use wechat_pay_rust_sdk::pay::{WechatPay, WechatPayConfig};
+/// # use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPay, WechatPayConfig};
 /// let config = WechatPayConfig {
 ///     appid: "wx123".into(),
 ///     mch_id: "1900000001".into(),
@@ -79,6 +82,7 @@ fn build_client(timeouts: HttpTimeouts) -> Client {
 ///     serial_no: "5F2C…".into(),
 ///     v3_key: "0123456789abcdef0123456789abcdef".into(),
 ///     notify_url: "https://example.com/pay/notify".into(),
+///     response_verify: ResponseVerify::Required,
 /// };
 /// let wechat_pay = WechatPay::from_config(config);
 /// # Ok::<(), std::io::Error>(())
@@ -97,6 +101,11 @@ pub struct WechatPayConfig {
     pub v3_key: String,
     /// 支付结果通知地址。
     pub notify_url: String,
+    /// 出站应答的验签开关，默认 [`ResponseVerify::Required`]。
+    ///
+    /// 没有默认值是有意的：新增它是一次**行为变更**（默认强制验签），
+    /// 让每处构造点显式写出这个选择，比留一个「忘了设就是关」的空洞安全。
+    pub response_verify: ResponseVerify,
 }
 
 // 与 `WechatPay` 同理：derive 会把私钥与 APIv3 密钥原样打进日志。
@@ -110,6 +119,64 @@ impl std::fmt::Debug for WechatPayConfig {
             .field("v3_key", &"<redacted>")
             .field("notify_url", &self.notify_url)
             .finish()
+    }
+}
+
+/// 出站应答是否验签。
+///
+/// 微信对**应答**（不只是回调）也做签名：`Wechatpay-Serial` / `-Timestamp` / `-Nonce` /
+/// `-Signature` 四个头 + `{timestamp}\n{nonce}\n{body}\n` 的验签串，用的是同一批平台
+/// 证书 / 微信支付公钥，因此回调验签的那套索引可以直接复用。
+///
+/// 默认（也是唯一推荐值）是 [`ResponseVerify::Required`]：不验签的应答等于把「这条应答
+/// 真的来自微信」这件事交给 TLS 之外的运气 —— 一个能改应答的中间层可以伪造
+/// 「订单不存在」「请求未受理」这类结论，进而诱导业务做出错误处置。
+///
+/// ⚠ [`ResponseVerify::Disabled`] **只用于**指向本地 mock 网关的离线测试，或网关确实
+/// 无法回传 `Wechatpay-*` 头且暂时无法整改的场景；生产环境关闭等于放弃这一层防护。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseVerify {
+    /// 强制验签（推荐）：2xx 应答缺任一签名头即 [`PayError::VerifyError`]。
+    Required,
+    /// 不验签：跳过应答签名校验，也不拉取平台证书。
+    Disabled,
+}
+
+/// 刷新平台证书的单飞状态。
+///
+/// 用原子量而不是异步锁：`tokio` 只开了 `time`（没有 `sync`），而且刷新是「锁外拉取、
+/// 锁内替换」，本来就不需要互斥保护整段流程 —— 只需要「同一时刻只有一个人去拉」。
+#[derive(Debug, Default)]
+pub(crate) struct RefreshState {
+    /// 是否已有刷新在飞行中。
+    pub(crate) in_flight: AtomicBool,
+    /// 上一次**尝试**刷新的 unix 秒（0 表示从未尝试）。
+    pub(crate) last_attempt: AtomicI64,
+}
+
+/// 刷新期间持有 `in_flight` 标记，`Drop` 时释放。
+///
+/// 用 RAII 而不是「拉完手动置回 false」：异步模式下这句话在 `.await` 之后，而调用方把
+/// SDK 的 Future 包进 `tokio::time::timeout` / `select!`、或直接 abort 任务时，Future 会在
+/// 那个 await 点被丢弃，手动释放的代码**永不执行** —— 标记会永久卡在 true，
+/// 之后所有需要刷新的请求（含冷启动与 12 小时窗口）都会先等满、再失败。`Drop` 在取消路径
+/// 上同样会跑。
+pub(crate) struct RefreshGuard<'a>(&'a RefreshState);
+
+impl<'a> RefreshGuard<'a> {
+    /// 抢标记；返回 `None` 表示已有刷新在飞行中。
+    pub(crate) fn acquire(state: &'a RefreshState) -> Option<Self> {
+        state
+            .in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| RefreshGuard(state))
+    }
+}
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::SeqCst);
     }
 }
 
@@ -134,6 +201,22 @@ pub struct WechatPay {
     pub(crate) retry: RetryPolicy,
     /// 退款专用重试策略，默认分钟级退避。见 [`WechatPay::with_refund_retry`]。
     pub(crate) refund_retry: RetryPolicy,
+    /// 平台证书 / 微信支付公钥的索引：出站应答验签按 `Wechatpay-Serial` 选键。
+    ///
+    /// `RwLock` 而不是 `Mutex`：读（每次验签）远多于写（12 小时一次刷新）。
+    /// ⚠ 锁内只做查表与一次 RSA 验签，**绝不跨 `.await` 持锁**（拉取在锁外完成，
+    /// 拿写锁只是为了整体替换）。
+    pub(crate) platform_keys: RwLock<PlatformKeys>,
+    /// 密钥是否由调用方提供（公钥模式 / 固定证书来源）。
+    ///
+    /// 这两种来源下 `GET /v3/certificates` 里既没有这些 key（公钥模式的公钥不在平台证书
+    /// 列表里），整体替换还会把它们抹掉 —— 所以置位后一律不自动拉取与替换。
+    /// 用原子量而不是 `bool`：`set_platform_keys(&self, …)` 需要 `&self` 下改它。
+    pub(crate) static_keys: AtomicBool,
+    /// 平台证书刷新的单飞 / 限流状态。
+    pub(crate) key_refresh: RefreshState,
+    /// 出站应答是否验签，默认 [`ResponseVerify::Required`]。
+    pub(crate) response_verify: ResponseVerify,
     /// 解析后的商户私钥（首次签名时解析一次）。
     ///
     /// PEM 解析会做密钥校验并预计算 CRT 参数，放在每次请求上既慢又只能 panic；
@@ -157,6 +240,10 @@ impl std::fmt::Debug for WechatPay {
             .field("timeouts", &self.timeouts)
             .field("retry", &self.retry)
             .field("refund_retry", &self.refund_retry)
+            // 这两项不是机密，而且是升级后排查的头号问题：
+            // 「我是不是误关了验签」「现在到底认了哪几张证书」。
+            .field("response_verify", &self.response_verify)
+            .field("platform_keys", &self.platform_keys().serials())
             .finish()
     }
 }
@@ -377,6 +464,23 @@ impl WechatPay {
         self
     }
 
+    /// 覆盖应答验签开关（默认 [`ResponseVerify::Required`]）。
+    ///
+    /// ⚠ [`ResponseVerify::Disabled`] 只适用于指向本地 mock 网关的离线测试：
+    /// 关闭后「应答真的来自微信」这件事不再被校验，能改应答的中间层可以伪造
+    /// 「订单不存在」「请求未受理」这类结论。网关（代理 / CDN）过滤了
+    /// `Wechatpay-*` 头时应当修网关，而不是关验签。
+    #[must_use]
+    pub fn with_response_verify(mut self, mode: ResponseVerify) -> Self {
+        self.response_verify = mode;
+        self
+    }
+
+    /// 当前的应答验签开关。
+    pub fn response_verify(&self) -> ResponseVerify {
+        self.response_verify
+    }
+
     /// 覆盖 HTTP 超时配置（阈值见 [`HttpTimeouts`] 的默认值）。
     ///
     /// 会重建 HTTP 客户端，因此请在启动阶段调用，不要在每请求路径上调用。
@@ -385,10 +489,11 @@ impl WechatPay {
     ///
     /// ```no_run
     /// # use std::time::Duration;
-    /// # use wechat_pay_rust_sdk::pay::{HttpTimeouts, WechatPay, WechatPayConfig};
+    /// # use wechat_pay_rust_sdk::pay::{HttpTimeouts, ResponseVerify, WechatPay, WechatPayConfig};
     /// # let wechat_pay = WechatPay::from_config(WechatPayConfig {
     /// #     appid: "a".into(), mch_id: "b".into(), private_key: "c".into(),
     /// #     serial_no: "d".into(), v3_key: "e".into(), notify_url: "f".into(),
+    /// #     response_verify: ResponseVerify::Required,
     /// # });
     /// let wechat_pay = wechat_pay.with_timeouts(HttpTimeouts {
     ///     request: Duration::from_secs(30),
@@ -413,11 +518,12 @@ impl WechatPay {
     /// **策略只控制次数与间隔；「该不该重试」由失败分类决定**，详见 [`crate::retry`]。
     ///
     /// ```no_run
-    /// # use wechat_pay_rust_sdk::pay::{WechatPay, WechatPayConfig};
+    /// # use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPay, WechatPayConfig};
     /// # use wechat_pay_rust_sdk::retry::RetryPolicy;
     /// # let wechat_pay = WechatPay::from_config(WechatPayConfig {
     /// #     appid: "a".into(), mch_id: "b".into(), private_key: "c".into(),
     /// #     serial_no: "d".into(), v3_key: "e".into(), notify_url: "f".into(),
+    /// #     response_verify: ResponseVerify::Required,
     /// # });
     /// // 只改次数，其余沿用默认
     /// let wechat_pay = wechat_pay.with_retry(RetryPolicy {
@@ -447,6 +553,65 @@ impl WechatPay {
     pub fn with_refund_retry(mut self, policy: RetryPolicy) -> Self {
         self.refund_retry = policy;
         self
+    }
+
+    /// 用**微信支付公钥**验签（公钥模式）。
+    ///
+    /// 参数顺序：`public_key_id`（商户平台下载公钥时给出的 ID，形如
+    /// `PUB_KEY_ID_0000000000000024101100397200006`）、`public_key_pem`（公钥 PEM 内容）。
+    /// 必须与微信在 `Wechatpay-Serial` 头里回传的值一致，否则选不到键。
+    ///
+    /// ⚠ 公钥模式下的公钥**不在** `GET /v3/certificates` 里（要从商户平台下载、自行更新），
+    /// 所以这个客户端进入**静态密钥模式**：不会自动拉取、也不会自动替换密钥 ——
+    /// 平台证书列表里没有这张公钥，拉取后的整体替换会把它抹掉。轮换要自己更新
+    /// （[`WechatPay::set_platform_keys`] 再设一次，或重建客户端）。
+    #[must_use]
+    pub fn with_platform_public_key(
+        self,
+        public_key_id: impl Into<String>,
+        public_key_pem: impl Into<String>,
+    ) -> Self {
+        let mut keys = PlatformKeys::new();
+        keys.insert(public_key_id, public_key_pem);
+        self.set_platform_keys(keys);
+        self
+    }
+
+    /// 当前平台密钥索引的快照（`serial_no -> 公钥 PEM`）。
+    ///
+    /// 用途是排查「到底认了哪几张证书」（轮换期正常是 2 张），不适合放进每请求路径：
+    /// 每次调用都会拷一份索引。
+    pub fn platform_keys(&self) -> PlatformKeys {
+        self.platform_keys_read().clone()
+    }
+
+    /// 直接设置平台密钥索引，并进入**静态密钥模式**（测试、固定证书、自建密钥源）。
+    ///
+    /// 静态模式下：不会自动拉取 `/v3/certificates`、不会用拉取结果替换你设置的索引。
+    /// 代价是轮换要你自己更新 —— 对公钥模式（[`WechatPay::with_platform_public_key`]）
+    /// 而言这是唯一正确的语义，因为公钥根本不在平台证书列表里。
+    pub fn set_platform_keys(&self, keys: PlatformKeys) {
+        *self.platform_keys_write() = keys;
+        self.static_keys.store(true, Ordering::SeqCst);
+    }
+
+    /// 读锁；锁中毒不 panic（中毒只说明持锁线程 panic 过，索引本身仍然可用）。
+    pub(crate) fn platform_keys_read(&self) -> std::sync::RwLockReadGuard<'_, PlatformKeys> {
+        self.platform_keys
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 写锁；中毒处理同 [`WechatPay::platform_keys_read`]。
+    pub(crate) fn platform_keys_write(&self) -> std::sync::RwLockWriteGuard<'_, PlatformKeys> {
+        self.platform_keys
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 是否允许自动拉取平台证书（静态密钥模式下为 `false`）。
+    pub(crate) fn auto_refresh_keys(&self) -> bool {
+        !self.static_keys.load(Ordering::SeqCst)
     }
 
     /// 当前的通用重试策略。
@@ -487,7 +652,7 @@ impl WechatPay {
     /// 网关默认 `https://api.mch.weixin.qq.com`，用 [`WechatPay::with_base_url`] 覆盖。
     ///
     /// ```no_run
-    /// # use wechat_pay_rust_sdk::pay::{WechatPay, WechatPayConfig};
+    /// # use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPay, WechatPayConfig};
     /// let wechat_pay = WechatPay::from_config(WechatPayConfig {
     ///     appid: "wx123".into(),
     ///     mch_id: "1900000001".into(),
@@ -495,6 +660,7 @@ impl WechatPay {
     ///     serial_no: "5F2C…".into(),
     ///     v3_key: "32 字节的 APIv3 密钥".into(),
     ///     notify_url: "https://example.com/pay/notify".into(),
+    ///     response_verify: ResponseVerify::Required,
     /// });
     /// # Ok::<(), std::io::Error>(())
     /// ```
@@ -512,6 +678,10 @@ impl WechatPay {
             timeouts,
             retry: RetryPolicy::default(),
             refund_retry: RetryPolicy::for_refund(),
+            platform_keys: RwLock::new(PlatformKeys::new()),
+            static_keys: AtomicBool::new(false),
+            key_refresh: RefreshState::default(),
+            response_verify: config.response_verify,
             parsed_key: std::sync::OnceLock::new(),
         }
     }
@@ -549,6 +719,8 @@ impl WechatPay {
             serial_no,
             v3_key,
             notify_url,
+            // 环境变量这条路没有「关掉验签」的开关：默认必须是强制的。
+            response_verify: ResponseVerify::Required,
         })
     }
 
@@ -606,7 +778,7 @@ impl WechatPay {
 
 #[cfg(test)]
 mod tests {
-    use crate::pay::{PayNotifyTrait, WechatPay, WechatPayConfig, WechatPayTrait};
+    use crate::pay::{PayNotifyTrait, ResponseVerify, WechatPay, WechatPayConfig, WechatPayTrait};
     use dotenvy::dotenv;
     use rsa::pkcs8::DecodePublicKey;
     use rsa::sha2::{Digest, Sha256};
@@ -634,6 +806,7 @@ mod tests {
             serial_no: String::new(),
             v3_key: String::new(),
             notify_url: String::new(),
+            response_verify: ResponseVerify::Required,
         });
         let sign_str = wechat_pay.rsa_sign("hello").expect("签名必须成功");
         debug!("sign_str: {}", sign_str);

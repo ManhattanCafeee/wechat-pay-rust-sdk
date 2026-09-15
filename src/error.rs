@@ -107,13 +107,17 @@ impl PayError {
     ///
     /// `false` 表示可以确定微信没有受理这次请求：连接根本没建立起来（连接被拒 /
     /// 连接超时），微信明确说未受理（429 / 500 / 502 / 503、`SYSTEM_ERROR`），
-    /// 或者是签名 / 解密 / 验签这类本地错误。
+    /// 或者是签名 / 解密 / 请求体编码这类**本地**错误。
     ///
-    /// ⚠ 两类容易被想当然的边界，都刻意偏保守：
+    /// ⚠ 三类容易被想当然的边界，都刻意偏保守：
     ///
     /// - **HTTP 202** 是「已接受请求，但尚未处理」，官方要求「请使用原参数重复请求
     ///   一遍」—— 它返回 `true`。请求已经被接收，可能随后生效。
     /// - **响应体解析失败**也返回 `true`：响应都回来了，说明请求早已送达。
+    /// - **应答验签失败**（[`PayError::VerifyError`] / [`PayError::UnknownPlatformSerial`] /
+    ///   [`PayError::StaleNotify`]）同样返回 `true`：应答是**完整收到之后**才验签的，
+    ///   而且官方会在极少数应答里故意下发错误签名来探测商户的验签实现 ——
+    ///   这个失败与被处理与否无关。若按 `false` 处理，写接口可能被换个单号重开。
     ///
     /// 判错的方向性代价并不对称 —— 多判成 `true` 只是让调用方多查一次单（`ORDER_NOT_EXIST`
     /// 会如实告诉他没这回事），漏判成 `false` 则可能诱导他换个单号重新下单。
@@ -153,22 +157,44 @@ impl PayError {
     /// 代理返回的 `{"status":403,"msg":"..."}` 会变成一个三个字段全为 `None` 的
     /// `ErrorResponse`，唯一的排查线索（原始文本）就被静默丢弃了。
     pub(crate) fn api_error(status: u16, body: &str) -> Self {
-        let parsed = serde_json::from_str::<ErrorResponse>(body)
-            .ok()
-            .filter(|r| r.code.is_some() || r.message.is_some() || r.detail.is_some());
+        PayError::ApiError {
+            status,
+            response: parse_error_response(body),
+        }
+    }
 
-        let response = parsed.unwrap_or_else(|| ErrorResponse {
-            code: None,
-            message: Some(truncate_raw_body(body)),
-            detail: None,
+    /// 同 [`PayError::api_error`]，但给 `message` 打上 `[未验签]` 标记。
+    ///
+    /// 用于「5xx 且没有签名头」这一类：链路（CDN / 反向代理 / WAF）过滤了
+    /// `Wechatpay-*` 头，此时既不能验签、也不该把响应丢掉 —— 5xx 的错误体里没有
+    /// 可被对手用来误判业务的语义，而把它变成 `VerifyError` 会把「自动重试」变成
+    /// 「不重试」。标记保留 `code` / `detail`，因此 [`crate::retry::classify`] 的
+    /// `SYSTEM_ERROR` 判定不受影响。
+    pub(crate) fn api_error_unverified(status: u16, body: &str) -> Self {
+        let mut response = parse_error_response(body);
+        response.message = Some(match response.message.take() {
+            Some(message) => format!("[未验签] {message}"),
+            None => "[未验签]".to_string(),
         });
-
         PayError::ApiError { status, response }
     }
 }
 
+/// 把响应体解析成微信的错误结构；不是微信形状时把原文截断后放进 `message`。
+fn parse_error_response(body: &str) -> ErrorResponse {
+    let parsed = serde_json::from_str::<ErrorResponse>(body)
+        .ok()
+        .filter(|r| r.code.is_some() || r.message.is_some() || r.detail.is_some());
+
+    parsed.unwrap_or_else(|| ErrorResponse {
+        code: None,
+        message: Some(truncate_raw_body(body)),
+        detail: None,
+    })
+}
+
 /// 截断过长的响应体并明确标注截断，空响应体给出显式标记。
-fn truncate_raw_body(body: &str) -> String {
+pub(crate) fn truncate_raw_body(body: &str) -> String {
     if body.is_empty() {
         return "<empty body>".to_string();
     }

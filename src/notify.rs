@@ -44,6 +44,63 @@ use crate::error::PayError;
 /// 「如果时间戳与当前时间的偏差超过5分钟，您应拒绝处理当前的响应或回调通知」。
 pub const MAX_TIMESTAMP_SKEW_SECS: i64 = 5 * 60;
 
+/// 校验 `Wechatpay-Timestamp` 与当前时间的偏差是否在 ±[`MAX_TIMESTAMP_SKEW_SECS`] 内。
+///
+/// 回调（[`PlatformKeys::verify_notify`]）与**出站应答**的验签（`WechatPay::verify_response`）
+/// 共用这一份实现 —— 应答验签不允许另写一份：这段算术曾经出过事
+/// （`Wechatpay-Timestamp` 是**未鉴权输入**，且在验签之前就被解析成整数，
+/// `i64::MIN` 会让 `now - signed_at` 算术溢出，开启 overflow-checks 的构建里直接 panic）。
+pub(crate) fn check_timestamp_skew(timestamp: &str, now_unix_secs: i64) -> Result<(), PayError> {
+    let signed_at: i64 = timestamp.parse().map_err(|_| {
+        PayError::StaleNotify(format!("Wechatpay-Timestamp 不是整数秒: {timestamp}"))
+    })?;
+
+    // 用无符号距离比较：`now - signed_at` 在 signed_at 取 i64::MIN 时会算术溢出。
+    let skew = now_unix_secs.abs_diff(signed_at);
+    if skew > MAX_TIMESTAMP_SKEW_SECS.unsigned_abs() {
+        return Err(PayError::StaleNotify(format!(
+            "时间戳偏差 {skew}s 超出 ±{MAX_TIMESTAMP_SKEW_SECS}s，判定为重放（timestamp={timestamp}, now={now_unix_secs}）"
+        )));
+    }
+    Ok(())
+}
+
+/// 四个验签头的 HTTP 头名：`(小写名, 规范写法)`。
+///
+/// 顺序与 [`NotifyHeaders::new`] 的参数顺序一致（serial / timestamp / nonce / signature）。
+const SIGNATURE_HEADERS: [(&str, &str); 4] = [
+    ("wechatpay-serial", "Wechatpay-Serial"),
+    ("wechatpay-timestamp", "Wechatpay-Timestamp"),
+    ("wechatpay-nonce", "Wechatpay-Nonce"),
+    ("wechatpay-signature", "Wechatpay-Signature"),
+];
+
+/// 从**应答**的请求头里取出四个签名头。
+///
+/// 返回 `Err(缺失的头名)` —— 缺头由调用方按状态码处置（2xx 拒绝、5xx 放行并标记）。
+/// 非 UTF-8 的头值**视为缺失**：宁可拒绝，也不要拿替换字符去验签。
+pub(crate) fn response_signature_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<NotifyHeaders, Vec<&'static str>> {
+    let mut missing = Vec::new();
+    let mut values: [String; 4] = Default::default();
+    for (slot, (lowercase, display)) in values.iter_mut().zip(SIGNATURE_HEADERS) {
+        match headers
+            .get(lowercase)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+        {
+            Some(value) => *slot = value,
+            None => missing.push(display),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    let [serial, timestamp, nonce, signature] = values;
+    Ok(NotifyHeaders::new(serial, timestamp, nonce, signature))
+}
+
 /// 微信回调（及应答）的验签请求头。
 #[derive(Debug, Clone)]
 pub struct NotifyHeaders {
@@ -131,22 +188,7 @@ impl PlatformKeys {
         body: &str,
         now_unix_secs: i64,
     ) -> Result<(), PayError> {
-        let signed_at: i64 = headers.timestamp.parse().map_err(|_| {
-            PayError::StaleNotify(format!(
-                "Wechatpay-Timestamp 不是整数秒: {}",
-                headers.timestamp
-            ))
-        })?;
-
-        // 用无符号距离比较：`now - signed_at` 在 signed_at 取 i64::MIN 时会算术溢出，
-        // 而这个请求头在验签之前就被解析 —— 也就是未鉴权输入不能把进程打崩。
-        let skew = now_unix_secs.abs_diff(signed_at);
-        if skew > MAX_TIMESTAMP_SKEW_SECS.unsigned_abs() {
-            return Err(PayError::StaleNotify(format!(
-                "时间戳偏差 {skew}s 超出 ±{MAX_TIMESTAMP_SKEW_SECS}s，判定为重放（timestamp={}, now={now_unix_secs}）",
-                headers.timestamp
-            )));
-        }
+        check_timestamp_skew(&headers.timestamp, now_unix_secs)?;
 
         self.verify(
             &headers.serial,

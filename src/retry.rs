@@ -241,19 +241,28 @@ pub(crate) fn classify(err: &PayError) -> Option<Delivery> {
         // 必然已经送到微信 —— 按「可能已生效」处理。
         // 这个方向判错只会让调用方多查一次单；反方向判错可能导致重复下单。
         PayError::JsonError(_) => Some(Delivery::Processed),
-        // 签名、解密、Base64、验签失败等本地错误：重试结果一样，也不可能已生效。
-        //
-        // ⚠ 这里刻意**逐个列出**而不是 `_ => None`：`None` 同时意味着
-        // 「不重试」与 `may_have_taken_effect() == false`，后者被文档描述为
-        // 「可以确定微信没有受理这次请求」。新增 `PayError` 变体时若落进通配分支，
-        // 就会静默拿到这个危险结论 —— 让编译器逼着人做决定。
+        // 签名、解密、Base64 等本地错误：请求根本没发出去，重试结果一样。
         PayError::SignError(_)
         | PayError::DecryptError(_)
         | PayError::DecodeError(_)
-        | PayError::VerifyError(_)
-        | PayError::WeixinNotFound
+        | PayError::WeixinNotFound => None,
+        // 验签类错误（回调验签、**出站应答**验签、选键、超窗）：同样不重试，但**已经收到
+        // 应答**了 —— 与上面的 `JsonError` 同类，按「可能已生效」处理。
+        //
+        // ⚠ 这里刻意**不**落进 `None`：`None` 同时意味着「不重试」与
+        // `may_have_taken_effect() == false`，后者被文档描述为「可以确定微信没有受理
+        // 这次请求」。出站应答验签失败时这个结论是**错的**：
+        //
+        // * 应答都完整回来了，说明请求早已送达微信（响应体读一半断连都算「已处理」）；
+        // * 官方明确会在极少数应答里下发错误签名（`WECHATPAY/SIGNTEST/`）来探测商户的
+        //   验签实现 —— 也就是说「验签失败」在生产中是预期事件，且与被处理与否无关；
+        // * 最常见的真实原因是证书轮换：那一刻的应答是真的，订单**已经建了**。
+        //
+        // 对写接口（下单 / 关单 / 退款）判 `false` 会诱导调用方换个单号重开 —— 正是
+        // [`PayError::may_have_taken_effect`] 那套取舍要避免的方向。
+        PayError::VerifyError(_)
         | PayError::UnknownPlatformSerial(_)
-        | PayError::StaleNotify(_) => None,
+        | PayError::StaleNotify(_) => Some(Delivery::Processed),
     }
 }
 
@@ -401,10 +410,9 @@ mod tests {
             // 参数 / 权限 / 资源类错误：重试不会有不同结果
             api(400),
             api(404),
-            // 本地错误：验签、选键
+            // 本地错误：请求根本没发出去
             PayError::WeixinNotFound,
-            PayError::VerifyError("bad signature".into()),
-            PayError::UnknownPlatformSerial("SERIAL".into()),
+            PayError::SignError("bad key".into()),
         ] {
             assert!(
                 !err.may_have_taken_effect(),
@@ -414,6 +422,29 @@ mod tests {
         // 「结果未知」的两类由集成测试用真实 HTTP 场景覆盖：
         //   tests/offline.rs::write_timeout_is_not_retried_but_read_timeout_is
         //   tests/offline.rs::response_body_that_dies_midway_is_never_retried
+    }
+
+    #[test]
+    fn verification_failures_do_not_retry_but_may_have_taken_effect() {
+        // 应答**已经完整收到**才谈得上验签失败 —— 请求必然已送达微信，且官方会故意
+        // 下发带错误签名的探测应答。这里必须与「响应体解析失败」同判为 `true`：
+        // 判 `false`（= 可以确定微信没有受理）会诱导写接口换个单号重开。
+        for err in [
+            PayError::VerifyError("bad signature".into()),
+            PayError::UnknownPlatformSerial("SERIAL".into()),
+            PayError::StaleNotify("stale".into()),
+        ] {
+            assert!(
+                err.may_have_taken_effect(),
+                "{err} 是「已收到应答但没通过验签」，不能当成「确定没发生」"
+            );
+            assert_eq!(
+                classify(&err),
+                Some(Delivery::Processed),
+                "{err} 必须归为「已处理」：不重试，但可能已生效"
+            );
+            assert_eq!(err.kind(), crate::error::ErrorKind::Local);
+        }
     }
 
     #[test]

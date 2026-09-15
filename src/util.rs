@@ -78,11 +78,17 @@ pub fn x509_to_pem(content: &[u8]) -> Result<String, Box<dyn Error>> {
 
 /// 返回 `(证书当前是否有效, not_after 的 unix 秒时间戳)`。
 ///
-/// 配合 [`crate::cert::PlatformKeys::needs_refresh`] 判断平台证书是否该更新。
-pub fn x509_is_valid(content: &[u8]) -> Result<(bool, i64), Box<dyn Error>> {
-    let pem = pem::parse(content)?;
-    let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())?;
-    //读取到证书的有效期
+/// 用于平台证书的到期过滤：`GET /v3/certificates` 的响应里可能带着已过期的证书
+/// （轮换期新旧两张都在有效期内时两张都会保留，过期的则应当丢弃）。
+///
+/// 解析失败返回 [`PayError::VerifyError`]：与库其余错误类型一致，调用方可以直接 `?`。
+pub fn x509_is_valid(content: &[u8]) -> Result<(bool, i64), PayError> {
+    fn invalid(error: impl std::fmt::Display) -> PayError {
+        PayError::VerifyError(format!("平台证书解析失败: {error}"))
+    }
+    let pem = pem::parse(content).map_err(invalid)?;
+    let (_, cert) = x509_parser::parse_x509_certificate(pem.contents()).map_err(invalid)?;
+    // 读取到证书的有效期
     let expire_time = cert.validity().is_valid();
     Ok((expire_time, cert.validity.not_after.timestamp()))
 }

@@ -2,11 +2,11 @@
 
 微信支付 APIv3 的 Rust SDK（**社区维护，非腾讯官方**）。
 
-> **这是 fork，不是上游，也未发布到 crates.io。** 当前版本 `0.3.0`，相对上游 `0.2.21`
+> **这是 fork，不是上游，也未发布到 crates.io。** 当前版本 `0.4.0`，相对上游 `0.2.21`
 > 含破坏性改动（见 [CHANGELOG](CHANGELOG.md)）。请按「引入依赖」用 **git 或 path** 引入。
 
 覆盖：JSAPI / Native / APP / H5 / 付款码下单、申请退款、订单查询、关单、退款查询、
-平台证书获取与轮换、支付回调的验签与解密。
+平台证书获取与轮换、支付回调的验签与解密、**出站应答验签（默认强制）**。
 
 [![QQ群](https://img.shields.io/badge/QQ%E7%BE%A4-799168925-blue)](http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=dLoye8pBcO60zGzqLjGO0l-GgMIaf6wQ&authKey=LfxBdZ5A%2F9eWJbKpzTcuWPjmQu5UdIJ3TVTpqRAQYkCID50WLkYoIXcGxGKzupG3&noverify=0&group_code=799168925)
 
@@ -26,6 +26,7 @@
   - [退款申请](#退款申请)
   - [订单查询 / 关单 / 退款查询](#订单查询--关单--退款查询)
   - [回调通知：验签与防重放](#回调通知验签与防重放)
+  - [应答验签（默认强制）](#应答验签默认强制)
   - [平台证书轮换](#平台证书轮换)
   - [错误处理](#错误处理)
   - [超时与连接复用](#超时与连接复用)
@@ -38,8 +39,10 @@
 
 ```toml
 # 方式一：git —— 建议固定 tag，避免跟随 main 漂移导致构建不可复现
-#   需先把本仓库 push 到 remote，并打上 tag v0.3.0
-wechat-pay-rust-sdk = { git = "https://github.com/ManhattanCafeee/wechat-pay-rust-sdk", tag = "v0.3.0" }
+#   需先把本仓库 push 到 remote，并打上 tag v0.4.0
+#   ⚠ 不要用 v0.3.0：那是 `WechatPay::new(...)` 时代的 tag，与本文档示例
+#     （`WechatPayConfig` / `from_config`）对不上。要钉提交号就写 rev = "<commit>"。
+wechat-pay-rust-sdk = { git = "https://github.com/ManhattanCafeee/wechat-pay-rust-sdk", tag = "v0.4.0" }
 
 # 方式二：path —— 适合边改 SDK 边调业务代码
 wechat-pay-rust-sdk = { path = "../wechat-pay-rust-sdk" }
@@ -51,7 +54,7 @@ wechat-pay-rust-sdk = { path = "../wechat-pay-rust-sdk", features = ["async"] }
 wechat-pay-rust-sdk = { path = "../wechat-pay-rust-sdk", features = ["debug-print"] }
 ```
 
-> ⚠ **不要**写成 `wechat-pay-rust-sdk = "0.3.0"` —— 该名字在 crates.io 属于上游（最高 `0.2.21`），
+> ⚠ **不要**写成 `wechat-pay-rust-sdk = "0.4.0"` —— 该名字在 crates.io 属于上游（最高 `0.2.21`），
 > 这句话要么解析到**上游代码**、要么直接解析失败，两种情况都拿不到本 fork 的修复。
 >
 > MSRV 1.89（edition 2024）。
@@ -349,6 +352,9 @@ xxxx...
 ## 签名验证
 使用上面的公钥用来验签
 > 平台的证书有时效性，请及时检测并下载最新的证书并替换本地公钥。
+>
+> ⚠ 本节讲的是**手工验签**（回调场景）。**出站请求的应答验签由 SDK 自动完成**，
+> 默认强制，见「应答验签」一节 —— 那里不需要你手工传公钥。
 
 ```rust
 use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
@@ -489,15 +495,93 @@ let data = wechat_pay.decrypt_paydata(ciphertext, nonce, associated_data)?;
 遇到 `PayError::UnknownPlatformSerial` 说明微信正在轮换证书 ——
 **立即重新拉取**证书列表再重试，不要拿别的密钥去试。
 
+## 应答验签（默认强制）
+
+微信不只给回调签名：**每个应答**都带 `Wechatpay-Serial` / `Wechatpay-Timestamp` /
+`Wechatpay-Nonce` / `Wechatpay-Signature` 四个头（验签串是 `{时间戳}\n{随机串}\n{应答体}\n`，
+与回调用的是同一批平台证书 / 微信支付公钥）。本 SDK 默认**强制**校验它 —— 不验签的应答
+等于把「这条应答真的来自微信」交给链路运气：一个能改应答的中间层可以伪造 `ORDER_NOT_EXIST`、
+「请求未受理」这类结论，而调用方在超时兜底时正是靠它们决定要不要换个单号重开。
+
+```rust
+use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPayConfig};
+
+let config = WechatPayConfig {
+    appid: "wx123".into(),
+    mch_id: "1900000001".into(),
+    private_key: private_key_pem,
+    serial_no: "5F2C…".into(),
+    v3_key: "0123456789abcdef0123456789abcdef".into(),
+    notify_url: "https://example.com/pay/notify".into(),
+    response_verify: ResponseVerify::Required, // 默认行为，也是唯一推荐值
+};
+```
+
+调用方不需要额外做什么：SDK 在首个请求前自动拉取平台证书（冷启动），之后按 12 小时窗口
+刷新；遇到没见过的 `Wechatpay-Serial`（轮换期）会**刷新一次平台证书后重验** ——
+重验用的是**已经收到的那份响应**，不会重发业务请求。
+
+四条必须记住的：
+
+1. **升级后若所有请求都报「缺少签名头」** —— 先查你的代理 / CDN 是否过滤了 `Wechatpay-*` 头
+   （官方文档承认这是常见现象，建议改代理配置或直连），**不要**因此关掉验签。
+2. **`ResponseVerify::Disabled` 只用于本地 mock 网关**，或网关暂时无法整改的场景；
+   关掉之后应答不再被校验，也没有自动拉取密钥。
+3. **验签失败不重试，但按「可能已生效」处置**：应答是**完整收到之后**才验签的，而且微信会
+   故意在极少数应答里下发带 `WECHATPAY/SIGNTEST/` 前缀的错误签名来探测验签实现。
+   拿到 `VerifyError` / `UnknownPlatformSerial` / `StaleNotify` 时
+   `may_have_taken_effect()` 返回 `true` —— 写接口应当先去查单。
+4. **微信支付公钥模式**（`Wechatpay-Serial` 形如 `PUB_KEY_ID_…`）必须自己配置公钥，
+   它**不在**平台证书列表里，刷新也拿不到：
+
+   ```rust
+   let wechat_pay = wechat_pay.with_platform_public_key(
+       "PUB_KEY_ID_0000000000000024101100397200006", // 商户平台给出的公钥 ID
+       std::fs::read_to_string("wechat_pay_public_key.pem")?,
+   );
+   ```
+
+   配置后客户端进入**静态密钥模式**：不自动拉取、不自动替换，公钥更新时再设一次。
+
+5. **排查两种「全部请求都失败」**：
+   - 报「缺少签名头」→ 查代理 / CDN 是否过滤 `Wechatpay-*` 头（见上）；
+   - 报 `StaleNotify`（时间戳偏差超 ±300s）→ 先**校时**（NTP）。应答验签用的是与回调
+     同一个 5 分钟窗口，主机时钟漂移会让每条应答都被判成超窗，而错误消息里的
+     「判定为重放」只是措辞 —— 先对时，别急着当成攻击。
+
+非 2xx 的处理（有签名头就一定验，验不过就返回验签错误）：
+
+| 应答 | 缺签名头时 |
+| --- | --- |
+| 2xx | **拒绝**（`VerifyError`）—— 包括关单的 204：空 body 的验签串是 `{时间戳}\n{随机串}\n\n`，微信照签 |
+| 4xx | **拒绝**（`VerifyError`，消息里带状态码与原始 body）—— 这类应答的 `code` 会被当成业务结论，不能让它来自无法验证的来源 |
+| 5xx | **放行**，但错误消息标注 `[未验签]`：5xx 不含可被误判的业务语义（伪造它只能诱发重试），而严格拒绝会把 CDN / 网关的 5xx 从「自动重试」变成「不重试」 |
+
+> 残余风险：应答签名只覆盖 **时间戳 / 随机串 / 应答体**，**不绑定请求**，所以 5 分钟窗口内
+> 抓到的真实应答理论上可被重放（对当前端点集，重放成功应答不会改变状态）。
+> 这与回调的取舍一致：窗口 + 签名，不解决「网络层被完全接管」。
+
 ## 平台证书轮换
 
 轮换期微信会**同时下发新旧两张都在有效期内**的平台证书，所以必须按请求头
 `Wechatpay-Serial` 选键。写死单张证书会让轮换期的回调验签全部失败 —— 也就是订单不发货。
 
-`PlatformKeys` 就是 `serial_no -> 公钥 PEM` 的索引；`fetch_platform_keys()`
-每次返回**全新**的索引，调用方应整体替换而不是逐条合并。
-官方要求至少每 12 小时刷新一次，`PlatformKeys::needs_refresh(now)` 按
-`REFRESH_INTERVAL_SECS` 帮你判断。
+`PlatformKeys` 就是 `serial_no -> 公钥 PEM` 的索引（已过期的证书会被丢弃）：
+
+- **出站应答验签**：索引由 SDK 自己维护 —— 首个请求前自动拉取，之后按 12 小时窗口刷新，
+  遇到未知 serial 立即刷新一次后重验。想看当前认了哪几张：
+  `wechat_pay.platform_keys().serials()`。
+- **回调验签**：用你自己持有的索引（`fetch_platform_keys()` 每次返回**全新**的索引，
+  调用方应整体替换而不是逐条合并），或在回调里取 `wechat_pay.platform_keys()` 快照。
+  拿到 `UnknownPlatformSerial` 说明微信正在轮换证书：调
+  `wechat_pay.refresh_platform_keys_for_unknown_serial(&serial)` 刷新后重验 ——
+  ⚠ **不要**在回调里用不带限流的 `refresh_platform_keys()`：回调的 serial 是未鉴权输入，
+  伪造一个就能触发刷新，那等于把证书接口（官方要求 12 小时一次）变成放大器。
+  （`example/` 的回调实现就是这么写的。）
+- 官方要求至少每 12 小时刷新一次；`PlatformKeys::needs_refresh(now)` 按
+  `REFRESH_INTERVAL_SECS` 帮你判断。⚠ 用 `set_platform_keys` /
+  `with_platform_public_key` 设置的索引属于**调用方负责**：SDK 不会自动拉取或替换它
+  （否则会把公钥模式配置的公钥抹掉）。
 
 ## 错误处理
 
@@ -523,7 +607,7 @@ match wechat_pay.jsapi_pay(params).await {
                 );
             }
         }
-        // 本地错误：签名、解密、JSON 解析、验签失败、回调超窗 —— 通常要告警。
+        // 本地错误：签名、解密、JSON 解析、验签失败（含应答验签）、回调超窗 —— 通常要告警。
         ErrorKind::Local => { /* … */ }
     },
 }
@@ -531,6 +615,11 @@ match wechat_pay.jsapi_pay(params).await {
 
 `response.detail` 是微信的字段级定位信息（例如 `/payer/openid`），
 而 `Display` 会把它一起渲染出来 —— 日志外发前记得脱敏。
+
+⚠ **应答验签失败会改变这两层的边界**（默认开启）：无签名头的 4xx 会变成
+`VerifyError`（`Local`）而不是 `ApiError` —— 此时**拿不到** `response.code`，
+必须按「结果未知」处置（查单 / 告警），**不要**当成「订单不存在」。
+无签名头的 5xx 仍是 `ApiError`，但消息里带 `[未验签]` 标记。详见「应答验签」一节。
 
 ## 超时与连接复用
 
@@ -566,6 +655,11 @@ let wechat_pay = wechat_pay.with_timeouts(HttpTimeouts {
 | 已受理、未处理完 | 202 | **已收到**，只是还没处理完 | 重试 | **重试** |
 | 结果未知 | 读写超时、504 等官方未定义的 5xx | **可能已处理** | 重试 | **不重试** |
 | 已处理 | 响应体没读完就断连 | 处理过了 | 不重试 | 不重试 |
+| 应答验签失败 | 签名错 / 缺签名头 / 未知 serial / 超窗 | 应答**已收到** | 不重试 | 不重试 |
+
+⚠ **应答验签失败不重试，但 `may_have_taken_effect()` 返回 `true`**：应答都完整回来了，
+说明请求早已送达微信，而且微信会故意下发错误签名探测验签实现 —— 判成「确定没发生」会
+诱导调用方换个单号重开。缺签名头的 5xx 是唯一例外：它被放行成 `ApiError`，因此照上表重试。
 
 上表的措辞直接来自微信官方 HTTP 状态码页：429 是「**请求未受理**」，502/503 是
 「**请求无法处理**」，各接口的 500 都写「**请用相同参数重新调用**」，202 则是

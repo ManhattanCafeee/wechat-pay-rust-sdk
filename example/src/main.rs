@@ -18,7 +18,7 @@
 
 use actix_web::web::{Bytes, Data};
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, post};
-use wechat_pay_rust_sdk::cert::PlatformKeys;
+use wechat_pay_rust_sdk::error::PayError;
 use wechat_pay_rust_sdk::model::{WechatPayDecodeData, WechatPayNotify};
 use wechat_pay_rust_sdk::notify::NotifyHeaders;
 use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
@@ -36,12 +36,7 @@ fn fail(message: impl std::fmt::Display) -> HttpResponse {
 ///
 /// ⚠ 官方要求 **5 秒内**应答，所以真实的落库/发货必须异步化，不要在这个函数里同步做完。
 #[post("/pay/notify")]
-async fn pay_notify(
-    req: HttpRequest,
-    body: Bytes,
-    keys: Data<PlatformKeys>,
-    wechat_pay: Data<WechatPay>,
-) -> HttpResponse {
+async fn pay_notify(req: HttpRequest, body: Bytes, wechat_pay: Data<WechatPay>) -> HttpResponse {
     // ① 提取四个验签请求头（缺任意一个都会返回 Err）。
     let headers = match NotifyHeaders::from_pairs(
         req.headers()
@@ -59,10 +54,7 @@ async fn pay_notify(
     };
 
     // ② 验签三步：时间戳新鲜度（±300s）→ 按 Wechatpay-Serial 选键 → 验签。
-    if let Err(err) = keys.verify_notify(&headers, raw_body) {
-        // ⚠ 生产代码在这里应当区分两种情况：
-        //   UnknownPlatformSerial = 微信正在轮换平台证书，**立即重新拉取**再重试一次；
-        //   StaleNotify            = 疑似重放，直接拒绝并告警。
+    if let Err(err) = verify_notify_with_refresh(&wechat_pay, &headers, raw_body).await {
         return fail(err);
     }
 
@@ -89,6 +81,36 @@ async fn pay_notify(
     HttpResponse::NoContent().finish()
 }
 
+/// 回调验签，含证书轮换兜底。
+///
+/// 索引取的是客户端当前的快照（`WechatPay` 自己维护并按 12 小时刷新）；
+/// 拿到 `UnknownPlatformSerial` 说明微信正在轮换平台证书 —— **立即重新拉取**再验一次，
+/// 不要拿别的密钥去试。
+///
+/// ⚠ 这里必须用 `refresh_platform_keys_for_unknown_serial` 而不是
+/// `refresh_platform_keys`：回调里的 `Wechatpay-Serial` 是**未鉴权输入**，伪造一个就能
+/// 触发刷新；那个入口带 60s 最小间隔（与 SDK 内部对出站应答的处理一致），
+/// 无节流等于把 `/v3/certificates` 变成可被外部触发的放大器。
+///
+/// ⚠ 出站请求的应答验签由 SDK 自己做（默认强制，含同一条轮换兜底路径），
+/// 这里处理的是**回调**方向，两者不共用调用点。
+async fn verify_notify_with_refresh(
+    wechat_pay: &WechatPay,
+    headers: &NotifyHeaders,
+    raw_body: &str,
+) -> Result<(), PayError> {
+    match wechat_pay.platform_keys().verify_notify(headers, raw_body) {
+        Err(PayError::UnknownPlatformSerial(serial)) => {
+            wechat_pay
+                .refresh_platform_keys_for_unknown_serial(&serial)
+                .await?;
+            wechat_pay.platform_keys().verify_notify(headers, raw_body)
+        }
+        // StaleNotify = 疑似重放，直接拒绝并告警；其余错误原样交给调用方。
+        other => other,
+    }
+}
+
 /// 业务落库的占位实现 —— 真实项目请换成「幂等写库 + 异步发货」。
 fn handle_payment(data: &WechatPayDecodeData) {
     tracing::info!(
@@ -106,27 +128,21 @@ async fn main() -> std::io::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    // 启动时拉一次平台证书。之后应当按 `PlatformKeys::needs_refresh` 定时刷新
-    // （官方要求至少每 12 小时一次），并在验签拿到 `UnknownPlatformSerial` 时立即重拉。
+    // 启动时预热平台证书：`refresh_platform_keys` 会把索引装进客户端（出站应答验签
+    // 用的就是它），同时返回一份快照 —— 用来记日志、以及让凭证错误在启动时就暴露。
+    // 之后 SDK 自己按 12 小时窗口刷新，并在遇到未知 `Wechatpay-Serial` 时刷新后重验。
     let bootstrap = WechatPay::from_env();
-    let mut keys = bootstrap
-        .fetch_platform_keys()
+    let keys = bootstrap
+        .refresh_platform_keys()
         .await
         .expect("拉取平台证书失败：检查商户证书、证书序列号与 APIv3 密钥");
-    // 记录拉取时间 —— 不记的话 `needs_refresh` 永远返回 true，刷新循环会每轮重拉一次。
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("系统时间早于 Unix 纪元")
-        .as_secs() as i64;
-    keys.mark_refreshed(now);
     tracing::info!(count = keys.len(), serials = ?keys.serials(), "已加载平台密钥");
 
-    // `WechatPay` 不实现 Clone（它持有连接池），所以每个 worker 各建一份；
-    // 证书索引是只读的，直接 clone 即可。
+    // `WechatPay` 不实现 Clone（它持有连接池），所以每个 worker 各建一份 ——
+    // 各 worker 会在自己的首个请求前各自完成一次冷启动拉取。
     HttpServer::new(move || {
         App::new()
             .app_data(Data::new(WechatPay::from_env()))
-            .app_data(Data::new(keys.clone()))
             .service(pay_notify)
     })
     .bind(("0.0.0.0", 8080))?
