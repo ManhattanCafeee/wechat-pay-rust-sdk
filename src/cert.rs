@@ -646,6 +646,10 @@ impl WechatPay {
 mod tests {
     use super::*;
 
+    /// `util::rsa_pem_parse_count()` 是**进程级全局计数**,而 cargo 默认并行跑测试 ——
+    /// 断言「同一把钥匙只解析一次」的用例必须与任何会触发解析的用例互斥,否则偶发失败。
+    static PARSE_COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 与 `tests/offline.rs` 的测试私钥（PKCS#8）配套的公钥。
     ///
     /// 公开信息，只为覆盖索引的「解析一次、验签多次」路径；与离线用例用的是同一对密钥。
@@ -663,6 +667,9 @@ awIDAQAB
 
     #[test]
     fn verify_parses_each_public_key_only_once() {
+        let _guard = PARSE_COUNT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut keys = PlatformKeys::new();
         assert!(!keys.insert("SERIAL_CACHED", TEST_PUBLIC_KEY_PEM));
         assert_eq!(keys.get("SERIAL_CACHED"), Some(TEST_PUBLIC_KEY_PEM));
@@ -716,6 +723,10 @@ awIDAQAB
     /// 两表的归属、选键顺序（静态优先）与「安装拉取结果只动轮换表」
     #[test]
     fn two_tables_keep_their_own_entries() {
+        // 下面那次 `verify` 会触发 PEM 解析尝试(计数是全局的,见 `PARSE_COUNT_LOCK`)
+        let _guard = PARSE_COUNT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut keys = PlatformKeys::new();
         assert!(!keys.insert("SERIAL_INJECTED", TEST_PUBLIC_KEY_PEM));
         assert!(!keys.insert_rotating("SERIAL_ROTATING", TEST_PUBLIC_KEY_PEM));
@@ -778,13 +789,9 @@ awIDAQAB
         assert!(rotating_only.needs_refresh(now));
     }
 
-    /// 双表并存时轮换表刷新失败**不该**让请求失败：注入的静态密钥仍能验签。
-    ///
-    /// 回归点：`ensure_keys` 原先无条件 `?` 传播拉取错误 —— 公钥模式加上轮换表之后，
-    /// 证书接口一抖动就会把「本来验得过的公钥签名报文」一起打掉。
-    #[cfg(feature = "async")]
-    #[tokio::test]
-    async fn refresh_failure_does_not_fail_requests_when_a_static_key_remains() {
+    /// 造一个「已注入静态公钥 + 轮换表已过刷新窗口 + 证书接口不可达」的客户端：
+    /// `ensure_keys` 的刷新必然失败，而索引里还剩一份能验签的密钥。
+    fn client_with_static_key_and_a_stale_rotating_table() -> WechatPay {
         let client = WechatPay::from_config(crate::pay::WechatPayConfig {
             appid: "wx_test_appid".to_string(),
             mch_id: "1900000001".to_string(),
@@ -797,9 +804,11 @@ awIDAQAB
         // 必然连不上的地址 + 关掉重试(否则要等退避)
         .with_base_url("http://127.0.0.1:1")
         .with_retry(crate::retry::RetryPolicy::disabled());
+        // 用 `insert`(延迟解析)而不是 `add_static_platform_key`(当场解析)注入:这条用例只关心
+        // 「静态密钥在位 + 轮换表过期」的取值组合,不必碰全局解析计数(见 `PARSE_COUNT_LOCK`)。
         client
-            .add_static_platform_key("PUB_KEY_ID_INLINE_TEST", TEST_PUBLIC_KEY_PEM)
-            .expect("注入公钥");
+            .platform_keys_write()
+            .insert("PUB_KEY_ID_INLINE_TEST", TEST_PUBLIC_KEY_PEM);
 
         // 造「轮换表已过刷新窗口」的状态；注入的静态密钥仍在
         {
@@ -808,10 +817,31 @@ awIDAQAB
             guard.mark_refreshed(crate::util::now_unix_secs() - REFRESH_INTERVAL_SECS - 1);
         }
         assert!(client.keys_need_refresh(), "前置状态：轮换表已过刷新窗口");
-
         client
+    }
+
+    /// 双表并存时轮换表刷新失败**不该**让请求失败：注入的静态密钥仍能验签。
+    ///
+    /// 回归点：`ensure_keys` 原先无条件 `?` 传播拉取错误 —— 公钥模式加上轮换表之后，
+    /// 证书接口一抖动就会把「本来验得过的公钥签名报文」一起打掉。
+    ///
+    /// ⚠ 两种模式各覆盖一遍：`src/async_impl/` 只是共享实现的栖身处，默认（同步）构建
+    /// 同样编译 `ensure_keys`，只留 async 版等于把同步路径的回归留给调用方。
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn refresh_failure_does_not_fail_requests_when_a_static_key_remains() {
+        client_with_static_key_and_a_stale_rotating_table()
             .ensure_keys()
             .await
+            .expect("有静态密钥时，轮换表刷新失败不该让请求失败");
+    }
+
+    /// 同上，同步构建（这里 `ensure_keys` 是普通函数，不是 `async fn`）。
+    #[cfg(not(feature = "async"))]
+    #[test]
+    fn refresh_failure_does_not_fail_requests_when_a_static_key_remains() {
+        client_with_static_key_and_a_stale_rotating_table()
+            .ensure_keys()
             .expect("有静态密钥时，轮换表刷新失败不该让请求失败");
     }
 }
