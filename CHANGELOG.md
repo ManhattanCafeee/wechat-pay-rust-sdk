@@ -47,6 +47,9 @@
   或显式 `with_response_verify(ResponseVerify::Disabled)`。
 - **微信支付公钥模式的商户必须配置公钥**（`with_platform_public_key`），否则所有应答都会以
   `UnknownPlatformSerial` 失败。
+- **`PayError::ApiError` 新增 `request_id: Option<String>`**（应答头 `Request-ID`，缺失为 `None`）：
+  对 `ApiError` 做字段穷尽匹配的代码需要补 `..`。`Display` 在取到该值时附 ` (request-id: …)`，
+  取不到时与原先逐字节一致。
 
 ### 新增
 

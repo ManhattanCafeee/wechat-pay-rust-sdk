@@ -177,6 +177,8 @@ struct MockResponse {
     delay: Option<Duration>,
     /// 只服务这个路径（`None` = 按到达顺序 FIFO）。
     expect_path: Option<String>,
+    /// 额外写出的响应头（例如 `Request-ID`）：`(名, 值)`。
+    extra_headers: Vec<(String, String)>,
 }
 
 impl MockResponse {
@@ -187,6 +189,7 @@ impl MockResponse {
             signing: Signing::default(),
             delay: None,
             expect_path: None,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -249,6 +252,13 @@ impl MockResponse {
     /// 真实原因无关的 JSON 错误）。
     fn for_path(mut self, path: &str) -> Self {
         self.expect_path = Some(path.to_string());
+        self
+    }
+
+    /// 追加一个自定义响应头（可多次调用）。
+    fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.extra_headers
+            .push((name.to_string(), value.to_string()));
         self
     }
 }
@@ -436,8 +446,13 @@ fn handle_connection(
             .iter()
             .map(|(name, value)| format!("{name}: {value}\r\n"))
             .collect();
+        let extra_headers: String = response
+            .extra_headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
         let out = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{extra_headers}{headers}Content-Length: {}\r\n\r\n{}",
             response.status,
             reason,
             response.body.len(),
@@ -732,7 +747,7 @@ dual_test! {
         )));
 
         match result {
-            Err(PayError::ApiError { status, response }) => {
+            Err(PayError::ApiError { status, response, .. }) => {
                 assert_eq!(status, 400);
                 assert_eq!(response.code.as_deref(), Some("PARAM_ERROR"));
                 assert_eq!(response.message.as_deref(), Some("参数错误"));
@@ -744,6 +759,103 @@ dual_test! {
             }
             other => panic!("下单失败必须返回 Err(PayError::ApiError)，实际得到 {other:?}"),
         }
+    }
+}
+dual_test! {
+    fn api_error_carries_request_id_from_response_header() {
+        // 官方要求把应答头 Request-ID 写进日志：SDK 把它挂在 ApiError 上透出。
+        let mock = Mock::start(vec![
+            MockResponse::json(400, r#"{"code":"PARAM_ERROR","message":"参数错误"}"#)
+                .with_header("Request-ID", "REQ-123"),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let err = call!(wechat_pay.jsapi_pay(JsapiParams::new(
+            "测试商品",
+            "ORDER_REQID",
+            1.into(),
+            "openid".into(),
+        )))
+        .expect_err("400 必须返回 Err");
+
+        match &err {
+            PayError::ApiError {
+                status,
+                request_id,
+                ..
+            } => {
+                assert_eq!(*status, 400);
+                assert_eq!(request_id.as_deref(), Some("REQ-123"));
+            }
+            other => panic!("应为 ApiError，实际 {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("request-id: REQ-123"),
+            "Display 必须带出 request-id: {err}"
+        );
+    }
+}
+dual_test! {
+    fn api_error_without_request_id_header_is_none() {
+        let mock = Mock::start(vec![MockResponse::json(
+            400,
+            r#"{"code":"PARAM_ERROR","message":"参数错误"}"#,
+        )]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let err = call!(wechat_pay.jsapi_pay(JsapiParams::new(
+            "测试商品",
+            "ORDER_NO_REQID",
+            1.into(),
+            "openid".into(),
+        )))
+        .expect_err("400 必须返回 Err");
+
+        match &err {
+            PayError::ApiError { request_id, .. } => {
+                assert!(request_id.is_none(), "缺 Request-ID 头时必须为 None");
+            }
+            other => panic!("应为 ApiError，实际 {other:?}"),
+        }
+        assert!(
+            !err.to_string().contains("request-id"),
+            "缺头时不得凭空渲染 request-id: {err}"
+        );
+    }
+}
+dual_test! {
+    fn unverified_5xx_api_error_keeps_request_id() {
+        // 5xx 缺签名头会放行成 `api_error_unverified` —— Request-ID 同样要透出。
+        let mock = Mock::start(vec![
+            MockResponse::json(503, r#"{"code":"SYSTEM_ERROR","message":"系统异常"}"#)
+                .without_signature_headers()
+                .with_header("Request-Id", "REQ-503"),
+        ]);
+        // 503 属可重试失败：关掉重试才能保证只发一次，且断言的就是这一次。
+        let wechat_pay = client_for(&mock.base_url).with_retry(RetryPolicy::disabled());
+
+        let err = call!(wechat_pay.close_order("ORDER_REQID_503")).expect_err("503 仍是错误");
+
+        match &err {
+            PayError::ApiError {
+                status,
+                response,
+                request_id,
+            } => {
+                assert_eq!(*status, 503);
+                assert_eq!(request_id.as_deref(), Some("REQ-503"));
+                assert!(
+                    response
+                        .message
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("[未验签]"),
+                    "5xx 缺签名头应带未验签标记: {response:?}"
+                );
+            }
+            other => panic!("应为 ApiError，实际 {other:?}"),
+        }
+        assert_eq!(mock.requests().len(), 1, "关掉重试后只应发一次");
     }
 }
 dual_test! {
@@ -763,7 +875,7 @@ dual_test! {
         )));
 
         match result {
-            Err(PayError::ApiError { status, response }) => {
+            Err(PayError::ApiError { status, response, .. }) => {
                 assert_eq!(status, 400);
                 assert_eq!(response.code.as_deref(), Some("NOT_ENOUGH"));
                 assert_eq!(response.message.as_deref(), Some("余额不足"));
@@ -1425,7 +1537,7 @@ dual_test! {
         let result = call!(wechat_pay.query_order("ORDER_XXXX"));
 
         match result {
-            Err(PayError::ApiError { status, response }) => {
+            Err(PayError::ApiError { status, response, .. }) => {
                 assert_eq!(status, 404);
                 assert_eq!(response.code.as_deref(), Some("ORDER_NOT_EXIST"));
             }
@@ -1483,7 +1595,7 @@ dual_test! {
         )));
 
         match result {
-            Err(PayError::ApiError { status, response }) => {
+            Err(PayError::ApiError { status, response, .. }) => {
                 // status 如实记录真实状态码（200），业务原因看 response.code
                 assert_eq!(status, 200);
                 assert_eq!(response.code.as_deref(), Some("PARAM_ERROR"));
@@ -2371,7 +2483,7 @@ dual_test! {
         let err = call!(wechat_pay.close_order("UNVERIFIED_5XX")).expect_err("5xx 仍是错误");
 
         match &err {
-            PayError::ApiError { status, response } => {
+            PayError::ApiError { status, response, .. } => {
                 assert_eq!(*status, 500);
                 assert_eq!(
                     response.code.as_deref(),
@@ -2917,7 +3029,7 @@ dual_test! {
         let err = call!(wechat_pay.close_order("CERTS_5XX")).expect_err("冷启动拉证失败");
 
         match &err {
-            PayError::ApiError { status, response } => {
+            PayError::ApiError { status, response, .. } => {
                 assert_eq!(*status, 500);
                 assert!(
                     response

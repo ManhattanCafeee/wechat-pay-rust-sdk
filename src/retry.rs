@@ -216,7 +216,9 @@ pub(crate) fn classify(err: &PayError) -> Option<Delivery> {
                 Some(Delivery::Unknown)
             }
         }
-        PayError::ApiError { status, response } => {
+        PayError::ApiError {
+            status, response, ..
+        } => {
             // 错误码优先于状态码：微信会以 HTTP 200 返回错误信封，那时状态码没有意义。
             // SYSTEM_ERROR 与 HTTP 500 同源，官方要求「请用相同参数重新调用」。
             if response.code.as_deref() == Some("SYSTEM_ERROR") {
@@ -402,7 +404,7 @@ mod tests {
 
     #[test]
     fn may_have_taken_effect_is_false_when_wechat_never_took_the_request() {
-        let api = |status: u16| PayError::api_error(status, "{}");
+        let api = |status: u16| PayError::api_error(status, "{}", None);
         for err in [
             // 官方明确说「请求未受理 / 请求无法处理」
             api(429),
@@ -449,7 +451,7 @@ mod tests {
 
     #[test]
     fn api_status_classification_matches_official_guidance() {
-        let api = |status: u16| PayError::api_error(status, "{}");
+        let api = |status: u16| PayError::api_error(status, "{}", None);
         for retryable in [429, 500, 502, 503] {
             assert_eq!(
                 classify(&api(retryable)),
@@ -470,7 +472,8 @@ mod tests {
             );
         }
         // 2xx + SYSTEM_ERROR 信封与 HTTP 500 同源，官方要求「请用相同参数重新调用」。
-        let envelope = PayError::api_error(200, r#"{"code":"SYSTEM_ERROR","message":"系统异常"}"#);
+        let envelope =
+            PayError::api_error(200, r#"{"code":"SYSTEM_ERROR","message":"系统异常"}"#, None);
         assert_eq!(
             classify(&envelope),
             Some(Delivery::Rejected),
@@ -485,7 +488,7 @@ mod tests {
     fn accepted_and_unparsable_responses_may_have_taken_effect() {
         // 202：微信已经受理，只是还没处理完 —— 可能随后生效，不能当成「没发生」。
         assert!(
-            PayError::api_error(202, "").may_have_taken_effect(),
+            PayError::api_error(202, "", None).may_have_taken_effect(),
             "202 的请求已被微信接收，调用方必须去查单而不是换个单号重开"
         );
         // 响应体解析失败：响应都回来了，请求必然已送达。这里刻意偏保守 ——

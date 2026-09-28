@@ -44,16 +44,23 @@ pub enum PayError {
     /// ⚠ `status` 是微信返回的**原始**状态码，可能是 200 / 202 —— 不要假设它 ≥ 400。
     ///
     /// 保留微信原始的错误码、错误信息与 detail，便于定位到具体字段。
-    /// 匹配方式：`PayError::ApiError { status, response }`，用 `response.code` 分支处理。
+    /// 匹配方式：`PayError::ApiError { status, response, request_id }`（不需全部字段时用 `..`），
+    /// 用 `response.code` 分支处理。
+    ///
+    /// `request_id` 取自应答头 `Request-ID`（微信侧的请求唯一标识，官方要求商户把它写进日志）——
+    /// 退款未受理、查单异常这类需要微信侧协助排查的场景，提供该值即可快速定位到请求记录。
     ///
     /// ⚠ 日志提示：`Display` 会带上 `detail`，而微信的 `detail` 含出错字段的路径与取值
     /// （例如 `/payer/openid`），`message` 也可能回显提交内容。日志外发前需自行脱敏。
-    #[error("wechat api error: http {status}, {response}")]
+    #[error("wechat api error: http {status}, {response}{}", .request_id.as_deref().map(|id| format!(" (request-id: {id})")).unwrap_or_default())]
     ApiError {
         /// HTTP 状态码
         status: u16,
         /// 微信返回的错误体
         response: ErrorResponse,
+        /// 应答头 `Request-ID`：微信侧的请求唯一标识（官方要求商户把它写进日志）。
+        /// 应答缺该头、或被网关 / CDN 过滤时为 `None`。
+        request_id: Option<String>,
     },
 }
 
@@ -156,10 +163,11 @@ impl PayError {
     /// `deny_unknown_fields`，任何 JSON 对象都能解析成功。若不加这层判断，WAF / 反向
     /// 代理返回的 `{"status":403,"msg":"..."}` 会变成一个三个字段全为 `None` 的
     /// `ErrorResponse`，唯一的排查线索（原始文本）就被静默丢弃了。
-    pub(crate) fn api_error(status: u16, body: &str) -> Self {
+    pub(crate) fn api_error(status: u16, body: &str, request_id: Option<String>) -> Self {
         PayError::ApiError {
             status,
             response: parse_error_response(body),
+            request_id,
         }
     }
 
@@ -170,13 +178,21 @@ impl PayError {
     /// 可被对手用来误判业务的语义，而把它变成 `VerifyError` 会把「自动重试」变成
     /// 「不重试」。标记保留 `code` / `detail`，因此 [`crate::retry::classify`] 的
     /// `SYSTEM_ERROR` 判定不受影响。
-    pub(crate) fn api_error_unverified(status: u16, body: &str) -> Self {
+    pub(crate) fn api_error_unverified(
+        status: u16,
+        body: &str,
+        request_id: Option<String>,
+    ) -> Self {
         let mut response = parse_error_response(body);
         response.message = Some(match response.message.take() {
             Some(message) => format!("[未验签] {message}"),
             None => "[未验签]".to_string(),
         });
-        PayError::ApiError { status, response }
+        PayError::ApiError {
+            status,
+            response,
+            request_id,
+        }
     }
 }
 

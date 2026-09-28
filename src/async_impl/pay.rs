@@ -92,8 +92,9 @@ async fn send_and_check(builder: RequestBuilder) -> Result<RawResponse, PayError
     let headers = response.headers().clone();
     let body = response.bytes().await?.to_vec();
     debug!(
-        "status: {} body: {}",
+        "status: {} request-id: {} body: {}",
         status,
+        (request_id_of(&headers).as_deref().unwrap_or("-")),
         (String::from_utf8_lossy(&body))
     );
     Ok(RawResponse {
@@ -152,6 +153,14 @@ fn is_error_envelope(body: &[u8]) -> bool {
             .is_some_and(|code| !code.is_empty()),
         Err(_) => false,
     }
+}
+
+/// 取应答头 `Request-ID`（微信的请求唯一标识）。头名大小写不敏感；非 UTF-8 视为缺失。
+fn request_id_of(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 impl WechatPay {
@@ -237,15 +246,20 @@ impl WechatPay {
                 Ok((raw, signature)) if !(200..300).contains(&raw.status) => {
                     let text = String::from_utf8_lossy(&raw.body);
                     Err(match signature {
-                        SignatureStatus::Unsigned => {
-                            PayError::api_error_unverified(raw.status, &text)
+                        SignatureStatus::Unsigned => PayError::api_error_unverified(
+                            raw.status,
+                            &text,
+                            request_id_of(&raw.headers),
+                        ),
+                        SignatureStatus::Verified => {
+                            PayError::api_error(raw.status, &text, request_id_of(&raw.headers))
                         }
-                        SignatureStatus::Verified => PayError::api_error(raw.status, &text),
                     })
                 }
                 Ok((raw, _)) if is_error_envelope(&raw.body) => Err(PayError::api_error(
                     raw.status,
                     &String::from_utf8_lossy(&raw.body),
+                    request_id_of(&raw.headers),
                 )),
                 other => other.map(|(raw, _)| raw),
             };
@@ -269,6 +283,7 @@ impl WechatPay {
                     Ok(raw) => Err(PayError::api_error(
                         raw.status,
                         &String::from_utf8_lossy(&raw.body),
+                        request_id_of(&raw.headers),
                     )),
                     Err(err) => Err(err),
                 };
@@ -534,12 +549,14 @@ impl WechatPay {
             .map_err(|e| PayError::VerifyError(format!("非法 Referer: {e}")))?;
         headers.insert(REFERER, referer);
         let response = client.get(h5_url.as_ref()).headers(headers).send().await?;
+        // `text()` 会消费 response，request-id 要在它之前取。
+        let request_id = request_id_of(response.headers());
         let status = response.status();
         let text = response.text().await?;
         // 以前这里不看状态码：过期的 h5_url 或 CDN 错误页会被当成支付页去扫描，
         // 结果只报一个与真实原因无关的 `WeixinNotFound`。
         if !status.is_success() {
-            return Err(PayError::api_error(status.as_u16(), &text));
+            return Err(PayError::api_error(status.as_u16(), &text, request_id));
         }
         text.lines()
             .find(|line| line.contains("weixin://"))
@@ -762,7 +779,9 @@ mod tests {
                 "refunds status: {} refund_id: {}",
                 body.status, body.refund_id
             ),
-            Err(PayError::ApiError { status, response }) => {
+            Err(PayError::ApiError {
+                status, response, ..
+            }) => {
                 debug!("refunds failed: http {status}, {response}");
             }
             Err(e) => debug!("refunds error: {e}"),
@@ -848,7 +867,9 @@ mod tests {
                 "refunds status: {} refund_id: {}",
                 body.status, body.refund_id
             ),
-            Err(PayError::ApiError { status, response }) => {
+            Err(PayError::ApiError {
+                status, response, ..
+            }) => {
                 debug!("refunds failed: http {status}, {response}");
             }
             Err(e) => debug!("refunds error: {e}"),
@@ -871,7 +892,9 @@ mod tests {
                 "refunds status: {} refund_id: {}",
                 body.status, body.refund_id
             ),
-            Err(PayError::ApiError { status, response }) => {
+            Err(PayError::ApiError {
+                status, response, ..
+            }) => {
                 debug!("refunds failed: http {status}, {response}");
             }
             Err(e) => debug!("refunds error: {e}"),

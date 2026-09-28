@@ -415,8 +415,10 @@ async fn pay_notify(bytes: Bytes, req: HttpRequest) -> impl Responder {
         // 受理成功 ≠ 退款成功，需再用 query_refund 轮询 status 到终态
         Ok(body) => tracing::debug!("refunds status: {} refund_id: {}", body.status, body.refund_id),
         // 微信的业务错误：非 2xx 与「200 但 body 是错误信封」都会走到这里
-        Err(PayError::ApiError { status, response }) => tracing::debug!(
-            "refunds failed: http {status}, code={:?}, message={:?}, detail={:?}",
+        // request_id 来自应答头 Request-ID —— 向微信侧排查问题时提供该值
+        Err(PayError::ApiError { status, response, request_id }) => tracing::debug!(
+            "refunds failed: http {status}, request-id={}, code={:?}, message={:?}, detail={:?}",
+            request_id.as_deref().unwrap_or("-"),
             response.code, response.message, response.detail
         ),
         Err(e) => tracing::debug!("refunds error: {e}"),
@@ -616,6 +618,10 @@ match wechat_pay.jsapi_pay(params).await {
 
 `response.detail` 是微信的字段级定位信息（例如 `/payer/openid`），
 而 `Display` 会把它一起渲染出来 —— 日志外发前记得脱敏。
+
+`ApiError` 还带 `request_id`（应答头 `Request-ID`，缺失为 `None`）—— 微信官方要求把它写进日志；
+与微信侧排查（退款未受理、查单异常）时提供该值可快速定位到请求记录。取到该值时 `Display` 会附上
+` (request-id: …)`。
 
 ⚠ **应答验签失败会改变这两层的边界**（默认开启）：无签名头的 4xx 会变成
 `VerifyError`（`Local`）而不是 `ApiError` —— 此时**拿不到** `response.code`，

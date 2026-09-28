@@ -168,8 +168,8 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features async -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo test                     # lib 13 passed / 14 ignored + offline 73 passed
-cargo test --features async    # lib 14 passed / 7 ignored + offline 73 passed
+cargo test                     # lib 13 passed / 14 ignored + offline 76 passed
+cargo test --features async    # lib 14 passed / 7 ignored + offline 76 passed
 cargo check -p example
 
 # MSRV 作业（1.89.0）
@@ -310,11 +310,11 @@ cargo +1.89.0 check --all-targets
 | 纯逻辑单测 | `src/pay.rs`、`src/retry.rs`、`src/util.rs`、`src/pay_type.rs`、`src/async_impl/pay.rs` 的 `#[cfg(test)]` | 同上，默认执行 | 无 |
 | 在线冒烟 | 同上文件里的 `#[ignore]` | `cargo test --lib -- --ignored` | 真实凭证 + 公网 + 仓库根 PEM fixture |
 
-**精确计数（单次运行）**：`cargo test` → lib **13 passed / 14 ignored**，offline **73 passed**；
-`cargo test --features async` → lib **14 passed / 7 ignored**，offline **73 passed**。
+**精确计数（单次运行）**：`cargo test` → lib **13 passed / 14 ignored**，offline **76 passed**；
+`cargo test --features async` → lib **14 passed / 7 ignored**，offline **76 passed**。
 
-- offline 的 73 = 71 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
-  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 71。
+- offline 的 76 = 74 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
+  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 74。
 - lib 的 async 多一个用例：`src/async_impl/pay.rs::public_futures_are_send`（`cfg(feature = "async")`）。
 - ⚠ 计 `#[test]` 时要按**行首**（`^#\[test\]`）锚定：直接数 `#[test]` 会把 `dual_test!` 宏定义体内的
   那一次（缩进）和文档注释里提到的一次也算进去。
