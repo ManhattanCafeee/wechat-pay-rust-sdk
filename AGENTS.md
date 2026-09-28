@@ -168,8 +168,8 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features async -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo test                     # lib 13 passed / 14 ignored + offline 76 passed
-cargo test --features async    # lib 14 passed / 7 ignored + offline 76 passed
+cargo test                     # lib 14 passed / 14 ignored + offline 76 passed
+cargo test --features async    # lib 15 passed / 7 ignored + offline 76 passed
 cargo check -p example
 
 # MSRV 作业（1.89.0）
@@ -307,11 +307,11 @@ cargo +1.89.0 check --all-targets
 | 层 | 位置 | 怎么跑 | 需要什么 |
 | --- | --- | --- | --- |
 | 离线集成 | `tests/offline.rs`（唯一） | `cargo test` / `--features async` | 只需要本地监听端口 |
-| 纯逻辑单测 | `src/pay.rs`、`src/retry.rs`、`src/util.rs`、`src/pay_type.rs`、`src/async_impl/pay.rs` 的 `#[cfg(test)]` | 同上，默认执行 | 无 |
+| 纯逻辑单测 | `src/pay.rs`、`src/retry.rs`、`src/util.rs`、`src/pay_type.rs`、`src/cert.rs`、`src/async_impl/pay.rs` 的 `#[cfg(test)]` | 同上，默认执行 | 无 |
 | 在线冒烟 | 同上文件里的 `#[ignore]` | `cargo test --lib -- --ignored` | 真实凭证 + 公网 + 仓库根 PEM fixture |
 
-**精确计数（单次运行）**：`cargo test` → lib **13 passed / 14 ignored**，offline **76 passed**；
-`cargo test --features async` → lib **14 passed / 7 ignored**，offline **76 passed**。
+**精确计数（单次运行）**：`cargo test` → lib **14 passed / 14 ignored**，offline **76 passed**；
+`cargo test --features async` → lib **15 passed / 7 ignored**，offline **76 passed**。
 
 - offline 的 76 = 74 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
   `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 74。
@@ -441,8 +441,8 @@ MockResponse::json(200, body)          // 默认：正确签名（serial = TEST_
 - `set_platform_keys` / `with_platform_public_key` 之后客户端进入**静态密钥模式**：不自动拉取、
   不自动替换。手工灌入的索引 `fetched_at` 为空 ⇒ `needs_refresh()` 恒为 true，如果不做静态判定，
   每个请求前都会多打一次 `/v3/certificates`。
-- 应答验签给每个响应加一次 RSA 验签（`verify_rsa_sha256` 每次都会重新解析 PEM 公钥，
-  微秒~毫秒级）；要抠这部分开销就在索引里缓存已解析的公钥，别改成「跳过验签」。
+- 应答验签给每个响应加一次 RSA 验签；公钥 PEM 的解析结果缓存在 `PlatformKeys` 的索引条目里
+  （首次 `verify` 时解析一次，解析失败不缓存、`insert` 覆盖会重置缓存），别改成「跳过验签」。
 - `PayType`（`src/pay_type.rs`）是未被 crate 使用的公开 API。
 
 **业务侧必须自己做的事**

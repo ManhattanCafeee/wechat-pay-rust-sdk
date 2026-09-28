@@ -22,9 +22,11 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use reqwest::header::HeaderMap;
+use rsa::RsaPublicKey;
 
 use crate::async_impl::pay::{ResponseCheck, sleep_for};
 use crate::error::PayError;
@@ -91,13 +93,47 @@ macro_rules! indirect {
     };
 }
 
-/// `serial_no -> 公钥 PEM` 的索引。
+/// 索引里的一条密钥：PEM 原文 + 首次验签时解析出的公钥。
+///
+/// 解析结果缓存起来（`Arc` 共享，`Clone` 索引不复制大整数）：应答与回调验签是热路径，
+/// 每请求重新解析 PEM 是纯粹的开销 —— 同一把钥匙解析一次就够。
+#[derive(Clone)]
+struct KeyEntry {
+    pem: String,
+    parsed: OnceLock<Arc<RsaPublicKey>>,
+}
+
+// 手写 `Debug`：`RsaPublicKey` 的 derive 输出会把整个模数打出来，日志里全是噪音。
+impl std::fmt::Debug for KeyEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyEntry")
+            .field("pem", &self.pem)
+            .field("parsed", &self.parsed.get().is_some())
+            .finish()
+    }
+}
+
+impl KeyEntry {
+    /// 取已解析的公钥：首次调用时解析并缓存。
+    ///
+    /// 解析**失败不缓存** —— 坏 PEM 是配置问题，每次都该报同一个
+    /// `VerifyError`（消息与 [`util::parse_rsa_public_key`] 一致），而不是把错误也冻住。
+    fn parsed_key(&self) -> Result<Arc<RsaPublicKey>, PayError> {
+        if let Some(parsed) = self.parsed.get() {
+            return Ok(Arc::clone(parsed));
+        }
+        let parsed = Arc::new(util::parse_rsa_public_key(&self.pem)?);
+        Ok(Arc::clone(self.parsed.get_or_init(move || parsed)))
+    }
+}
+
+/// `serial_no -> 公钥 PEM` 的索引（首次验签时解析公钥并缓存，见 [`PlatformKeys::verify`]）。
 ///
 /// 不含网络逻辑：由调用方决定何时拉取与刷新，因此可以离线单测、也便于放进
 /// 应用状态里跨请求复用。
 #[derive(Debug, Default, Clone)]
 pub struct PlatformKeys {
-    keys: HashMap<String, String>,
+    keys: HashMap<String, KeyEntry>,
     fetched_at: Option<i64>,
 }
 
@@ -108,19 +144,27 @@ impl PlatformKeys {
     }
 
     /// 插入或覆盖一个密钥；返回是否覆盖了已有条目。
+    ///
+    /// 不解析 PEM（失败推迟到首次 [`PlatformKeys::verify`]）；覆盖会把旧的解析缓存一并丢弃。
     pub fn insert(
         &mut self,
         serial_no: impl Into<String>,
         public_key_pem: impl Into<String>,
     ) -> bool {
         self.keys
-            .insert(serial_no.into(), public_key_pem.into())
+            .insert(
+                serial_no.into(),
+                KeyEntry {
+                    pem: public_key_pem.into(),
+                    parsed: OnceLock::new(),
+                },
+            )
             .is_some()
     }
 
     /// 按 `Wechatpay-Serial` 取公钥 PEM。
     pub fn get(&self, serial_no: &str) -> Option<&str> {
-        self.keys.get(serial_no).map(String::as_str)
+        self.keys.get(serial_no).map(|entry| entry.pem.as_str())
     }
 
     /// 索引中已有的密钥数量。轮换期正常会有 2 个。
@@ -171,11 +215,14 @@ impl PlatformKeys {
         body: &str,
         signature: &str,
     ) -> Result<(), PayError> {
-        let public_key = self
+        let entry = self
+            .keys
             .get(serial_no)
             .ok_or_else(|| PayError::UnknownPlatformSerial(serial_no.to_string()))?;
+        // 公钥解析结果缓存在条目里：热路径上同一把钥匙只解析一次（失败不缓存）。
+        let public_key = entry.parsed_key()?;
         let message = format!("{timestamp}\n{nonce}\n{body}\n");
-        util::verify_rsa_sha256(public_key, &message, signature)
+        util::verify_rsa_sha256_with_key(&public_key, &message, signature)
     }
 }
 
@@ -475,5 +522,77 @@ impl WechatPay {
             )),
             other => other,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 与 `tests/offline.rs` 的测试私钥（PKCS#8）配套的公钥。
+    ///
+    /// 公开信息，只为覆盖索引的「解析一次、验签多次」路径；与离线用例用的是同一对密钥。
+    const TEST_PUBLIC_KEY_PEM: &str = "\
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxu8a4jjKvwg7moQK4AIy
+bEBk/IASqR1l65QmxZCQ+uaC7lE1cpbhtW0S8oVs6oe1jrkKiE5lFfrNQzzfJbmo
+jW1X5Owu3tEpb3LhH8guROBP8QPe4qQ547VczF01nkTIm86m0969XZIM5NOiRrCo
+KyUKtJqnNFH1C1FSfm/oqBOMI2AO1Gz0JqJI/yQJOYqMt3wh/kJ3w7LizL2NBlgr
+V3P7rln5q8tfDz9Xzlf/5zfPkxkbUxYcfhTSwrypplKuaSBpSvzMubZH/EcnBr/D
+tiijCX4njiSVZ2j4cZIJoKpdajYDFRxmn6Ko3oRT0zzVmHdioqNkbgn/mMf2w/1R
+awIDAQAB
+-----END PUBLIC KEY-----
+";
+
+    #[test]
+    fn verify_parses_each_public_key_only_once() {
+        let mut keys = PlatformKeys::new();
+        assert!(!keys.insert("SERIAL_CACHED", TEST_PUBLIC_KEY_PEM));
+        assert_eq!(keys.get("SERIAL_CACHED"), Some(TEST_PUBLIC_KEY_PEM));
+
+        // 签名本身无效（不是这把钥匙签的）没关系：走的就是「查表 → 取公钥 → 验签」。
+        let before = util::rsa_pem_parse_count();
+        let first = keys.verify("SERIAL_CACHED", "1700000000", "nonce", "{}", "AAAA");
+        assert!(first.is_err(), "无效签名必须报错: {first:?}");
+        assert_eq!(
+            util::rsa_pem_parse_count(),
+            before + 1,
+            "首次验签应解析一次公钥"
+        );
+        assert!(
+            keys.keys["SERIAL_CACHED"].parsed.get().is_some(),
+            "首次验签后应把解析结果缓存进条目"
+        );
+
+        let second = keys.verify("SERIAL_CACHED", "1700000000", "nonce", "{}", "AAAA");
+        assert_eq!(
+            util::rsa_pem_parse_count(),
+            before + 1,
+            "第二次验签不得再解析 PEM"
+        );
+        match second {
+            // 走到了 RSA 验签本身（缓存命中的证据），而不是又去解析 PEM。
+            Err(PayError::VerifyError(message)) => assert!(
+                !message.contains("parser error"),
+                "第二次不该重新解析 PEM: {message}"
+            ),
+            other => panic!("应为 VerifyError，实际 {other:?}"),
+        }
+
+        // 未知 serial 与坏 PEM 的行为保持原样（错误类型与文案都不变）。
+        match keys.verify("SERIAL_MISSING", "1700000000", "nonce", "{}", "AAAA") {
+            Err(PayError::UnknownPlatformSerial(serial)) => assert_eq!(serial, "SERIAL_MISSING"),
+            other => panic!("应为 UnknownPlatformSerial，实际 {other:?}"),
+        }
+        keys.insert("SERIAL_BAD", "not a pem");
+        match keys.verify("SERIAL_BAD", "1700000000", "nonce", "{}", "AAAA") {
+            Err(PayError::VerifyError(message)) => {
+                assert!(
+                    message.contains("public key parser error"),
+                    "实际: {message}"
+                );
+            }
+            other => panic!("应为 VerifyError，实际 {other:?}"),
+        }
     }
 }

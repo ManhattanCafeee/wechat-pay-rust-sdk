@@ -13,18 +13,57 @@ use crate::error::PayError;
 ///
 /// 微信支付 v3 的应答验签与回调验签都走这条路径；平台证书轮换时由调用方
 /// 先从证书列表里挑出对应公钥再传进来。
+///
+/// ⚠ 每次调用都会**重新解析** `pub_key_pem`。要「解析一次、验签多次」（平台证书索引的
+/// 热路径），crate 内部用 `parse_rsa_public_key` + `verify_rsa_sha256_with_key`。
 pub fn verify_rsa_sha256(
     pub_key_pem: &str,
     message: &str,
     signature_b64: &str,
 ) -> Result<(), PayError> {
-    let pub_key = RsaPublicKey::from_public_key_pem(pub_key_pem)
-        .map_err(|e| PayError::VerifyError(format!("public key parser error: {e}")))?;
+    let pub_key = parse_rsa_public_key(pub_key_pem)?;
+    verify_rsa_sha256_with_key(&pub_key, message, signature_b64)
+}
+
+/// 解析 PEM 公钥（SubjectPublicKeyInfo）。
+///
+/// 单拆出来是为了让调用方能缓存解析结果：`PlatformKeys` 的索引对每个 serial
+/// 只解析一次。失败映射与 [`verify_rsa_sha256`] 一致（`VerifyError`）。
+pub(crate) fn parse_rsa_public_key(pem: &str) -> Result<RsaPublicKey, PayError> {
+    #[cfg(test)]
+    RSA_PEM_PARSE_COUNT.with(|count| count.set(count.get() + 1));
+    RsaPublicKey::from_public_key_pem(pem)
+        .map_err(|e| PayError::VerifyError(format!("public key parser error: {e}")))
+}
+
+/// 用**已解析**的公钥验证 RSA-SHA256（PKCS#1 v1.5）签名，`signature_b64` 为 base64。
+pub(crate) fn verify_rsa_sha256_with_key(
+    pub_key: &RsaPublicKey,
+    message: &str,
+    signature_b64: &str,
+) -> Result<(), PayError> {
     let hashed = Sha256::new().chain_update(message).finalize();
     let signature = base64_decode(signature_b64)?;
     pub_key
         .verify(Pkcs1v15Sign::new::<Sha256>(), &hashed, signature.as_slice())
         .map_err(|e| PayError::VerifyError(e.to_string()))
+}
+
+// 公钥 PEM 的解析次数（仅测试用）。
+//
+// `PlatformKeys`「同一把钥匙只解析一次」这条性质靠它证明；用线程局部量而不是全局
+// 原子量，免得与并行的其它单测互相污染计数。
+// （这里是普通注释而非文档注释：`///` 挂在 `thread_local!` 宏调用上会被判为
+// unused doc comment，而 CI 的 `-D warnings` 会把它变成硬错误。）
+#[cfg(test)]
+thread_local! {
+    static RSA_PEM_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 当前线程累计解析公钥 PEM 的次数（仅测试用）。
+#[cfg(test)]
+pub(crate) fn rsa_pem_parse_count() -> usize {
+    RSA_PEM_PARSE_COUNT.with(std::cell::Cell::get)
 }
 
 /// 生成一个随机的商户订单号：UUID v4 去掉连字符后的 32 位十六进制串。
