@@ -9,8 +9,8 @@ use crate::{sign, util};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, USER_AGENT};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -677,8 +677,12 @@ impl WechatPay {
     ///
     /// ⚠ 公钥模式下的公钥**不在** `GET /v3/certificates` 里（要从商户平台下载、自行更新），
     /// 所以这个客户端进入**静态密钥模式**：不会自动拉取、也不会自动替换密钥 ——
-    /// 平台证书列表里没有这张公钥，拉取后的整体替换会把它抹掉。轮换要自己更新
+    /// 平台证书列表里没有这张公钥，拉取后的替换会把它抹掉。轮换要自己更新
     /// （[`WechatPay::set_platform_keys`] 再设一次，或重建客户端）。
+    ///
+    /// ⚠ **微信支付公钥 / 平台证书的灰度切换期请改用
+    /// [`WechatPay::add_static_platform_key`]**：它注入公钥但**不**切模式，因此同一个客户端
+    /// 既能验公钥签的、也能验平台证书签的（灰度期两种都可能出现）。
     #[must_use]
     pub fn with_platform_public_key(
         self,
@@ -691,10 +695,38 @@ impl WechatPay {
         self
     }
 
-    /// 当前平台密钥索引的快照（`serial_no -> 公钥 PEM`）。
+    /// 向**静态密钥表**注入一把调用方提供的公钥（微信支付公钥 / 固定证书来源），
+    /// **不改变模式**。
     ///
-    /// 用途是排查「到底认了哪几张证书」（轮换期正常是 2 张），不适合放进每请求路径：
-    /// 每次调用都会拷一份索引。
+    /// 与 [`WechatPay::with_platform_public_key`] / [`WechatPay::set_platform_keys`] 的区别：
+    /// 不会切到静态密钥模式，平台证书的自动拉取 / 12 小时刷新 / 未知 serial 刷新照旧 ——
+    /// 同一个客户端因此能**同时**验证「静态公钥」与「轮换中的平台证书」签名的回调与应答，
+    /// 这正是官方公钥/证书**灰度切换期**必须的行为（切换期间同一商户的报文可能由两者随机签名）。
+    ///
+    /// 选键顺序：静态表优先；同一 serial 两表都有时静态表获胜（轮换表那条只是被遮蔽，不删除）。
+    ///
+    /// PEM **当场解析**：坏 PEM（例如误传了证书 PEM）在这里就报
+    /// [`PayError::VerifyError`]，不等到第一笔回调。返回 `Ok(true)` 表示覆盖了静态表里
+    /// 同 serial 的旧条目。
+    ///
+    /// 注入本身**不会**触发任何网络请求：平台证书仍在需要时（未知 serial）才拉取。
+    pub fn add_static_platform_key(
+        &self,
+        serial: impl Into<String>,
+        public_key_pem: impl Into<String>,
+    ) -> Result<bool, PayError> {
+        let public_key_pem = public_key_pem.into();
+        let parsed = Arc::new(crate::util::parse_rsa_public_key(&public_key_pem)?);
+        Ok(self
+            .platform_keys_write()
+            .insert_parsed(serial.into(), public_key_pem, parsed))
+    }
+
+    /// 当前平台密钥索引的快照（`serial_no -> 公钥 PEM`，**两张表合并**）。
+    ///
+    /// 用途是排查「到底认了哪几张证书」（轮换期正常是 2 张，加上注入的公钥可能更多），
+    /// 不适合放进每请求路径：每次调用都会拷一份索引。
+    /// 回调验签用的就是这份快照，因此它同时包含注入的静态公钥与自动拉取的平台证书。
     pub fn platform_keys(&self) -> PlatformKeys {
         self.platform_keys_read().clone()
     }
@@ -704,6 +736,10 @@ impl WechatPay {
     /// 静态模式下：不会自动拉取 `/v3/certificates`、不会用拉取结果替换你设置的索引。
     /// 代价是轮换要你自己更新 —— 对公钥模式（[`WechatPay::with_platform_public_key`]）
     /// 而言这是唯一正确的语义，因为公钥根本不在平台证书列表里。
+    ///
+    /// 本调用**整体替换两张表**：传进来的索引就是全部可信材料，之前自动拉取的平台证书
+    /// 也会被清掉（与「调用方负责」的语义一致）。只注入静态表而不影响轮换表请用
+    /// [`WechatPay::add_static_platform_key`]。
     pub fn set_platform_keys(&self, keys: PlatformKeys) {
         // ⚠ 置位与写入必须在**同一个写锁临界区**内：安装侧（`fetch_and_install_keys_once`）
         // 是在写锁内复查 `auto_refresh_keys()` 的，若这里先放锁再置位，就会出现

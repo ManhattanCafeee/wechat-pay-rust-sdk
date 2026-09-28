@@ -6,7 +6,8 @@
 > 含破坏性改动（见 [CHANGELOG](CHANGELOG.md)）。请按「引入依赖」用 **git 或 path** 引入。
 
 覆盖：JSAPI / Native / APP / H5 / 付款码下单、申请退款、订单查询、关单、退款查询、
-平台证书获取与轮换、支付回调的验签与解密、**出站应答验签（默认强制）**。
+平台证书获取与轮换、**微信支付公钥与平台证书双表并存（灰度期两种签名都认）**、
+支付回调的验签与解密、**出站应答验签（默认强制）**。
 
 [![QQ群](https://img.shields.io/badge/QQ%E7%BE%A4-799168925-blue)](http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=dLoye8pBcO60zGzqLjGO0l-GgMIaf6wQ&authKey=LfxBdZ5A%2F9eWJbKpzTcuWPjmQu5UdIJ3TVTpqRAQYkCID50WLkYoIXcGxGKzupG3&noverify=0&group_code=799168925)
 
@@ -509,12 +510,15 @@ let data = wechat_pay.decrypt_notify(&notify.resource)?;
 
 遇到 `PayError::UnknownPlatformSerial` 说明微信正在轮换证书 ——
 **立即重新拉取**证书列表再重试，不要拿别的密钥去试。
+（`Wechatpay-Serial` 以 `PUB_KEY_ID_` 开头的是**微信支付公钥**，它不在平台证书列表里：
+拉取也拿不到，请用 `add_static_platform_key` 注入；这类 serial 不会触发任何证书请求。）
 
 ## 应答验签（默认强制）
 
 微信不只给回调签名：**每个应答**都带 `Wechatpay-Serial` / `Wechatpay-Timestamp` /
 `Wechatpay-Nonce` / `Wechatpay-Signature` 四个头（验签串是 `{时间戳}\n{随机串}\n{应答体}\n`，
-与回调用的是同一批平台证书 / 微信支付公钥）。本 SDK 默认**强制**校验它 —— 不验签的应答
+与回调用的是同一套密钥：平台证书，加上调用方用 `add_static_platform_key` 注入的静态公钥 ——
+两张表，静态优先）。本 SDK 默认**强制**校验它 —— 不验签的应答
 等于把「这条应答真的来自微信」交给链路运气：一个能改应答的中间层可以伪造 `ORDER_NOT_EXIST`、
 「请求未受理」这类结论，而调用方在超时兜底时正是靠它们决定要不要换个单号重开。
 
@@ -558,6 +562,22 @@ let config = WechatPayConfig {
 
    配置后客户端进入**静态密钥模式**：不自动拉取、不自动替换，公钥更新时再设一次。
 
+   ⚠ **公钥 / 平台证书的灰度切换期请改用 `add_static_platform_key`**：官方切换期间同一商户的
+   报文可能由**公钥**或**平台证书**随机签名，两种都得认。这个入口注入公钥但**不**切模式，
+   因此平台证书的自动拉取 / 刷新照旧，并且官方网关下没有「每个请求前先拉一次证书」的强依赖
+   （已注入静态密钥且轮换表为空时不预拉，改为遇到证书签名的应答时按需拉一次）：
+
+   ```rust
+   // 灰度期：公钥 + 平台证书双表并存（选键静态表优先）
+   wechat_pay.add_static_platform_key(
+       "PUB_KEY_ID_0000000000000024101100397200006",
+       std::fs::read_to_string("wechat_pay_public_key.pem")?,
+   )?;
+   ```
+
+   切换完成后想回到「只信这把公钥」，用 `set_platform_keys`（整体替换两张表并切静态模式）
+   或重建客户端。
+
 5. **排查两种「全部请求都失败」**：
    - 报「缺少签名头」→ 查代理 / CDN 是否过滤 `Wechatpay-*` 头（见上）；
    - 报 `StaleNotify`（时间戳偏差超 ±300s）→ 先**校时**（NTP）。应答验签用的是与回调
@@ -597,7 +617,10 @@ let config = WechatPayConfig {
 - 官方要求至少每 12 小时刷新一次；`PlatformKeys::needs_refresh(now)` 按
   `REFRESH_INTERVAL_SECS` 帮你判断。⚠ 用 `set_platform_keys` /
   `with_platform_public_key` 设置的索引属于**调用方负责**：SDK 不会自动拉取或替换它
-  （否则会把公钥模式配置的公钥抹掉）。
+  （否则会把公钥模式配置的公钥抹掉）。唯一的例外是 `add_static_platform_key`：它只写**静态表**，
+  自动轮换照旧 —— 两张表并存时选键**静态表优先**，轮换表的安装只替换轮换表那一半。
+  另外，已注入静态密钥且轮换表从未拉取过时 `needs_refresh` 返回 `false`（不预拉，
+  改为遇到未知 serial 时按需拉一次）。
 - 单飞刷新期间其它请求会等到刷新结束（默认最多 **2 秒**）；并发冷启动多、证书接口慢的场景
   可以用 `wechat_pay.with_key_refresh_wait(Duration::from_secs(5))` 调大预算 ——
   等超预算的请求会拿到 `UnknownPlatformSerial`（消息里带预算毫秒数），`Duration::ZERO`

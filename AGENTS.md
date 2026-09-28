@@ -104,12 +104,23 @@ send_and_check(builder)              ← 只发请求，取回 (status, headers,
   轮换期微信用**新**证书签名，本地索引里还没有 —— 没有这条路径，「未知 serial → 刷新」会在
   首次轮换时自锁。⚠ 它不是信任锚（公钥来自同一个尚未验签的 body），真正的保证是 TLS + AEAD。
 - **微信支付公钥模式**（serial 形如 `PUB_KEY_ID_…`）的公钥不在平台证书列表里：
-  用 `with_platform_public_key(id, pem)` 配置；遇到该前缀**不会**去刷新证书（白打限流接口）。
+  用 `with_platform_public_key(id, pem)`（注入 + 切静态模式，轮换要自己更新）或
+  **`add_static_platform_key(id, pem)`**（只注入静态表、**不**切模式 —— 公钥/证书灰度期用这个，
+  两种签名都得认）。该前缀的未知 serial **不会**去刷新证书（白打限流接口），
+  判定在 `refresh_platform_keys_for_unknown_serial` 的最前面（回调路径也走它）。
+- `PlatformKeys` 是**两张表**：`injected`（调用方注入，`insert` / `insert_parsed` 写它）+
+  `rotating`（自动拉取，`insert_rotating` / `install_rotating` 写它）。选键**静态表优先**
+  （同 serial 两表都有时用注入的那把，轮换表那条只是被遮蔽）；命中注入表但 PEM/签名坏时
+  直接失败，**不**回落到轮换表。`len` / `serials` / `is_empty` 报告两表合并（去重）。
 - `set_platform_keys` / `with_platform_public_key` 之后是**静态密钥模式**（`static_keys`）：
-  不自动拉取、不自动替换。否则手工灌入的索引 `fetched_at = None` 会让 `needs_refresh()` 恒为 true
-  （每个请求前都拉一次证书），而「整体替换」会把公钥模式配置的公钥抹掉。
-- 刷新是**整体替换**（不是合并，合并会把微信已撤下的旧证书永久留下），并丢弃
-  `x509_is_valid` 判定为已过期的证书；刷新失败**不动**已有索引。
+  不自动拉取、不自动替换（`set_platform_keys` 连轮换表一起整体替换，调用方的密钥是唯一可信材料）。
+  否则手工灌入的索引 `fetched_at = None` 会让 `needs_refresh()` 恒为 true（每个请求前都拉一次证书），
+  而替换会把调用方配置的公钥抹掉。**例外**：`add_static_platform_key` 不置位，
+  且「已注入静态密钥、轮换表从未拉取过」时 `needs_refresh()` 返回 `false`（改为按需拉取）——
+  没有这条例外，双表模式下每个请求前都会先打一次证书接口，而它不可达时业务会全盘失败。
+- 刷新只替换**轮换表**（`install_rotating`，整体替换而不是合并：合并会把微信已撤下的旧证书永久
+  留下），并丢弃 `x509_is_valid` 判定为已过期的证书；刷新失败**不动**已有索引，也不再让请求失败
+  （`ensure_keys` 只在「一份密钥都没有」时报错 —— 有静态密钥时证书接口抖动不该打掉验得过的报文）。
 - `src/cert.rs` 的 `indirect!` 宏：`request → verify_response → refresh → fetch_keys_from_api
   → request` 构成调用环，异步模式下必须在其中一条边引入 `Box::pin`（选在罕见的「拉证书」
   那条边，避免热路径每请求多一次分配）；同步模式直接求值。
@@ -446,10 +457,12 @@ MockResponse::json(200, body)          // 默认：正确签名（serial = TEST_
   （靠 `api_error_unverified`，它保留 `code` / `detail`，所以 `SYSTEM_ERROR` 仍会重试）。
 - **微信支付公钥模式**（serial 形如 `PUB_KEY_ID_…`）必须显式配置公钥，否则所有应答都以
   `UnknownPlatformSerial` 失败；该公钥**不在** `/v3/certificates` 里，遇到这个前缀**不会**
-  去刷新证书（那是白打限流接口）。
+  去刷新证书（那是白打限流接口）。灰度期用 `add_static_platform_key`（不切模式 ⇒ 公钥与
+  平台证书两种签名都能验）。
 - `set_platform_keys` / `with_platform_public_key` 之后客户端进入**静态密钥模式**：不自动拉取、
   不自动替换。手工灌入的索引 `fetched_at` 为空 ⇒ `needs_refresh()` 恒为 true，如果不做静态判定，
-  每个请求前都会多打一次 `/v3/certificates`。
+  每个请求前都会多打一次 `/v3/certificates`（`add_static_platform_key` 的注入同理，
+  由 `needs_refresh` 里「注入表非空且轮换表为空」的例外挡住）。
 - 应答验签给每个响应加一次 RSA 验签；公钥 PEM 的解析结果缓存在 `PlatformKeys` 的索引条目里
   （首次 `verify` 时解析一次，解析失败不缓存、`insert` 覆盖会重置缓存），别改成「跳过验签」。
 - `PayType`（`src/pay_type.rs`）是未被 crate 使用的公开 API。

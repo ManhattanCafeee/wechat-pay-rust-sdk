@@ -346,17 +346,13 @@ impl WechatPay {
     ///
     /// 重验用的是已经缓冲在内存里的原始应答 —— **绝不重发业务请求**：对写接口重发会
     /// 改变重放语义（那是 `retry` 模块的管辖范围）。
+    ///
+    /// 「微信支付公钥」（`PUB_KEY_ID_…`）这类拉取也认识不了的 serial 由
+    /// [`WechatPay::refresh_platform_keys_for_unknown_serial`] 直接给出可操作的错误，不在这里判。
     #[maybe_async_attr]
     async fn verify_signed(&self, headers: &NotifyHeaders, body: &str) -> Result<(), PayError> {
         match self.verify_against_index(headers, body) {
             Err(PayError::UnknownPlatformSerial(serial)) => {
-                // 公钥模式的公钥不在平台证书列表里，刷新是白打接口 —— 直接给可操作错误。
-                if serial.starts_with(crate::cert::PUBLIC_KEY_ID_PREFIX) {
-                    return Err(PayError::UnknownPlatformSerial(format!(
-                        "{serial}:这是「微信支付公钥」模式的公钥 ID，它不在平台证书列表里，\
-                         刷新也拿不到。请用 WechatPay::with_platform_public_key 配置公钥"
-                    )));
-                }
                 self.refresh_platform_keys_for_unknown_serial(&serial)
                     .await?;
                 self.verify_against_index(headers, body)

@@ -3275,3 +3275,123 @@ dual_test! {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 双表验签：调用方注入的静态公钥 + 自动轮换的平台证书并存（公钥/证书灰度期）
+// ---------------------------------------------------------------------------
+
+dual_test! {
+    fn injected_and_rotating_tables_verify_in_one_client() {
+        // 灰度期的真实形状：同一个商户的应答可能由**微信支付公钥**或**平台证书**签名。
+        // 注入公钥**不切模式**（`add_static_platform_key`），所以两种都能验，且因为默认
+        // 静态表已可用，冷启动不会预拉平台证书（见 `needs_refresh` 的例外）。
+        let certificates = certificates_response(&[(TEST_PLATFORM_SERIAL_NEW, "nonce_dual01")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, r#"{"prepay_id":"wx_dual_pk"}"#)
+                .signed_with_serial(TEST_PUBLIC_KEY_ID),
+            MockResponse::json(200, r#"{"prepay_id":"wx_dual_cert"}"#)
+                .signed_with_serial(TEST_PLATFORM_SERIAL_NEW),
+            MockResponse::json(200, &certificates).signed_with_serial(TEST_PLATFORM_SERIAL_NEW),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+        let replaced = wechat_pay
+            .add_static_platform_key(TEST_PUBLIC_KEY_ID, public_key_pem())
+            .expect("注入公钥");
+        assert!(!replaced, "首次注入不该报告覆盖");
+
+        let first = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect("公钥签名的应答应当验签通过");
+        assert_eq!(first.prepay_id.as_deref(), Some("wx_dual_pk"));
+        assert_eq!(
+            mock.requests().len(),
+            1,
+            "已注入静态密钥时冷启动不得预拉平台证书"
+        );
+
+        let second = call!(wechat_pay.jsapi_pay(JsapiParams::new("a", "O", 1.into(), "o".into())))
+            .expect("平台证书签名的应答应当按需刷新后验签通过");
+        assert_eq!(second.prepay_id.as_deref(), Some("wx_dual_cert"));
+        let paths: Vec<String> = mock
+            .requests()
+            .iter()
+            .map(|request| request.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/v3/pay/transactions/jsapi",
+                "/v3/pay/transactions/jsapi",
+                "/v3/certificates"
+            ],
+            "期望：公钥签名（无预拉）→ 证书签名（未知 serial）→ 按需拉一次证书"
+        );
+        assert_eq!(
+            wechat_pay.platform_keys().serials(),
+            vec![TEST_PUBLIC_KEY_ID, TEST_PLATFORM_SERIAL_NEW],
+            "两张表必须并存：注入的公钥 + 拉到的平台证书"
+        );
+    }
+}
+
+dual_test! {
+    fn add_static_platform_key_keeps_auto_refresh_alive() {
+        // 与 `with_platform_public_key` 的关键区别：不切静态模式 ⇒ 轮换照旧。
+        // 若实现里误用了 set_platform_keys，`refresh_platform_keys` 会以
+        // 「不会拉取平台证书」失败。
+        let certificates = certificates_response(&[("SERIAL_OLD", "nonce_keep01")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &certificates).signed_with_serial("SERIAL_OLD"),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+        wechat_pay
+            .add_static_platform_key(TEST_PUBLIC_KEY_ID, public_key_pem())
+            .expect("注入公钥");
+
+        let fetched = call!(wechat_pay.refresh_platform_keys())
+            .expect("注入静态密钥不得把客户端切进静态模式");
+        assert_eq!(fetched.serials(), vec!["SERIAL_OLD"], "拉到的只是轮换表");
+        assert_eq!(
+            wechat_pay.platform_keys().serials(),
+            vec![TEST_PUBLIC_KEY_ID, "SERIAL_OLD"],
+            "注入的公钥与拉到的证书必须同时可用"
+        );
+
+        // `set_platform_keys` 的既有语义不变：整体替换（两张表都换掉）并切静态模式
+        wechat_pay.set_platform_keys(PlatformKeys::new());
+        assert!(
+            wechat_pay.platform_keys().is_empty(),
+            "整体替换必须连轮换表一起清掉"
+        );
+        let err = call!(wechat_pay.refresh_platform_keys()).expect_err("静态模式下不得自动拉取");
+        assert!(matches!(err, PayError::VerifyError(_)), "实际: {err:?}");
+    }
+}
+
+dual_test! {
+    fn unknown_public_key_id_never_triggers_a_certificate_fetch() {
+        // 回调路径（应用侧捕的正是这个错误）：`Wechatpay-Serial` 是未鉴权输入，
+        // 伪造一个 `PUB_KEY_ID_…` 不该换来一次 `/v3/certificates`。
+        // mock 的响应队列为空 ⇒ 真发了请求就会拿到 500，计数也会 > 0。
+        let mock = Mock::start(vec![]);
+        let wechat_pay = WechatPay::from_config(test_config()).with_base_url(&mock.base_url);
+        wechat_pay
+            .add_static_platform_key(TEST_PUBLIC_KEY_ID, public_key_pem())
+            .expect("注入公钥");
+
+        let err = call!(wechat_pay.refresh_platform_keys_for_unknown_serial("PUB_KEY_ID_UNKNOWN"))
+            .expect_err("未知的公钥 ID 不该被当成可轮换的 serial");
+
+        match err {
+            PayError::UnknownPlatformSerial(message) => {
+                assert!(message.contains("PUB_KEY_ID_UNKNOWN"), "消息应含 serial: {message}");
+                assert!(
+                    message.contains("add_static_platform_key")
+                        || message.contains("with_platform_public_key"),
+                    "必须给出可操作的下一步: {message}"
+                );
+            }
+            other => panic!("应为 UnknownPlatformSerial，实际 {other:?}"),
+        }
+        assert_eq!(mock.requests().len(), 0, "公钥 ID 连一次证书请求都不该触发");
+    }
+}

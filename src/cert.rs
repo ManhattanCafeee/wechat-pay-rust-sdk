@@ -1,20 +1,26 @@
-//! 平台证书 / 微信支付公钥的按键索引。
+//! 平台证书 / 微信支付公钥的按键索引（**两张表**:调用方注入的静态密钥 + 自动轮换的平台证书）。
 //!
 //! 微信平台证书**轮换期会同时下发新旧两张且都在有效期内**，验签必须按请求头
 //! `Wechatpay-Serial` 选择对应的密钥。写死单张证书的写法在轮换时会直接导致回调
 //! 验签全部失败 —— 也就是订单不发货。
 //!
+//! 微信支付公钥与平台证书的**灰度切换期**又要求反过来：同一商户的回调/应答可能由**公钥**
+//! 或**平台证书**签名，两种都得认。因此 [`PlatformKeys`](crate::cert::PlatformKeys) 里是两张表：
+//! 调用方用 `insert` / [`WechatPay::add_static_platform_key`](crate::pay::WechatPay::add_static_platform_key)
+//! 注入的固定公钥，以及 SDK 自动拉取的平台证书；选键**静态表优先**。
+//!
 //! 本模块提供：
 //!
-//! * [`PlatformKeys`](crate::cert::PlatformKeys) —— `serial_no -> 公钥 PEM` 的索引，
+//! * [`PlatformKeys`](crate::cert::PlatformKeys) —— `serial_no -> 公钥 PEM` 的两表索引，
 //!   支持按 serial 选键；
 //! * [`WechatPay::fetch_platform_keys`](crate::pay::WechatPay::fetch_platform_keys) ——
 //!   拉取 `GET /v3/certificates`、逐张解密并建索引（**无状态**，返回给调用方）；
 //! * [`WechatPay::refresh_platform_keys`](crate::pay::WechatPay::refresh_platform_keys) ——
-//!   拉取并**整体替换**客户端内部那份索引（出站应答验签用的就是它）。
+//!   拉取并**只替换轮换表**（注入的静态密钥不受影响；出站应答验签用的就是同一份索引）。
 //!
-//! 客户端内部那份索引由 SDK 自己维护：每次请求前按 12 小时窗口判断是否该刷新
-//! （冷启动时就是首次拉取），遇到未知 `Wechatpay-Serial` 会**再刷新一次并重验**。
+//! 轮换表由 SDK 自己维护：每次请求前按 12 小时窗口判断是否该刷新（冷启动时就是首次拉取），
+//! 遇到未知 `Wechatpay-Serial` 会**再刷新一次并重验**；已注入静态密钥且从未拉取过时不预拉
+//! （改为按需，见 [`PlatformKeys::needs_refresh`](crate::cert::PlatformKeys::needs_refresh)）。
 //! 回调验签请用手里的 [`PlatformKeys`](crate::cert::PlatformKeys)：`PlatformKeys::verify_notify`，
 //! 一旦拿到
 //! [`PayError::UnknownPlatformSerial`](crate::error::PayError::UnknownPlatformSerial)
@@ -131,13 +137,22 @@ impl KeyEntry {
     }
 }
 
-/// `serial_no -> 公钥 PEM` 的索引（首次验签时解析公钥并缓存，见 [`PlatformKeys::verify`]）。
+/// 平台密钥索引:**两张表** + 轮换表的新鲜度。
 ///
-/// 不含网络逻辑：由调用方决定何时拉取与刷新，因此可以离线单测、也便于放进
+/// - `injected`:调用方注入的固定密钥(微信支付公钥、自建密钥源),不参与轮换 ——
+///   平台证书列表里根本没有它们,整体替换只会把它们抹掉。
+/// - `rotating`:自动拉取的平台证书,`GET /v3/certificates` 的安装目标。
+///
+/// 选键顺序**静态表优先**:同一 serial 两表都有时用注入的那把(官方公钥灰度期,商户自己钉的
+/// 公钥是更权威的来源),轮换表那条只是被遮蔽、不会被删除。命中注入表但 PEM / 签名坏时直接失败,
+/// **不**回落到轮换表 —— 静默降级会让「密钥配错了」看起来像「轮换还没完成」。
+///
+/// 不含网络逻辑:由调用方决定何时拉取与刷新,因此可以离线单测、也便于放进
 /// 应用状态里跨请求复用。
 #[derive(Debug, Default, Clone)]
 pub struct PlatformKeys {
-    keys: HashMap<String, KeyEntry>,
+    injected: HashMap<String, KeyEntry>,
+    rotating: HashMap<String, KeyEntry>,
     fetched_at: Option<i64>,
 }
 
@@ -147,70 +162,121 @@ impl PlatformKeys {
         Self::default()
     }
 
-    /// 插入或覆盖一个密钥；返回是否覆盖了已有条目。
+    /// 插入或覆盖一把**调用方注入**的密钥(静态表);返回是否覆盖了已有条目。
     ///
-    /// 不解析 PEM（失败推迟到首次 [`PlatformKeys::verify`]）；覆盖会把旧的解析缓存一并丢弃。
+    /// 不解析 PEM(失败推迟到首次 [`PlatformKeys::verify`]);覆盖会把旧的解析缓存一并丢弃。
     pub fn insert(
         &mut self,
         serial_no: impl Into<String>,
         public_key_pem: impl Into<String>,
     ) -> bool {
-        self.keys
+        insert_entry(&mut self.injected, serial_no.into(), public_key_pem.into())
+    }
+
+    /// 插入或覆盖一把**轮换表**密钥(平台证书);只给 `GET /v3/certificates` 的安装路径用。
+    pub(crate) fn insert_rotating(
+        &mut self,
+        serial_no: impl Into<String>,
+        public_key_pem: impl Into<String>,
+    ) -> bool {
+        insert_entry(&mut self.rotating, serial_no.into(), public_key_pem.into())
+    }
+
+    /// 插入一把**已解析**的注入密钥:配置期的 PEM 当场解析,不推迟到首次验签
+    /// (坏 PEM 属于配置错误,应当在注入时就报错)。
+    pub(crate) fn insert_parsed(
+        &mut self,
+        serial_no: String,
+        public_key_pem: String,
+        parsed: Arc<RsaPublicKey>,
+    ) -> bool {
+        self.injected
             .insert(
-                serial_no.into(),
+                serial_no,
                 KeyEntry {
-                    pem: public_key_pem.into(),
-                    parsed: OnceLock::new(),
+                    pem: public_key_pem,
+                    parsed: OnceLock::from(parsed),
                 },
             )
             .is_some()
     }
 
-    /// 按 `Wechatpay-Serial` 取公钥 PEM。
+    /// 只替换**轮换表**(安装一次拉取结果):调用方注入的静态密钥不受影响。
+    pub(crate) fn install_rotating(&mut self, fetched: PlatformKeys) {
+        self.rotating = fetched.rotating;
+    }
+
+    /// 按 `Wechatpay-Serial` 取公钥 PEM(静态表优先,未命中再查轮换表)。
     pub fn get(&self, serial_no: &str) -> Option<&str> {
-        self.keys.get(serial_no).map(|entry| entry.pem.as_str())
+        self.entry(serial_no).map(|entry| entry.pem.as_str())
     }
 
-    /// 索引中已有的密钥数量。轮换期正常会有 2 个。
+    /// 索引里的密钥数量(两表**去重**:同一 serial 两表都有只算一次)。轮换期正常会有 2 个。
     pub fn len(&self) -> usize {
-        self.keys.len()
+        self.injected.len()
+            + self
+                .rotating
+                .keys()
+                .filter(|serial| !self.injected.contains_key(*serial))
+                .count()
     }
 
-    /// 索引是否为空（从未成功拉取过，或返回的证书列表为空）。
+    /// 索引是否为空(两张表都没有密钥)。
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.injected.is_empty() && self.rotating.is_empty()
     }
 
-    /// 当前索引里的全部 serial_no（排序后），用于排查「到底认了哪几张证书」。
+    /// 当前索引里的全部 serial_no(两表合并去重、排序后),用于排查「到底认了哪几张证书」。
     pub fn serials(&self) -> Vec<&str> {
-        let mut out: Vec<&str> = self.keys.keys().map(String::as_str).collect();
+        let mut out: Vec<&str> = self
+            .injected
+            .keys()
+            .chain(self.rotating.keys())
+            .map(String::as_str)
+            .collect();
         out.sort_unstable();
+        out.dedup();
         out
     }
 
-    /// 记录一次成功拉取的时间（unix 秒）。
+    /// 记录一次成功拉取的时间(unix 秒)。
     pub fn mark_refreshed(&mut self, now_unix_secs: i64) {
         self.fetched_at = Some(now_unix_secs);
     }
 
-    /// 最近一次成功拉取的时间（unix 秒）；从未拉取过则为 `None`。
+    /// 最近一次成功拉取的时间(unix 秒);从未拉取过则为 `None`。
     pub fn fetched_at(&self) -> Option<i64> {
         self.fetched_at
     }
 
-    /// 是否该重新拉取了。从未拉取过、或距上次拉取已达
-    /// [`REFRESH_INTERVAL_SECS`] 都返回 `true`。
+    /// 轮换表是否该重新拉取了。
+    ///
+    /// **例外**:调用方已经注入静态密钥、轮换表又从未拉取过(双表并用、且还没遇到需要平台证书的
+    /// 场合)时返回 `false` —— 轮换表改为**按需**填充(未知 serial 时由
+    /// [`WechatPay::refresh_platform_keys_for_unknown_serial`] 拉一次)。否则纯公钥模式的每个请求
+    /// 前都会先拉一次证书接口,而该接口不可达时业务会全盘失败 —— 这正是公钥模式要避免的强依赖。
     pub fn needs_refresh(&self, now_unix_secs: i64) -> bool {
+        if self.fetched_at.is_none() && self.rotating.is_empty() && !self.injected.is_empty() {
+            return false;
+        }
         match self.fetched_at {
             None => true,
             Some(fetched) => now_unix_secs.saturating_sub(fetched) >= REFRESH_INTERVAL_SECS,
         }
     }
 
+    /// 按选键顺序取条目:静态表优先,未命中再看轮换表。
+    fn entry(&self, serial_no: &str) -> Option<&KeyEntry> {
+        self.injected
+            .get(serial_no)
+            .or_else(|| self.rotating.get(serial_no))
+    }
+
     /// 用 `serial_no` 对应的密钥验证 `timestamp\nnonce\nbody\n` 的签名。
     ///
-    /// serial 不在索引里时返回 [`PayError::UnknownPlatformSerial`] —— 这通常意味着
-    /// 微信正在轮换证书，应当重新拉取列表后重试，**不要**退化成用别的密钥去试。
+    /// 选键顺序与 [`PlatformKeys::get`] 一致(静态表优先);两表都没有该 serial 时返回
+    /// [`PayError::UnknownPlatformSerial`] —— 这通常意味着微信正在轮换证书,应当重新拉取列表
+    /// 后重试,**不要**退化成用别的密钥去试。
     pub fn verify(
         &self,
         serial_no: &str,
@@ -220,14 +286,30 @@ impl PlatformKeys {
         signature: &str,
     ) -> Result<(), PayError> {
         let entry = self
-            .keys
-            .get(serial_no)
+            .entry(serial_no)
             .ok_or_else(|| PayError::UnknownPlatformSerial(serial_no.to_string()))?;
-        // 公钥解析结果缓存在条目里：热路径上同一把钥匙只解析一次（失败不缓存）。
+        // 公钥解析结果缓存在条目里:热路径上同一把钥匙只解析一次(失败不缓存)。
         let public_key = entry.parsed_key()?;
         let message = format!("{timestamp}\n{nonce}\n{body}\n");
         util::verify_rsa_sha256_with_key(&public_key, &message, signature)
     }
+}
+
+/// 往指定表里插一条未解析的条目;返回是否覆盖了同 serial 的旧条目。
+fn insert_entry(
+    table: &mut HashMap<String, KeyEntry>,
+    serial_no: String,
+    public_key_pem: String,
+) -> bool {
+    table
+        .insert(
+            serial_no,
+            KeyEntry {
+                pem: public_key_pem,
+                parsed: OnceLock::new(),
+            },
+        )
+        .is_some()
 }
 
 impl WechatPay {
@@ -285,6 +367,15 @@ impl WechatPay {
         &self,
         serial: &str,
     ) -> Result<(), PayError> {
+        // `PUB_KEY_ID_…`（微信支付公钥）**不在**平台证书列表里：刷新是白打接口，而且回调里的
+        // serial 来自未鉴权输入 —— 放到限流之前拦掉，伪造的公钥 ID 连一次证书请求都触发不了。
+        // 静态表里没有它只有两种可能：公钥还没注入，或微信换了公钥（要重新下载再注入）。
+        if serial.starts_with(PUBLIC_KEY_ID_PREFIX) {
+            return Err(PayError::UnknownPlatformSerial(format!(
+                "{serial}:该 serial 是微信支付公钥（不在平台证书列表里），拉取证书无法认识它；\
+                 请用 add_static_platform_key（或 with_platform_public_key）注入这把公钥后重试"
+            )));
+        }
         if !self.auto_refresh_keys() {
             return Err(PayError::UnknownPlatformSerial(format!(
                 "{serial}:当前客户端使用调用方提供的密钥（公钥模式 / set_platform_keys），\
@@ -338,10 +429,14 @@ impl WechatPay {
         })
     }
 
-    /// 确保密钥索引可用：Auto 模式下按 12 小时窗口刷新（索引为空时就是冷启动引导）。
+    /// 确保密钥索引可用：轮换表按 12 小时窗口刷新（索引为空时就是冷启动引导）。
     ///
     /// 由 `request_json` / `request_no_content` 在**发送前**调用。静态密钥模式与关闭验签时
     /// 什么都不做 —— 密钥要么由调用方负责，要么根本用不上。
+    ///
+    /// 刷新失败**不必然**让请求失败：只要索引里还有一份可用密钥（典型场景是调用方注入的
+    /// 静态公钥 + 轮换表刷新失败），请求照发 —— 那份密钥能验的应答/回调仍然验得过，
+    /// 验不了的会按「未知 serial」单独失败。只有一份密钥都没有时才把拉取错误原样带出。
     #[maybe_async_attr]
     pub(crate) async fn ensure_keys(&self) -> Result<(), PayError> {
         if self.response_verify == ResponseVerify::Disabled || !self.auto_refresh_keys() {
@@ -350,11 +445,15 @@ impl WechatPay {
         if !self.keys_need_refresh() {
             return Ok(());
         }
-        self.refresh_platform_keys().await?;
+        let refreshed = self.refresh_platform_keys().await;
         if self.platform_keys_read().is_empty() {
+            refreshed?;
             return Err(PayError::VerifyError(
                 "平台证书索引为空：自动拉取平台证书失败或仍在进行中，无法验证应答签名".to_string(),
             ));
+        }
+        if let Err(err) = refreshed {
+            debug!("平台证书刷新失败，继续用现有索引（静态密钥仍可验签）: {err}");
         }
         Ok(())
     }
@@ -426,7 +525,8 @@ impl WechatPay {
                 debug!("客户端已切到静态密钥模式，放弃安装本次拉取结果");
                 return Ok(guard.clone());
             }
-            *guard = keys.clone();
+            // 只替换轮换表:调用方注入的静态公钥不属于这次拉取的结果
+            guard.install_rotating(keys.clone());
             guard.mark_refreshed(crate::util::now_unix_secs());
         }
         Ok(keys)
@@ -492,7 +592,8 @@ impl WechatPay {
             }
             let public_key_pem = util::x509_to_pem(plaintext.as_slice())
                 .map_err(|e| PayError::VerifyError(format!("平台证书解析失败: {e}")))?;
-            keys.insert(serial_no.clone(), public_key_pem);
+            // 拉来的证书进**轮换表**:调用方注入的静态密钥不能被平台证书列表覆盖
+            keys.insert_rotating(serial_no.clone(), public_key_pem);
         }
         Ok(keys)
     }
@@ -573,7 +674,7 @@ awIDAQAB
             "首次验签应解析一次公钥"
         );
         assert!(
-            keys.keys["SERIAL_CACHED"].parsed.get().is_some(),
+            keys.injected["SERIAL_CACHED"].parsed.get().is_some(),
             "首次验签后应把解析结果缓存进条目"
         );
 
@@ -607,5 +708,107 @@ awIDAQAB
             }
             other => panic!("应为 VerifyError，实际 {other:?}"),
         }
+    }
+
+    /// 两表的归属、选键顺序（静态优先）与「安装拉取结果只动轮换表」
+    #[test]
+    fn two_tables_keep_their_own_entries() {
+        let mut keys = PlatformKeys::new();
+        assert!(!keys.insert("SERIAL_INJECTED", TEST_PUBLIC_KEY_PEM));
+        assert!(!keys.insert_rotating("SERIAL_ROTATING", TEST_PUBLIC_KEY_PEM));
+        assert_eq!(keys.serials(), vec!["SERIAL_INJECTED", "SERIAL_ROTATING"]);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.get("SERIAL_ROTATING"), Some(TEST_PUBLIC_KEY_PEM));
+
+        // 同一 serial 两表都有：静态表获胜，且只算一个 serial
+        keys.insert("SERIAL_BOTH", "INJECTED_PEM");
+        keys.insert_rotating("SERIAL_BOTH", "ROTATING_PEM");
+        assert_eq!(keys.get("SERIAL_BOTH"), Some("INJECTED_PEM"));
+        assert_eq!(
+            keys.serials(),
+            vec!["SERIAL_BOTH", "SERIAL_INJECTED", "SERIAL_ROTATING"]
+        );
+        assert_eq!(keys.len(), 3, "同一 serial 两表都有只算一次");
+        // 注入表那条坏 PEM：不许回落到轮换表（静默降级会让配错密钥看起来像「轮换还没完成」）
+        assert!(matches!(
+            keys.verify("SERIAL_BOTH", "1700000000", "nonce", "{}", "AAAA"),
+            Err(PayError::VerifyError(_))
+        ));
+
+        // 安装一次拉取结果：只替换轮换表，注入的密钥必须留下
+        let mut fetched = PlatformKeys::new();
+        fetched.insert_rotating("SERIAL_FRESH", TEST_PUBLIC_KEY_PEM);
+        keys.install_rotating(fetched);
+        assert_eq!(keys.get("SERIAL_INJECTED"), Some(TEST_PUBLIC_KEY_PEM));
+        assert_eq!(keys.get("SERIAL_ROTATING"), None, "轮换表是整体替换");
+        assert_eq!(keys.get("SERIAL_FRESH"), Some(TEST_PUBLIC_KEY_PEM));
+    }
+
+    /// `needs_refresh` 的冷启动例外：**已注入静态密钥且从未拉取过**时返回 false
+    /// （轮换表改为按需拉取），其余情况保持原有时间窗语义。
+    #[test]
+    fn needs_refresh_skips_the_cold_start_only_when_a_static_key_exists() {
+        let now = 1_700_000_000;
+
+        // 两张表都空：冷启动必须拉
+        assert!(PlatformKeys::new().needs_refresh(now));
+
+        // 只有注入的静态密钥、从未拉取：不预拉
+        let mut injected_only = PlatformKeys::new();
+        injected_only.insert("SERIAL_INJECTED", TEST_PUBLIC_KEY_PEM);
+        assert!(!injected_only.needs_refresh(now));
+
+        // 轮换表有内容且已过窗口：照刷
+        let mut stale = injected_only.clone();
+        stale.insert_rotating("SERIAL_ROT", TEST_PUBLIC_KEY_PEM);
+        stale.mark_refreshed(now - REFRESH_INTERVAL_SECS - 1);
+        assert!(stale.needs_refresh(now));
+
+        // 轮换表新鲜：不刷
+        let mut fresh = stale.clone();
+        fresh.mark_refreshed(now - 10);
+        assert!(!fresh.needs_refresh(now));
+
+        // 只有轮换表、且从未标记过拉取时间：要刷
+        let mut rotating_only = PlatformKeys::new();
+        rotating_only.insert_rotating("SERIAL_ROT", TEST_PUBLIC_KEY_PEM);
+        assert!(rotating_only.needs_refresh(now));
+    }
+
+    /// 双表并存时轮换表刷新失败**不该**让请求失败：注入的静态密钥仍能验签。
+    ///
+    /// 回归点：`ensure_keys` 原先无条件 `?` 传播拉取错误 —— 公钥模式加上轮换表之后，
+    /// 证书接口一抖动就会把「本来验得过的公钥签名报文」一起打掉。
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn refresh_failure_does_not_fail_requests_when_a_static_key_remains() {
+        let client = WechatPay::from_config(crate::pay::WechatPayConfig {
+            appid: "wx_test_appid".to_string(),
+            mch_id: "1900000001".to_string(),
+            private_key: "not-parsed-until-first-sign".to_string(),
+            serial_no: "5F3A1B7C9D2E4F6081A2B3C4D5E6F708192A3B4C".to_string(),
+            v3_key: "0123456789abcdef0123456789abcdef".to_string(),
+            notify_url: "https://example.com/notify".to_string(),
+            response_verify: ResponseVerify::Required,
+        })
+        // 必然连不上的地址 + 关掉重试(否则要等退避)
+        .with_base_url("http://127.0.0.1:1")
+        .with_retry(crate::retry::RetryPolicy::disabled());
+        client
+            .add_static_platform_key("PUB_KEY_ID_INLINE_TEST", TEST_PUBLIC_KEY_PEM)
+            .expect("注入公钥");
+
+        // 造「轮换表已过刷新窗口」的状态；注入的静态密钥仍在
+        {
+            let mut guard = client.platform_keys_write();
+            guard.insert_rotating("SERIAL_ROTATING_STALE", TEST_PUBLIC_KEY_PEM);
+            guard.mark_refreshed(crate::util::now_unix_secs() - REFRESH_INTERVAL_SECS - 1);
+        }
+        assert!(client.keys_need_refresh(), "前置状态：轮换表已过刷新窗口");
+
+        client
+            .ensure_keys()
+            .await
+            .expect("有静态密钥时，轮换表刷新失败不该让请求失败");
     }
 }

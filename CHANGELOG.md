@@ -102,9 +102,38 @@
 - **`WechatPay::with_base_urls(primary, backups)`**：主 + 备网关地址，每次重试轮换到下一个
   （官方跨城冗灾）；host 不参与签名，换域名重发与同域名重试的重放语义一致；
   不配置备域名时行为与原先逐字节一致。
+- **`WechatPay::add_static_platform_key(serial, pem) -> Result<bool, PayError>`**：向**静态密钥表**
+  注入一把公钥（典型是微信支付公钥），**不改变模式** —— 平台证书的自动拉取 / 12 小时刷新 /
+  未知 serial 刷新照旧。同一个客户端因此能同时验证「静态公钥」与「轮换中的平台证书」签名的
+  应答与回调，这正是官方**微信支付公钥 ⇄ 平台证书灰度切换期**的要求（切换期间同一商户的报文
+  可能由两者随机签名）。PEM 当场解析（坏 PEM 立即返回 `VerifyError`，不等到第一笔回调），
+  返回 `Ok(true)` 表示覆盖了静态表里同 serial 的旧条目。
+  与 `with_platform_public_key`（注入 + 切静态模式）的区别只在于**模式是否被切走**。
+- **`PlatformKeys` 变为双表**（`injected` 调用方注入 + `rotating` 自动拉取的平台证书）：
+  新增 `PlatformKeys::insert` 写入注入表、`add_static_platform_key` 为注入入口；选键
+  **静态表优先**（同一 serial 两表都有时用注入的那把）；`len` / `serials` / `is_empty`
+  报告两表合并（去重）的结果。`PlatformKeys::get` / `verify` 因此对回调与应答同时可见两表。
+- 离线用例从 73 增到 84：公钥与平台证书两种签名在同一客户端内各自验签通过、注入公钥后
+  **冷启动不预拉证书**、按需（未知 serial）拉一次证书后重验、显式刷新仍可用（模式未被切走）、
+  `set_platform_keys` 仍整体替换并切静态模式、未知公钥 ID 连一次证书请求都不触发，
+  以及「轮换表刷新失败但有静态密钥时请求照发」。
 
 ### 行为变更
 
+- **`PlatformKeys::needs_refresh` 在「调用方已注入静态密钥、轮换表又从未拉取过」时返回 `false`**：
+  轮换表改为**按需**填充（未知 serial 时拉一次）。否则纯公钥模式（双表并用）的每个请求前都会
+  先打一次 `/v3/certificates`，而该接口不可达时业务会全盘失败 —— 那正是公钥模式要避免的强依赖。
+  轮换表一旦有内容，12 小时窗口语义不变。
+- **`ensure_keys`（请求前的密钥自检）不再无条件传播拉取失败**：只要索引里**还有一份可用密钥**
+  （典型是注入的静态公钥 + 该次拉取失败），请求照发，失败只记 `debug` 日志；一份密钥都没有时
+  仍会返回 `VerifyError` 或原拉取错误。验签本身不放松：验不过的应答仍按未知 serial 单独失败。
+- **未知 `Wechatpay-Serial` 的 `PUB_KEY_ID_…` 分支从应答验签移至刷新入口**
+  （`refresh_platform_keys_for_unknown_serial`）：语义与文案不变（仍含
+  `with_platform_public_key` 的指引，并补上 `add_static_platform_key`），效果是**回调路径**同样
+  不再为伪造的公钥 ID 打一次 `/v3/certificates`。
+- **`refresh_platform_keys` / 证书安装现在只替换轮换表**（不再 `*guard = keys` 整体覆盖）：
+  注入的静态密钥不会被一次平台证书拉取抹掉。`set_platform_keys` 仍是**整体替换两张表**并切
+  静态模式（调用方提供的就是全部可信材料）。
 - **`SignData` 的 JSON 键名改为官方大小写**：`timestamp` → `timeStamp`、`nonce_str` → `nonceStr`、
   `sign_type` → `signType`、`pay_sign` → `paySign`、`app_id` → `appId`（Rust 字段名不变）。
   此前序列化出来全是 snake_case，而 `wx.requestPayment` 的参数名是官方定死的 camelCase
