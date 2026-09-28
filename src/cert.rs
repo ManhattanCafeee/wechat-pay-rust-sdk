@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::header::HeaderMap;
 use rsa::RsaPublicKey;
@@ -55,13 +55,17 @@ pub const REFRESH_INTERVAL_SECS: i64 = 12 * 60 * 60;
 /// 配错），未知 serial 会按请求频率重试证书接口 —— 那种情况下业务本身已经在报错。
 pub const UNKNOWN_SERIAL_REFRESH_MIN_INTERVAL_SECS: i64 = 60;
 
-/// 等待并发刷新结束时的轮询间隔与轮数（有界：异步模式下不能无限等）。
-///
-/// 2s 的等待预算：够一次正常的证书拉取（含一次重试），又不至于让业务请求长时间挂在
-/// 「等别人刷证书」上。等不到也没关系 —— 失败是**响亮且保守**的（`UnknownPlatformSerial`，
-/// 对写接口是「结果未知」），不会把没验签的应答当成功。
+/// 等待并发刷新结束时的轮询间隔（单次等待的上限；总预算见 [`DEFAULT_KEY_REFRESH_WAIT`]）。
 const REFRESH_WAIT_INTERVAL: Duration = Duration::from_millis(200);
-const REFRESH_WAIT_ROUNDS: u32 = 10;
+
+/// 等待并发平台证书刷新完成的**默认预算**：2 秒（原先硬编码的 200ms × 10 轮的等价值）。
+///
+/// 刷新是单飞的：同一时刻只有一个请求去打 `/v3/certificates`，其余请求每 200ms 轮询一次
+/// 等它结束（见 `wait_for_refresh`）。预算用
+/// [`WechatPay::with_key_refresh_wait`](crate::pay::WechatPay::with_key_refresh_wait) 覆盖；
+/// 等超预算的请求会拿到 [`PayError::UnknownPlatformSerial`]（消息里带预算毫秒数）——
+/// 对自己发起的业务请求而言这是响亮且保守的失败，不会把没验签的应答当成功。
+pub const DEFAULT_KEY_REFRESH_WAIT: Duration = Duration::from_millis(2000);
 
 /// 微信支付公钥模式的 `Wechatpay-Serial` 前缀。
 ///
@@ -379,14 +383,23 @@ impl WechatPay {
         Ok(self.platform_keys())
     }
 
-    /// 有界等待正在进行的刷新结束（轮询 `in_flight`，最多 `REFRESH_WAIT_ROUNDS` 轮）。
+    /// 有界等待正在进行的刷新结束：轮询 `in_flight`，预算由
+    /// [`WechatPay::with_key_refresh_wait`](crate::pay::WechatPay::with_key_refresh_wait) 决定。
     #[maybe_async_attr]
     async fn wait_for_refresh(&self) -> Result<(), PayError> {
-        for _ in 0..REFRESH_WAIT_ROUNDS {
+        let budget = self.key_refresh_wait;
+        let started = Instant::now();
+        loop {
             if !self.key_refresh.in_flight.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            sleep_for(REFRESH_WAIT_INTERVAL).await;
+            // 预算耗尽即收手（预算为 `Duration::ZERO` 时在这里立即命中 —— 等价于「不等待」）。
+            let elapsed = started.elapsed();
+            if elapsed >= budget {
+                break;
+            }
+            // 单次等待不超过剩余预算：短预算下不会睡满一整轮。
+            sleep_for(REFRESH_WAIT_INTERVAL.min(budget - elapsed)).await;
         }
         // 睡完最后一轮再确认一次，避免刚好卡在边界上。
         if !self.key_refresh.in_flight.load(Ordering::SeqCst) {
@@ -394,7 +407,7 @@ impl WechatPay {
         }
         Err(PayError::UnknownPlatformSerial(format!(
             "平台证书正在刷新中，等待超过 {}ms 仍未完成",
-            REFRESH_WAIT_INTERVAL.as_millis() * u128::from(REFRESH_WAIT_ROUNDS)
+            budget.as_millis()
         )))
     }
 

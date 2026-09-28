@@ -488,6 +488,26 @@ pub struct WechatPayNotifySource {
     pub nonce: String,
 }
 
+/// 微信回调 `resource` 固定使用的加密算法。
+const NOTIFY_RESOURCE_ALGORITHM: &str = "AEAD_AES_256_GCM";
+
+impl WechatPayNotifySource {
+    /// 校验 `algorithm` 是本 SDK 支持的加密算法（`AEAD_AES_256_GCM`）。
+    ///
+    /// 微信只使用 AEAD_AES_256_GCM 加密回调的 `resource`。这道校验放在解密**之前**，
+    /// 是为了让「算法不是 GCM」报成明确错误，而不是退化成 GCM 解密失败 —— 后者会把
+    /// 「语义拒绝 / 需要升级 SDK」指向「密文或密钥不对」这个错误方向。
+    pub fn validate_algorithm(&self) -> Result<(), crate::error::PayError> {
+        if self.algorithm != NOTIFY_RESOURCE_ALGORITHM {
+            return Err(crate::error::PayError::DecryptError(format!(
+                "不支持的回调加密算法「{}」：微信回调的 resource 固定用 {NOTIFY_RESOURCE_ALGORITHM} 加密",
+                self.algorithm
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// 微信支付回调通知报文。
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WechatPayNotify {

@@ -195,6 +195,10 @@ impl WechatPay {
     ///
     /// 每次尝试都重新签名：重试可能跨过 5 分钟的签名有效窗口，复用旧签名会直接 401。
     /// 每次尝试也各自验签（应答是新的，签名自然也是新的）。
+    ///
+    /// 每次尝试的网关地址按
+    /// [`WechatPay::with_base_urls`](crate::pay::WechatPay::with_base_urls) 轮换
+    /// （未配置备域名时恒为主域名）。
     #[maybe_async_attr]
     pub(crate) async fn request(
         &self,
@@ -212,7 +216,7 @@ impl WechatPay {
             let headers = self.build_header(method, url, body)?;
             // 复用 `WechatPay` 持有的客户端：连接池跨请求共享，不必每次重新建连 / TLS 握手。
             let client = &self.client;
-            let full_url = format!("{}{}", self.base_url(), url);
+            let full_url = format!("{}{}", self.gateway_for_attempt(attempt), url);
             debug!("url: {} body: {}", full_url, body);
             let builder = match method {
                 HttpMethod::GET => client.get(full_url),

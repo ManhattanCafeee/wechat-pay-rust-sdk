@@ -31,6 +31,7 @@
   - [错误处理](#错误处理)
   - [超时与连接复用](#超时与连接复用)
   - [自动重试](#自动重试)
+  - [主备域名（跨城冗灾）](#主备域名跨城冗灾)
 
 # 使用指南
 引入依赖
@@ -222,6 +223,7 @@ println!("{args}");
 > 抓到一次合法回调就能反复投递。而且这段用了 `.unwrap()`，出错会变成 500 让微信一直重投。
 > 正确顺序与完整示例见「[回调通知：验签与防重放](#回调通知验签与防重放)」，
 > 可直接运行的版本见 `example/src/main.rs`。
+> 推荐入口是 `wechat_pay.decrypt_notify(&notify.resource)` —— 它会先校验 `resource.algorithm`。
 
 ```rust
 use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
@@ -459,7 +461,9 @@ match refund.status.as_str() {
 ## 回调通知：验签与防重放
 
 ```rust
+use wechat_pay_rust_sdk::model::WechatPayNotify;
 use wechat_pay_rust_sdk::notify::NotifyHeaders;
+use wechat_pay_rust_sdk::pay::PayNotifyTrait; // decrypt_notify 是 trait 方法
 
 // 启动时拉一次平台证书，之后每 12 小时内刷新
 let mut keys = wechat_pay.fetch_platform_keys().await?;
@@ -473,11 +477,13 @@ keys.mark_refreshed(now);
 let headers = NotifyHeaders::from_pairs(req_headers)?; // 任意框架的 (name, value) 迭代器
 keys.verify_notify(&headers, raw_body)?;               // 新鲜度 → 按 serial 选键 → 验签
 
-let data = wechat_pay.decrypt_paydata(ciphertext, nonce, associated_data)?;
+// 解密：入口会先校验 resource.algorithm（非 AEAD_AES_256_GCM 在解密前就报错）
+let notify: WechatPayNotify = serde_json::from_str(raw_body)?;
+let data = wechat_pay.decrypt_notify(&notify.resource)?;
 // 然后按 out_trade_no 落库去重 —— 幂等必须你自己做
 ```
 
-三点必须记住：
+几点必须记住：
 
 1. **`raw_body` 必须是原始字节。** 若框架先把 body 反序列化成 JSON、再序列化回去，
    字节变了，验签必然失败。用 `Bytes` 之类的类型拿原始体。
@@ -485,11 +491,14 @@ let data = wechat_pay.decrypt_paydata(ciphertext, nonce, associated_data)?;
    这是正常流量，直接拒绝即可，不要为它开特例。
 3. **SDK 不替你做幂等。** 微信在收到成功应答前会重试（15s/15s/30s/3m/…
    最多 15 次），必须按 `out_trade_no` / `transaction_id` 落库去重后再发货。
-4. **退款结果通知要换一个解码器。** `decrypt_paydata` 解的是**支付**通知；退款通知
+4. **退款结果通知要换一个解码器。** `decrypt_notify` 解的是**支付**通知；退款通知
    （`REFUND.SUCCESS` / `REFUND.ABNORMAL` / `REFUND.CLOSED`）的字段不重合（没有
    `appid` / `trade_state`，多了 `out_refund_no` / `refund_status`），要用
-   `decrypt_refund_paydata` 解成 `WechatPayRefundDecodeData` —— 否则会以「缺字段」失败。
-   两条通知的验签流程完全一样。
+   `decrypt_refund_notify(&notify.resource)` 解成 `WechatPayRefundDecodeData` —— 否则会以
+   「缺字段」失败。两条通知的验签流程完全一样。
+5. **`resource.algorithm` 不必自己比对。** 两个 `decrypt_*_notify` 入口会先校验它是
+   `AEAD_AES_256_GCM`（微信回调的固定取值）：不是就在解密**之前**返回 `DecryptError`，
+   而不是让你拿到一个方向错误的「GCM 解密失败」。
 
 应答要求：**5 秒内**返回，成功时返回 HTTP **200 或 204 且不带 body**；
 校验或处理失败才返回 4xx/5xx + `{"code":"FAIL","message":"…"}`。业务处理请异步化。
@@ -585,6 +594,10 @@ let config = WechatPayConfig {
   `REFRESH_INTERVAL_SECS` 帮你判断。⚠ 用 `set_platform_keys` /
   `with_platform_public_key` 设置的索引属于**调用方负责**：SDK 不会自动拉取或替换它
   （否则会把公钥模式配置的公钥抹掉）。
+- 单飞刷新期间其它请求会等到刷新结束（默认最多 **2 秒**）；并发冷启动多、证书接口慢的场景
+  可以用 `wechat_pay.with_key_refresh_wait(Duration::from_secs(5))` 调大预算 ——
+  等超预算的请求会拿到 `UnknownPlatformSerial`（消息里带预算毫秒数），`Duration::ZERO`
+  则是完全不等待。
 
 ## 错误处理
 
@@ -724,3 +737,23 @@ let wechat_pay = wechat_pay.with_refund_retry(RetryPolicy::disabled());
 
 「该不该重试」由失败分类决定，**策略只控制次数与退避** —— 把 `max_attempts` 调大
 也不会让写接口在超时后被重试。
+
+## 主备域名（跨城冗灾）
+
+官方要求「正常使用主域名调用……当域名出现请求超时、读写超时，自动切换备域名重试」
+（备域名 `api2.mch.weixin.qq.com`）。配置备域名后**每一次重试**都会轮换到下一个地址
+（主 → 备 1 → 备 2 → 主 → …）：
+
+```rust
+let wechat_pay = wechat_pay.with_base_urls(
+    "https://api.mch.weixin.qq.com",
+    ["https://api2.mch.weixin.qq.com"],
+);
+```
+
+- host **不参与签名**（签名串第二行只有 path + query），换域名重发与在同一域名上重试的
+  重放语义完全一致；「该不该重试」仍然只由失败分类决定。
+- ⚠ 写接口「结果未知」的失败（读写超时）**不会**重试 —— 不存在「超时后换个域名重发写请求」
+  这种越界行为，它依然要由你先查单确认。
+- 不配置备域名（默认）时行为与以前完全一致。
+- ⚠ 这两个地址只能来自你自己的配置，**绝不能让用户输入接触它们**。

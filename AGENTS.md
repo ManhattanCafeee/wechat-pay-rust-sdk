@@ -82,6 +82,8 @@ send_and_check(builder)              ← 只发请求，取回 (status, headers,
   等待者的完成信号只能是「`in_flight` 已释放」，**不能**用 `needs_refresh`（命中未知 serial 时
   索引可能既新鲜又不含那个 serial）。标记用 **RAII 释放**：异步任务被 `timeout` / `select!` /
   abort 丢弃时手动复位不会执行，标记会永久为真。
+  等待预算默认 2 秒（`cert::DEFAULT_KEY_REFRESH_WAIT`），可用 `WechatPay::with_key_refresh_wait`
+  覆盖（`Duration::ZERO` = 不等待）；等超预算的等待者拿到 `UnknownPlatformSerial`。
 - 未知 serial → `refresh_platform_keys_for_unknown_serial()`（**60s 成功窗口** + 单飞）后**重验**：
   复用已缓冲的响应，**绝不重发业务请求**。该方法**公开**：回调验签拿到
   `UnknownPlatformSerial` 时也用它（回调的 serial 是未鉴权输入，不带限流的
@@ -142,7 +144,7 @@ src/                 库本体（12 个公开模块 + 1 个 pub(crate) 模块）
 src/async_impl/      ⚠ 名字有误导性：sync 与 async 的**共享**实现（maybe-async 编译期改写）
 src/retry.rs         重试策略、失败分类与可重试判定（改动前先读模块文档）
 src/pay.rs           WechatPay 定义 / 配置 / build_header 签名 / 加解密 / 两个 trait
-src/cert.rs          平台证书 / 微信支付公钥索引：按 serial 选键、到期过滤、刷新（单飞 + 自校验）
+src/cert.rs          平台证书 / 微信支付公钥索引：按 serial 选键、到期过滤、刷新（单飞 + 自校验 + 等待预算可配）
 src/notify.rs        回调验签 + 防重放（±300s 窗口 → 选键 → 验签）
 src/error.rs         PayError / ErrorKind 三层归类
 src/model.rs         请求与回调模型（Serialize）
@@ -168,8 +170,8 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features async -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo test                     # lib 14 passed / 14 ignored + offline 76 passed
-cargo test --features async    # lib 15 passed / 7 ignored + offline 76 passed
+cargo test                     # lib 15 passed / 14 ignored + offline 81 passed
+cargo test --features async    # lib 16 passed / 7 ignored + offline 81 passed
 cargo check -p example
 
 # MSRV 作业（1.89.0）
@@ -263,7 +265,7 @@ cargo +1.89.0 check --all-targets
 | `src/lib.rs` | crate 文档来源（include README）、`#![forbid(unsafe_code)]`、模块清单 |
 | `src/async_impl/pay.rs` | 所有端点方法 + 传输层 + 重试循环 —— 改动最集中的文件 |
 | `src/retry.rs` | 重试策略与失败分类；模块文档里有完整的官方依据 |
-| `src/pay.rs` | `WechatPay` 定义与配置面（`with_base_url` / `with_timeouts` / `with_retry` / `with_refund_retry`） |
+| `src/pay.rs` | `WechatPay` 定义与配置面（`with_base_url` / `with_base_urls` / `with_timeouts` / `with_retry` / `with_refund_retry` / `with_key_refresh_wait`） |
 | `src/error.rs` | `PayError` / `ErrorKind` / `may_have_taken_effect()` |
 | `tests/offline.rs` | 唯一的测试文件；自建 mock + `dual_test!` 宏也在里面 |
 | `README.md` | **同时是 crate 文档**；含安装方式（git / path）与各能力的使用示例 |
@@ -272,9 +274,12 @@ cargo +1.89.0 check --all-targets
 | `example/src/main.rs` | actix-web 回调服务器：**验签 → 解密 → 幂等 → 应答** 的完整参考实现（刻意不开 `debug-print`） |
 | `.github/workflows/ci.yml` | 唯一的 CI；上文的命令清单就来自这里 |
 
-**测试专用的公开 API**：`WechatPay::with_base_url()` 是测试把请求指向本地 mock 的唯一入口
-（字段私有）。它的同类风险是真实的 —— 能改 `base_url` 就能把你签好名的请求（含 openid、订单信息）
+**测试专用的公开 API**：`WechatPay::with_base_url()`（以及 `with_base_urls(primary, …)` 的主域名）
+是测试把请求指向本地 mock 的入口（字段私有）。它的同类风险是真实的 —— 能改 `base_url` 就能把你签好名的请求（含 openid、订单信息）
 改送到第三方域名，所以 ⚠ **生产代码绝不能让用户输入接触 `base_url`**。
+`WechatPay::with_base_urls(primary, backups)` 是生产向的主备域名配置（官方跨城冗灾，每次重试轮换），
+同样要求值不受用户输入影响。两个 setter 的方向是**单向**的：`with_base_url` 只改主域名
+（已配置的备域名仍在列表里，下次重试可能落到它上面），`with_base_urls` 则同时覆盖主域名与备域名列表。
 同理，`set_platform_keys()` / `with_platform_public_key()` 是测试与固定证书来源的入口：
 它们会把客户端切成静态密钥模式，能改它就等于能换掉验签用的公钥。
 
@@ -310,12 +315,13 @@ cargo +1.89.0 check --all-targets
 | 纯逻辑单测 | `src/pay.rs`、`src/retry.rs`、`src/util.rs`、`src/pay_type.rs`、`src/cert.rs`、`src/async_impl/pay.rs` 的 `#[cfg(test)]` | 同上，默认执行 | 无 |
 | 在线冒烟 | 同上文件里的 `#[ignore]` | `cargo test --lib -- --ignored` | 真实凭证 + 公网 + 仓库根 PEM fixture |
 
-**精确计数（单次运行）**：`cargo test` → lib **14 passed / 14 ignored**，offline **76 passed**；
-`cargo test --features async` → lib **15 passed / 7 ignored**，offline **76 passed**。
+**精确计数（单次运行）**：`cargo test` → lib **15 passed / 14 ignored**，offline **81 passed**；
+`cargo test --features async` → lib **16 passed / 7 ignored**，offline **81 passed**。
 
-- offline 的 76 = 74 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
-  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 74。
-- lib 的 async 多一个用例：`src/async_impl/pay.rs::public_futures_are_send`（`cfg(feature = "async")`）。
+- offline 的 81 = 79 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
+  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 79。
+- lib 的 async 多一个用例：`src/async_impl/pay.rs::public_futures_are_send`（`cfg(feature = "async")`）；
+  `src/pay.rs::gateway_rotation_cycles_through_the_primary_and_backups` 两种模式都会跑。
 - ⚠ 计 `#[test]` 时要按**行首**（`^#\[test\]`）锚定：直接数 `#[test]` 会把 `dual_test!` 宏定义体内的
   那一次（缩进）和文档注释里提到的一次也算进去。
 - 「需凭证的用例」有两种口径：跨模式去重共 **16 个函数**，但单次运行只列出 **14**（sync）或 **7**（async），
@@ -398,6 +404,9 @@ MockResponse::json(200, body)          // 默认：正确签名（serial = TEST_
 - **`sign_data` 的 JSON 键名对齐官方**（`timeStamp` / `nonceStr` / `package` / `signType` /
   `paySign` / `appId`，注意 `timeStamp` 的大写 S）：前端报「缺少参数」时不会指向 SDK，
   所以有测试钉住键名，并**反向断言不得残留 snake_case**。
+- **P3 增强**：回调 `resource` 的非 GCM 算法在解密前被拒（`decrypt_notify` / `decrypt_refund_notify`）；
+  刷新等待预算可配（更短预算下等待者按预期超时、单飞仍只拉一次证书）；
+  主域名失败后重试落在备域名（连接被拒与 5xx 两条路径），未配置备域名时行为不变。
 
 给新增测试定标准时注意：**用例必须能对着一个坏实现失败** —— 例如抖动测试要断言「确实取过上限
 以下的值」（否则「抖动恒等于计算值」的实现照样全绿）、`verify_notify` 有一条走**真实墙钟**的用例
@@ -412,8 +421,8 @@ MockResponse::json(200, body)          // 默认：正确签名（serial = TEST_
 - `cargo check --no-default-features` 失败：`reqwest` 是 optional 依赖，但 `src/error.rs` 的错误枚举
   无条件持有 `reqwest::Error`，`src/pay.rs` / `src/async_impl/pay.rs` 也无条件 `use reqwest::header::…`，
   `src/retry.rs` 还调用 `reqwest::Error` 的方法。要修得同时动这几处，改 `error.rs` 一处不够。
-- `cargo test --doc` 会失败（实测收集 **35** 个 doctest：`src/` 里 7 个示例能**编译**通过
-  （`no_run`），其余 **28** 个来自 README，需要真实凭证与公网）—— 这是**有意**接受的：README 的示例需要真实凭证与
+- `cargo test --doc` 会失败（实测收集 **37** 个 doctest：`src/` 里 8 个示例能**编译**通过
+  （`no_run`），其余 **29** 个来自 README，需要真实凭证与公网）—— 这是**有意**接受的：README 的示例需要真实凭证与
   公网，所以设了 `[lib] doctest = false`（默认的 `cargo test` 因此不收集它们），CI 也不跑 `--doc`。
   ⚠ 但这意味着源码文档注释里的示例（`src/retry.rs`、`src/error.rs`、`src/pay.rs`、`src/notify.rs`、
   `src/cert.rs`）只在手动跑 `cargo test --doc` 时被**编译**（`no_run` 不执行）；改完请手动跑一次，

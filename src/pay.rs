@@ -1,7 +1,7 @@
-use crate::cert::PlatformKeys;
+use crate::cert::{DEFAULT_KEY_REFRESH_WAIT, PlatformKeys};
 use crate::error::PayError;
 use crate::macros::debug;
-use crate::model::{WechatPayDecodeData, WechatPayRefundDecodeData};
+use crate::model::{WechatPayDecodeData, WechatPayNotifySource, WechatPayRefundDecodeData};
 use crate::request::HttpMethod;
 use crate::response::SignData;
 use crate::retry::{RequestKind, RetryPolicy};
@@ -186,7 +186,7 @@ impl Drop for RefreshGuard<'_> {
 ///
 /// 字段全部私有：`private_key` / `v3_key` 是能直接动钱的机密，`base_url` 决定你
 /// 签好名的请求发往何处 —— 三者都不应被外部随手改写。要覆盖网关地址请用
-/// [`WechatPay::with_base_url`]。
+/// [`WechatPay::with_base_url`]（主域名）或 [`WechatPay::with_base_urls`]（主 + 备）。
 pub struct WechatPay {
     pub(crate) appid: String,
     pub(crate) mch_id: String,
@@ -195,6 +195,8 @@ pub struct WechatPay {
     pub(crate) v3_key: String,
     pub(crate) notify_url: String,
     pub(crate) base_url: String,
+    /// 备域名（主 + 备轮换用）。空 = 只用主域名。见 [`WechatPay::with_base_urls`]。
+    pub(crate) backup_base_urls: Vec<String>,
     /// 复用的 HTTP 客户端：连接池跨请求共享，避免每次请求重新建连 + TLS 握手。
     pub(crate) client: Client,
     /// 当前超时配置。改它需要连同重建 client，见 [`WechatPay::with_timeouts`]。
@@ -217,6 +219,9 @@ pub struct WechatPay {
     pub(crate) static_keys: AtomicBool,
     /// 平台证书刷新的单飞 / 限流状态。
     pub(crate) key_refresh: RefreshState,
+    /// 等待并发平台证书刷新完成的预算（默认 [`DEFAULT_KEY_REFRESH_WAIT`]，2 秒）。
+    /// 见 [`WechatPay::with_key_refresh_wait`]。
+    pub(crate) key_refresh_wait: Duration,
     /// 出站应答是否验签，默认 [`ResponseVerify::Required`]。
     pub(crate) response_verify: ResponseVerify,
     /// 解析后的商户私钥（首次签名时解析一次）。
@@ -239,7 +244,9 @@ impl std::fmt::Debug for WechatPay {
             .field("v3_key", &"<redacted>")
             .field("notify_url", &self.notify_url)
             .field("base_url", &self.base_url)
+            .field("backup_base_urls", &self.backup_base_urls)
             .field("timeouts", &self.timeouts)
+            .field("key_refresh_wait", &self.key_refresh_wait)
             .field("retry", &self.retry)
             .field("refund_retry", &self.refund_retry)
             // 这两项不是机密，而且是升级后排查的头号问题：
@@ -311,6 +318,35 @@ pub trait PayNotifyTrait: WechatPayTrait {
         let plaintext = self.decrypt_bytes(ciphertext, nonce, associated_data)?;
         let data: WechatPayRefundDecodeData = serde_json::from_slice(&plaintext)?;
         Ok(data)
+    }
+    /// 解密回调的 `resource` 节点（**先校验 `algorithm`**）并解析成 [`WechatPayDecodeData`]。
+    ///
+    /// 参数是整个 `resource` 节点（`WechatPayNotify::resource`），因此能在解密之前校验
+    /// `algorithm` —— 不是 `AEAD_AES_256_GCM` 时返回明确的 [`PayError::DecryptError`]，
+    /// 而不是一个方向错误的 GCM 解密失败。
+    fn decrypt_notify(
+        &self,
+        resource: &WechatPayNotifySource,
+    ) -> Result<WechatPayDecodeData, PayError> {
+        resource.validate_algorithm()?;
+        self.decrypt_paydata(
+            resource.ciphertext.as_str(),
+            resource.nonce.as_str(),
+            resource.associated_data.as_deref().unwrap_or_default(),
+        )
+    }
+    /// 退款结果通知版：字段与支付通知不重合（见 [`Self::decrypt_refund_paydata`]），
+    /// 同样**先校验 `algorithm`** 再解密。
+    fn decrypt_refund_notify(
+        &self,
+        resource: &WechatPayNotifySource,
+    ) -> Result<WechatPayRefundDecodeData, PayError> {
+        resource.validate_algorithm()?;
+        self.decrypt_refund_paydata(
+            resource.ciphertext.as_str(),
+            resource.nonce.as_str(),
+            resource.associated_data.as_deref().unwrap_or_default(),
+        )
     }
     /// 用 APIv3 密钥做 AES-256-GCM 解密，返回明文（不解析）。
     ///
@@ -386,7 +422,9 @@ pub trait WechatPayTrait {
     fn v3_key(&self) -> &str;
     /// 支付结果通知地址。
     fn notify_url(&self) -> &str;
-    /// 网关地址，默认 `https://api.mch.weixin.qq.com`。
+    /// **主**网关地址（备域名见
+    /// [`WechatPay::with_base_urls`](crate::pay::WechatPay::with_base_urls)），默认
+    /// `https://api.mch.weixin.qq.com`。
     fn base_url(&self) -> &str;
     /// 用商户私钥做 RSA-SHA256（PKCS#1 v1.5）签名，返回 base64。
     ///
@@ -460,10 +498,67 @@ impl WechatPay {
     /// 主要用途是把请求指向本地 mock 服务做离线测试（见 `tests/offline.rs`）。
     /// ⚠ 生产代码绝不能让这个值受用户输入影响：你签好名的请求（含 openid、
     /// 订单信息）会被送到该地址。
+    ///
+    /// 只改**主**域名（已配置的备域名不受影响，下次重试仍可能落到备域名上 ——
+    /// 测试里只想改主域名时请显式确认备域名列表为空）；要用官方推荐的备域名容灾见
+    /// [`WechatPay::with_base_urls`]。
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// 配置**主 + 备**网关地址（官方「跨城冗灾」）。
+    ///
+    /// 第 1 次尝试用 `primary`，之后每次重试在 `[primary, backups…]` 里轮换
+    /// （主 → 备 1 → 备 2 → 主 → …）。换域名重发是安全的：重试发的是**同一笔请求**
+    /// （method / path / body 完全一致，每次尝试都会用新的时间戳与随机串重新签名，
+    /// 见 `WechatPay::request`），而 host **不参与签名**（签名串第二行只有 path + query），
+    /// 所以重放语义与在同一域名上重试完全一致；写接口「结果未知」的失败本来就不会重试，
+    /// 因此也不存在「超时后换个域名重发写请求」的越界行为。
+    ///
+    /// ⚠ 与 [`WechatPay::with_base_url`] 同样的风险：这两个值只能来自你自己的配置，
+    /// **绝不能**受用户输入影响 —— 你签好名的请求（含 openid、订单信息）会被送到这些地址。
+    /// `backups` 为空时行为与只用主域名完全一致。两个 setter 的方向是**单向**的：
+    /// `with_base_url` 只改主域名（备域名列表不动），而本方法会**同时覆盖主域名与备域名列表**
+    /// （先配好备域名再调它，等于把两者一起换掉）。
+    ///
+    /// ```no_run
+    /// # use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPay, WechatPayConfig};
+    /// # let wechat_pay = WechatPay::from_config(WechatPayConfig {
+    /// #     appid: "a".into(), mch_id: "b".into(), private_key: "c".into(),
+    /// #     serial_no: "d".into(), v3_key: "e".into(), notify_url: "f".into(),
+    /// #     response_verify: ResponseVerify::Required,
+    /// # });
+    /// let wechat_pay = wechat_pay.with_base_urls(
+    ///     "https://api.mch.weixin.qq.com",
+    ///     ["https://api2.mch.weixin.qq.com"],
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_base_urls<I>(mut self, primary: impl Into<String>, backups: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        self.base_url = primary.into();
+        self.backup_base_urls = backups.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// 第 `attempt` 次尝试（从 1 开始）使用的网关地址：主域名 → 备域名轮换 → 回到主域名。
+    ///
+    /// 没有配置备域名时恒为主域名 —— 与没有这个功能时的行为逐字节一致。
+    pub(crate) fn gateway_for_attempt(&self, attempt: u32) -> &str {
+        if self.backup_base_urls.is_empty() {
+            return &self.base_url;
+        }
+        let index = (attempt.saturating_sub(1) as usize) % (self.backup_base_urls.len() + 1);
+        if index == 0 {
+            &self.base_url
+        } else {
+            &self.backup_base_urls[index - 1]
+        }
     }
 
     /// 覆盖应答验签开关（默认 [`ResponseVerify::Required`]）。
@@ -481,6 +576,23 @@ impl WechatPay {
     /// 当前的应答验签开关。
     pub fn response_verify(&self) -> ResponseVerify {
         self.response_verify
+    }
+
+    /// 覆盖「等待并发平台证书刷新完成」的预算（默认 [`DEFAULT_KEY_REFRESH_WAIT`]，2 秒）。
+    ///
+    /// 平台证书刷新是**单飞**的：同一时刻只有一个请求去打 `/v3/certificates`，其余请求轮询
+    /// 等待它结束。等超预算的请求会拿到 [`PayError::UnknownPlatformSerial`]（消息里带预算毫秒数）。
+    /// 并发冷启动多、或证书接口偶发慢时调大它可以少一轮业务失败；传 `Duration::ZERO`
+    /// 表示完全不等待（一发现有刷新在飞行中就立即失败）。默认 2 秒与旧行为一致。
+    #[must_use]
+    pub fn with_key_refresh_wait(mut self, wait: Duration) -> Self {
+        self.key_refresh_wait = wait;
+        self
+    }
+
+    /// 当前的证书刷新等待预算。
+    pub fn key_refresh_wait(&self) -> Duration {
+        self.key_refresh_wait
     }
 
     /// 覆盖 HTTP 超时配置（阈值见 [`HttpTimeouts`] 的默认值）。
@@ -657,7 +769,8 @@ impl WechatPay {
     /// `private_key` 需要 **PEM 内容本身**（不是文件路径），`v3_key` 必须是 32 字节。
     /// 私钥直到第一次签名才解析，解析失败会作为 [`PayError::SignError`] 返回 ——
     /// 也就是说构造不会 panic，坏配置在第一次请求时才暴露。
-    /// 网关默认 `https://api.mch.weixin.qq.com`，用 [`WechatPay::with_base_url`] 覆盖。
+    /// 网关默认 `https://api.mch.weixin.qq.com`，用 [`WechatPay::with_base_url`]
+    /// 覆盖主域名、[`WechatPay::with_base_urls`] 配置主 + 备域名。
     ///
     /// ```no_run
     /// # use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPay, WechatPayConfig};
@@ -682,6 +795,7 @@ impl WechatPay {
             v3_key: config.v3_key,
             notify_url: config.notify_url,
             base_url: "https://api.mch.weixin.qq.com".to_string(),
+            backup_base_urls: Vec::new(),
             client: build_client(timeouts),
             timeouts,
             retry: RetryPolicy::default(),
@@ -689,6 +803,7 @@ impl WechatPay {
             platform_keys: RwLock::new(PlatformKeys::new()),
             static_keys: AtomicBool::new(false),
             key_refresh: RefreshState::default(),
+            key_refresh_wait: DEFAULT_KEY_REFRESH_WAIT,
             response_verify: config.response_verify,
             parsed_key: std::sync::OnceLock::new(),
         }
@@ -899,5 +1014,32 @@ mod tests {
         // verifying_key
         //     .verify(message.as_slice(), &signature)
         //     .expect("签名验证失败")
+    }
+
+    #[test]
+    fn gateway_rotation_cycles_through_the_primary_and_backups() {
+        let base = WechatPay::from_config(WechatPayConfig {
+            appid: String::new(),
+            mch_id: String::new(),
+            private_key: String::new(),
+            serial_no: String::new(),
+            v3_key: String::new(),
+            notify_url: String::new(),
+            response_verify: ResponseVerify::Required,
+        });
+        // 没有备域名：恒为主域名（既有行为）
+        assert_eq!(base.gateway_for_attempt(1), "https://api.mch.weixin.qq.com");
+        assert_eq!(base.gateway_for_attempt(3), "https://api.mch.weixin.qq.com");
+
+        let rotated =
+            base.with_base_urls("https://primary", ["https://backup1", "https://backup2"]);
+        assert_eq!(rotated.gateway_for_attempt(1), "https://primary");
+        assert_eq!(rotated.gateway_for_attempt(2), "https://backup1");
+        assert_eq!(rotated.gateway_for_attempt(3), "https://backup2");
+        assert_eq!(
+            rotated.gateway_for_attempt(4),
+            "https://primary",
+            "轮换必须回到主域名"
+        );
     }
 }

@@ -94,6 +94,14 @@
 - 离线用例从 51 增到 73：应答验签的正向 / 篡改 / 超窗（含 `i64::MIN`）/ 缺头（2xx、4xx、204、5xx）
   / 冷启动自校验 / 轮换自锁 / 刷新后仍未知 / 刷新失败不重发 / 公钥模式 / 并发单飞（含冷启动）
   / 静态密钥不被飞行中的拉取覆盖 / 关闭开关，以及「写接口坏签名只发一次且可能已生效」。
+- **`PayNotifyTrait::decrypt_notify` / `decrypt_refund_notify` + `WechatPayNotifySource::validate_algorithm`**：
+  带 `resource.algorithm` 校验的回调解密入口（非 `AEAD_AES_256_GCM` 在解密前返回 `DecryptError`，
+  而不是退化成 GCM 解密失败）。旧的 `decrypt_paydata` / `decrypt_refund_paydata` 行为不变。
+- **`WechatPay::with_key_refresh_wait(Duration)` + `cert::DEFAULT_KEY_REFRESH_WAIT`**：
+  平台证书单飞刷新的等待预算，默认仍是 2 秒（旧行为），`Duration::ZERO` 表示不等待。
+- **`WechatPay::with_base_urls(primary, backups)`**：主 + 备网关地址，每次重试轮换到下一个
+  （官方跨城冗灾）；host 不参与签名，换域名重发与同域名重试的重放语义一致；
+  不配置备域名时行为与原先逐字节一致。
 
 ### 行为变更
 

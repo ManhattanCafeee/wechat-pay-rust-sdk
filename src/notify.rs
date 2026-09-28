@@ -21,12 +21,17 @@
 //! // 1. 校验来源与新鲜度（本模块）
 //! keys.verify_notify(&headers, raw_body).expect("非法回调");
 //!
-//! // 2. 解密出业务数据
+//! // 2. 解密出业务数据（入口会先校验 resource.algorithm）
 //! //    （实际字段来自 raw_body 的 resource 节点）
-//! # let (ciphertext, nonce, associated_data) = (String::new(), String::new(), String::new());
-//! let data = wechat_pay
-//!     .decrypt_paydata(ciphertext, nonce, associated_data)
-//!     .expect("解密失败");
+//! # use wechat_pay_rust_sdk::model::WechatPayNotifySource;
+//! # let resource = WechatPayNotifySource {
+//! #     algorithm: "AEAD_AES_256_GCM".into(),
+//! #     ciphertext: String::new(),
+//! #     associated_data: None,
+//! #     original_type: "transaction".into(),
+//! #     nonce: String::new(),
+//! # };
+//! let data = wechat_pay.decrypt_notify(&resource).expect("解密失败");
 //!
 //! // 3. 幂等：按 out_trade_no / transaction_id 落库去重，重复投递直接返回成功
 //! //    —— 这一步必须由你的业务代码完成，SDK 无法代劳。

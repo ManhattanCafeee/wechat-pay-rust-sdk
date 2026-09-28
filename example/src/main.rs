@@ -58,16 +58,13 @@ async fn pay_notify(req: HttpRequest, body: Bytes, wechat_pay: Data<WechatPay>) 
         return fail(err);
     }
 
-    // ③ 解密 resource。解密不能替代验签 —— 顺序永远是先验签再解密。
+    // ③ 解密 resource（decrypt_notify 会先校验 resource.algorithm）。
+    //    解密不能替代验签 —— 顺序永远是先验签再解密。
     let notify: WechatPayNotify = match serde_json::from_str(raw_body) {
         Ok(notify) => notify,
         Err(err) => return fail(format!("回调 JSON 解析失败: {err}")),
     };
-    let data: WechatPayDecodeData = match wechat_pay.decrypt_paydata(
-        notify.resource.ciphertext,
-        notify.resource.nonce,
-        notify.resource.associated_data.unwrap_or_default(),
-    ) {
+    let data: WechatPayDecodeData = match wechat_pay.decrypt_notify(&notify.resource) {
         Ok(data) => data,
         Err(err) => return fail(err),
     };

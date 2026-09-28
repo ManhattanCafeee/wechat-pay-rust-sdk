@@ -19,7 +19,8 @@ use wechat_pay_rust_sdk::cert::{PlatformKeys, REFRESH_INTERVAL_SECS};
 use wechat_pay_rust_sdk::error::{ErrorKind, PayError};
 use wechat_pay_rust_sdk::model::{
     AmountInfo, AppParams, Currency, GoodsDetail, JsapiParams, MicroParams, NativeParams,
-    OrderDetail, PayerInfo, RefundsParams, SceneInfo, SettleInfo, WechatPayRefundDecodeData,
+    OrderDetail, PayerInfo, RefundsParams, SceneInfo, SettleInfo, WechatPayNotifySource,
+    WechatPayRefundDecodeData,
 };
 use wechat_pay_rust_sdk::notify::NotifyHeaders;
 use wechat_pay_rust_sdk::pay::{
@@ -987,6 +988,123 @@ dual_test! {
             .decrypt_paydata(ciphertext.as_str(), "abcdefghijkl", associated_data)
             .expect_err("退款通知不能走支付通知的解码器");
         assert_eq!(err.kind(), ErrorKind::Local, "实际: {err}");
+    }
+}
+dual_test! {
+    fn notify_resource_with_foreign_algorithm_is_rejected_before_decrypt() {
+        // 微信回调的 resource 固定用 AEAD_AES_256_GCM 加密；其它取值说明回调被改写
+        // 或微信升级了算法。它必须在**解密之前**被拒，而不是退化成一个方向错误的
+        // 「GCM 解密失败」。
+        let wechat_pay = client_for("http://127.0.0.1:1");
+        let resource = WechatPayNotifySource {
+            algorithm: "AEAD_AES_128_CBC".into(),
+            ciphertext: "AAAA".into(),
+            associated_data: Some("transaction".into()),
+            original_type: "transaction".into(),
+            nonce: "abcdefghijkl".into(),
+        };
+
+        assert!(
+            resource.validate_algorithm().is_err(),
+            "validate_algorithm 必须拒绝非 GCM 算法"
+        );
+
+        let err = wechat_pay
+            .decrypt_notify(&resource)
+            .expect_err("非 GCM 算法必须在解密前被拒");
+        match &err {
+            PayError::DecryptError(message) => {
+                assert!(
+                    message.contains("AEAD_AES_128_CBC"),
+                    "消息应含实际算法: {message}"
+                );
+                assert!(
+                    message.contains("AEAD_AES_256_GCM"),
+                    "消息应含支持的算法: {message}"
+                );
+            }
+            other => panic!("应为 DecryptError，实际 {other:?}"),
+        }
+        assert_eq!(err.kind(), ErrorKind::Local, "实际: {err:?}");
+
+        let refund_err = wechat_pay
+            .decrypt_refund_notify(&resource)
+            .expect_err("退款入口同样要先校验 algorithm");
+        // ⚠ 必须断言消息来自 validate_algorithm：AES-GCM 解密失败同样是 `DecryptError`
+        // （`cipher.decrypt(..).map_err(|e| PayError::DecryptError(e.to_string()))`），
+        // 只钉错误变体的话，把退款入口的校验删掉这条断言也不会红。
+        match &refund_err {
+            PayError::DecryptError(message) => {
+                assert!(
+                    message.contains("AEAD_AES_128_CBC"),
+                    "消息应含实际算法: {message}"
+                );
+                assert!(
+                    message.contains("AEAD_AES_256_GCM"),
+                    "消息应含支持的算法: {message}"
+                );
+            }
+            other => panic!("应为 DecryptError，实际 {other:?}"),
+        }
+    }
+}
+dual_test! {
+    fn decrypt_notify_validates_then_decrypts_the_resource_node() {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        let plaintext = r#"{"mchid":"1900000001","appid":"wx_test_appid","out_trade_no":"ORDER_NOTIFY_ENTRY","transaction_id":"4200001234202609110000000002","trade_type":"JSAPI","trade_state":"SUCCESS","trade_state_desc":"支付成功","bank_type":"OTHERS","attach":"","success_time":"2026-09-11T12:00:00+08:00","payer":{"openid":"oUpF8uMuAJO_M2pxb1Q9zNjWeS6o"},"amount":{"total":1}}"#;
+        let nonce_bytes: [u8; 12] = *b"abcdefghijkl";
+        let associated_data = "transaction";
+        let cipher = Aes256Gcm::new_from_slice(TEST_V3_KEY.as_bytes()).expect("cipher");
+        let encrypted = cipher
+            .encrypt(
+                &Nonce::from(nonce_bytes),
+                Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: associated_data.as_bytes(),
+                },
+            )
+            .expect("encrypt");
+
+        // 此测试不发送任何请求，base_url 无关紧要
+        let wechat_pay = client_for("http://127.0.0.1:1");
+        let resource = WechatPayNotifySource {
+            algorithm: "AEAD_AES_256_GCM".into(),
+            ciphertext: util::base64_encode(encrypted),
+            associated_data: Some(associated_data.into()),
+            original_type: "transaction".into(),
+            nonce: "abcdefghijkl".into(),
+        };
+        let data = wechat_pay
+            .decrypt_notify(&resource)
+            .expect("合法 algorithm 必须解密成功");
+        assert_eq!(data.out_trade_no, "ORDER_NOTIFY_ENTRY");
+        assert_eq!(data.amount.total, 1);
+
+        // 退款通知走另一个入口（字段不重合，见 refund_notification_has_its_own_decode_entry）
+        let refund_plaintext = r#"{"mchid":"1900000001","out_trade_no":"ORDER_0004","transaction_id":"4200001234202609110000000000","out_refund_no":"R_0004","refund_id":"50300000002026091100000000001","refund_status":"SUCCESS","success_time":"2026-09-14T12:00:00+08:00","user_received_account":"支付用户零钱","amount":{"total":1,"refund":1,"payer_total":1,"payer_refund":1}}"#;
+        let refund_associated_data = "refund";
+        let refund_encrypted = cipher
+            .encrypt(
+                &Nonce::from(nonce_bytes),
+                Payload {
+                    msg: refund_plaintext.as_bytes(),
+                    aad: refund_associated_data.as_bytes(),
+                },
+            )
+            .expect("encrypt");
+        let refund_resource = WechatPayNotifySource {
+            algorithm: "AEAD_AES_256_GCM".into(),
+            ciphertext: util::base64_encode(refund_encrypted),
+            associated_data: Some(refund_associated_data.into()),
+            original_type: "refund".into(),
+            nonce: "abcdefghijkl".into(),
+        };
+        let refund = wechat_pay
+            .decrypt_refund_notify(&refund_resource)
+            .expect("退款通知必须能解密");
+        assert_eq!(refund.out_refund_no, "R_0004");
     }
 }
 dual_test! {
@@ -2922,6 +3040,69 @@ dual_test! {
 }
 
 dual_test! {
+    fn a_shorter_key_refresh_wait_gives_up_while_a_refresh_is_in_flight() {
+        // 单飞刷新期间，其它请求会轮询等待；预算由 with_key_refresh_wait 决定。
+        // 这里把预算压到 50ms、让证书响应延迟 600ms：等待者必须**在预算到点后立即失败**，
+        // 而不是等到刷新完成（那样它会多发一条业务请求，且旧实现固定等 2s）。
+        let certificates = certificates_response(&[("SERIAL_OLD", "nonce_kw_001")]);
+        let mock = Mock::start(vec![
+            MockResponse::json(200, &certificates)
+                .signed_with_serial("SERIAL_OLD")
+                .with_delay(Duration::from_millis(600))
+                .for_path("/v3/certificates"),
+            MockResponse::json(204, "").signed_with_serial("SERIAL_OLD"),
+        ]);
+        let wechat_pay = WechatPay::from_config(test_config())
+            .with_base_url(&mock.base_url)
+            .with_key_refresh_wait(Duration::from_millis(50));
+
+        #[cfg(feature = "async")]
+        let (first, second) = tokio::join!(
+            wechat_pay.close_order("WAIT_SHORT_A"),
+            wechat_pay.close_order("WAIT_SHORT_B")
+        );
+        #[cfg(not(feature = "async"))]
+        let (first, second) = thread::scope(|scope| {
+            let first = scope.spawn(|| wechat_pay.close_order("WAIT_SHORT_A"));
+            let second = scope.spawn(|| wechat_pay.close_order("WAIT_SHORT_B"));
+            (first.join().expect("join A"), second.join().expect("join B"))
+        });
+
+        let results = [first, second];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "只有一个并发请求能等到刷新完成: {results:?}"
+        );
+        let err = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .expect("另一个必须等超预算失败");
+        match err {
+            PayError::UnknownPlatformSerial(message) => {
+                assert!(
+                    message.contains("50"),
+                    "消息应带上配置的预算毫秒数: {message}"
+                );
+            }
+            other => panic!("应为 UnknownPlatformSerial，实际 {other:?}"),
+        }
+
+        let requests = mock.requests();
+        let business = requests
+            .iter()
+            .filter(|request| request.path.contains("out-trade-no"))
+            .count();
+        assert_eq!(business, 1, "等超预算的请求不得发出业务请求: {requests:?}");
+        let fetches = requests
+            .iter()
+            .filter(|request| request.path == "/v3/certificates")
+            .count();
+        assert_eq!(fetches, 1, "单飞：并发冷启动只允许拉一次证书");
+    }
+}
+
+dual_test! {
     fn keys_set_while_a_refresh_is_in_flight_are_not_overwritten() {
         // `set_platform_keys` / `with_platform_public_key` 与一次飞行中的拉取撞上时，
         // **安装点**必须复查静态模式：`static_keys` 只挡「发起」，挡不住「安装」——
@@ -3043,5 +3224,54 @@ dual_test! {
             other => panic!("应为 ApiError，实际 {other:?}"),
         }
         assert_eq!(mock.requests().len(), 1, "密钥先行：拉证失败后不得发出业务请求");
+    }
+}
+
+dual_test! {
+    fn connection_refused_on_the_primary_rotates_to_the_backup_domain() {
+        // 官方跨城冗灾：主域名连不上（确定没送到 → 可重试）时，第二次尝试打备域名。
+        // 主域名用 `127.0.0.1:1`（无服务，连接必被拒）—— 与 `connection_refused_is_retried_even_for_writes`
+        // 同一约定，不去 bind/drop 临时端口（那会引入与并行用例抢端口的竞争窗口）。
+        let mock = Mock::start(vec![MockResponse::json(204, "")]);
+        let wechat_pay = client_for(&mock.base_url)
+            .with_base_urls("http://127.0.0.1:1", [mock.base_url.clone()])
+            .with_retry(fast_retry(3));
+
+        call!(wechat_pay.close_order("BACKUP_REFUSED")).expect("主域名连接被拒时应重试到备域名");
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "备域名应恰好收到一次请求: {requests:?}");
+        assert_eq!(
+            requests[0].path,
+            "/v3/pay/transactions/out-trade-no/BACKUP_REFUSED/close"
+        );
+    }
+}
+
+dual_test! {
+    fn a_retryable_failure_on_the_primary_moves_the_next_attempt_to_the_backup() {
+        // 5xx + SYSTEM_ERROR 是「明确未受理」→ 可重试；重试必须落在备域名上。
+        let primary = Mock::start(vec![MockResponse::json(
+            500,
+            r#"{"code":"SYSTEM_ERROR","message":"系统异常"}"#,
+        )]);
+        let backup = Mock::start(vec![MockResponse::json(204, "")]);
+        let wechat_pay = client_for(&backup.base_url)
+            .with_base_urls(primary.base_url.clone(), [backup.base_url.clone()])
+            .with_retry(fast_retry(3));
+
+        call!(wechat_pay.close_order("BACKUP_5XX")).expect("主域名 5xx 后应在备域名上重试成功");
+
+        assert_eq!(primary.requests().len(), 1, "主域名只应被尝试一次");
+        let backup_requests = backup.requests();
+        assert_eq!(
+            backup_requests.len(),
+            1,
+            "第二次尝试必须落在备域名: {backup_requests:?}"
+        );
+        assert_eq!(
+            backup_requests[0].path,
+            "/v3/pay/transactions/out-trade-no/BACKUP_5XX/close"
+        );
     }
 }
