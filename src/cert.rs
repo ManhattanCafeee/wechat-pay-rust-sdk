@@ -452,8 +452,11 @@ impl WechatPay {
                 "平台证书索引为空：自动拉取平台证书失败或仍在进行中，无法验证应答签名".to_string(),
             ));
         }
-        if let Err(err) = refreshed {
-            debug!("平台证书刷新失败，继续用现有索引（静态密钥仍可验签）: {err}");
+        // ⚠ 绑定写成 `_err` 不是笔误：这里的失败只进 `debug!`，而 `debug!` 在未启用
+        // `debug-print` 时展开为空操作、参数不求值（`src/macros.rs`）。用 `err` 会让
+        // 默认构建在 CI 的 `-D warnings` 下因 `unused_variables` 直接编译失败。
+        if let Err(_err) = refreshed {
+            debug!("平台证书刷新失败，继续用现有索引（静态密钥仍可验签）: {_err}");
         }
         Ok(())
     }
