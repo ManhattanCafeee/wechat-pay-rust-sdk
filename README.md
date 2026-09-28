@@ -499,6 +499,10 @@ let data = wechat_pay.decrypt_notify(&notify.resource)?;
 5. **`resource.algorithm` 不必自己比对。** 两个 `decrypt_*_notify` 入口会先校验它是
    `AEAD_AES_256_GCM`（微信回调的固定取值）：不是就在解密**之前**返回 `DecryptError`，
    而不是让你拿到一个方向错误的「GCM 解密失败」。
+6. **宿主时钟是硬依赖。** ±300s 的新鲜度窗口与出站应答验签**共用** —— 主机时钟漂移会让
+   所有回调与应答一起报 `StaleNotify`（看着像重放，其实是没对时，回调被拒就等于订单不发货）。
+   部署基线要求 **NTP 同步**；`StaleNotify` 的日志要**单独告警**（它是运维信号，
+   不要当成攻击结论）。
 
 应答要求：**5 秒内**返回，成功时返回 HTTP **200 或 204 且不带 body**；
 校验或处理失败才返回 4xx/5xx + `{"code":"FAIL","message":"…"}`。业务处理请异步化。
