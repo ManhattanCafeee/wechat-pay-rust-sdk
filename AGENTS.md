@@ -182,8 +182,8 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features async -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo test                     # lib 18 passed / 14 ignored + offline 84 passed
-cargo test --features async    # lib 19 passed / 7 ignored + offline 84 passed
+cargo test                     # lib 20 passed / 14 ignored + offline 89 passed
+cargo test --features async    # lib 21 passed / 7 ignored + offline 89 passed
 cargo check -p example
 
 # MSRV 作业（1.89.0）
@@ -331,11 +331,11 @@ cargo +1.89.0 check --all-targets
 | 纯逻辑单测 | `src/pay.rs`、`src/retry.rs`、`src/util.rs`、`src/pay_type.rs`、`src/cert.rs`、`src/async_impl/pay.rs` 的 `#[cfg(test)]` | 同上，默认执行 | 无 |
 | 在线冒烟 | 同上文件里的 `#[ignore]` | `cargo test --lib -- --ignored` | 真实凭证 + 公网 + 仓库根 PEM fixture |
 
-**精确计数（单次运行）**：`cargo test` → lib **18 passed / 14 ignored**，offline **84 passed**；
-`cargo test --features async` → lib **19 passed / 7 ignored**，offline **84 passed**。
+**精确计数（单次运行）**：`cargo test` → lib **20 passed / 14 ignored**，offline **89 passed**；
+`cargo test --features async` → lib **21 passed / 7 ignored**，offline **89 passed**。
 
-- offline 的 84 = 82 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
-  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 82。
+- offline 的 89 = 87 个 `dual_test!` + 2 个顶层 `#[test]`（`refund_uses_a_separate_minute_scaled_policy`、
+  `public_types_are_send_and_sync`）。可复现：`grep -c '^dual_test! {' tests/offline.rs` → 87。
 - lib 的 async 多一个用例：`src/async_impl/pay.rs::public_futures_are_send`（`cfg(feature = "async")`）；
   `src/pay.rs::gateway_rotation_cycles_through_the_primary_and_backups` 两种模式都会跑。
 - 模式相关的单测要成对写：`src/cert.rs::refresh_failure_does_not_fail_requests_when_a_static_key_remains`
@@ -441,12 +441,13 @@ MockResponse::json(200, body)          // 默认：正确签名（serial = TEST_
 - `cargo check --no-default-features` 失败：`reqwest` 是 optional 依赖，但 `src/error.rs` 的错误枚举
   无条件持有 `reqwest::Error`，`src/pay.rs` / `src/async_impl/pay.rs` 也无条件 `use reqwest::header::…`，
   `src/retry.rs` 还调用 `reqwest::Error` 的方法。要修得同时动这几处，改 `error.rs` 一处不够。
-- `cargo test --doc` 会失败（实测收集 **38** 个 doctest：`src/` 里 8 个示例能**编译**通过
-  （`no_run`），其余 **30** 个来自 README，需要真实凭证与公网）—— 这是**有意**接受的：README 的示例需要真实凭证与
+- `cargo test --doc` 会失败（实测收集 **39** 个 doctest：`src/` 里 8 个示例都能通过，其余 **31** 个来自
+  README，需要真实凭证与公网）—— 这是**有意**接受的：README 的示例需要真实凭证与
   公网，所以设了 `[lib] doctest = false`（默认的 `cargo test` 因此不收集它们），CI 也不跑 `--doc`。
-  ⚠ 但这意味着源码文档注释里的示例（`cargo test --doc -- --list` 里 `src/` 下的 8 条：`src/pay.rs` 5 条、
-  `src/error.rs` 与 `src/retry.rs` 各 1 条、`notify` 模块 1 条（rustdoc 标成 `src/lib.rs - notify`））
-  只在手动跑 `cargo test --doc` 时被**编译**（`no_run` 不执行）；改完请手动跑一次，CI 不会替你跑。
+  ⚠ 但这意味着源码文档注释里的示例只在手动跑 `cargo test --doc` 时才会被**编译/执行**：`cargo test --doc -- --list`
+  里 `src/` 下的 8 条是 `src/pay.rs` 5 条与 `notify` 模块 1 条（`no_run` ⇒ 只编译；rustdoc 标成
+  `src/lib.rs - notify`）、`src/error.rs` 与 `src/retry.rs` 各 1 条（**会真的执行**，无副作用）；改完请手动跑一次，
+  CI 不会替你跑。
 - README 示例**不被编译**，因此会悄悄腐烂。已修掉一处（小程序支付那段曾调用
   `micro_pay(JsapiParams::new(…))`，与真实签名 `micro_pay(params: MicroParams)` 不符），
   但这只是**已知的一处** —— 改 README 示例时请人工核对 API 签名，CI 不会发现。
