@@ -646,10 +646,6 @@ impl WechatPay {
 mod tests {
     use super::*;
 
-    /// `util::rsa_pem_parse_count()` 是**进程级全局计数**,而 cargo 默认并行跑测试 ——
-    /// 断言「同一把钥匙只解析一次」的用例必须与任何会触发解析的用例互斥,否则偶发失败。
-    static PARSE_COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// 与 `tests/offline.rs` 的测试私钥（PKCS#8）配套的公钥。
     ///
     /// 公开信息，只为覆盖索引的「解析一次、验签多次」路径；与离线用例用的是同一对密钥。
@@ -667,14 +663,13 @@ awIDAQAB
 
     #[test]
     fn verify_parses_each_public_key_only_once() {
-        let _guard = PARSE_COUNT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut keys = PlatformKeys::new();
         assert!(!keys.insert("SERIAL_CACHED", TEST_PUBLIC_KEY_PEM));
         assert_eq!(keys.get("SERIAL_CACHED"), Some(TEST_PUBLIC_KEY_PEM));
 
         // 签名本身无效（不是这把钥匙签的）没关系：走的就是「查表 → 取公钥 → 验签」。
+        // 计数是**线程局部**的（`util::RSA_PEM_PARSE_COUNT`），断言用的又是本用例内的增量，
+        // 因此不需要与其它用例互斥。
         let before = util::rsa_pem_parse_count();
         let first = keys.verify("SERIAL_CACHED", "1700000000", "nonce", "{}", "AAAA");
         assert!(first.is_err(), "无效签名必须报错: {first:?}");
@@ -723,10 +718,6 @@ awIDAQAB
     /// 两表的归属、选键顺序（静态优先）与「安装拉取结果只动轮换表」
     #[test]
     fn two_tables_keep_their_own_entries() {
-        // 下面那次 `verify` 会触发 PEM 解析尝试(计数是全局的,见 `PARSE_COUNT_LOCK`)
-        let _guard = PARSE_COUNT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut keys = PlatformKeys::new();
         assert!(!keys.insert("SERIAL_INJECTED", TEST_PUBLIC_KEY_PEM));
         assert!(!keys.insert_rotating("SERIAL_ROTATING", TEST_PUBLIC_KEY_PEM));
@@ -789,8 +780,8 @@ awIDAQAB
         assert!(rotating_only.needs_refresh(now));
     }
 
-    /// 造一个「已注入静态公钥 + 轮换表已过刷新窗口 + 证书接口不可达」的客户端：
-    /// `ensure_keys` 的刷新必然失败，而索引里还剩一份能验签的密钥。
+    /// 造一个「已注入静态公钥 + 轮换表已过刷新窗口 + 刷新必然失败」的客户端：
+    /// 占位私钥在**签名阶段**就报 `SignError`（请求根本不会发出），而索引里还剩一份能验签的密钥。
     fn client_with_static_key_and_a_stale_rotating_table() -> WechatPay {
         let client = WechatPay::from_config(crate::pay::WechatPayConfig {
             appid: "wx_test_appid".to_string(),
@@ -801,14 +792,13 @@ awIDAQAB
             notify_url: "https://example.com/notify".to_string(),
             response_verify: ResponseVerify::Required,
         })
-        // 必然连不上的地址 + 关掉重试(否则要等退避)
+        // 私钥是占位串 ⇒ 签名必失败；地址仍钉在死端口，万一私钥被换成合法 fixture 也不会出网。
+        // 关掉重试免得等退避。
         .with_base_url("http://127.0.0.1:1")
         .with_retry(crate::retry::RetryPolicy::disabled());
-        // 用 `insert`(延迟解析)而不是 `add_static_platform_key`(当场解析)注入:这条用例只关心
-        // 「静态密钥在位 + 轮换表过期」的取值组合,不必碰全局解析计数(见 `PARSE_COUNT_LOCK`)。
         client
-            .platform_keys_write()
-            .insert("PUB_KEY_ID_INLINE_TEST", TEST_PUBLIC_KEY_PEM);
+            .add_static_platform_key("PUB_KEY_ID_INLINE_TEST", TEST_PUBLIC_KEY_PEM)
+            .expect("注入公钥");
 
         // 造「轮换表已过刷新窗口」的状态；注入的静态密钥仍在
         {
