@@ -626,7 +626,7 @@ impl WechatPay {
     /// * 地址是**绝对的**且 5 分钟内有效 ⇒ 这里按官方给的地址**原样**请求（不套用网关前缀，
     ///   否则就把请求发到了另一个 host）；地址必须落在 `/v3/` 之下、默认必须 https
     ///   （只有调用方显式把客户端指向明文网关时才放行 http，见
-    ///   [`crate::util::bill_download_path_and_query`]）。
+    ///   `crate::util::bill_download_path_and_query`）。
     ///
     /// 返回**原始字节**：`tar_type = Some(BillTarType::Gzip)` 时是 gzip 流，由调用方解压。
     /// 非 2xx 会作为**未验签**的 `PayError::ApiError` 返回；下载失败直接重试即可
