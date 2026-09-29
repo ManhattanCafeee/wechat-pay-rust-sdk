@@ -132,6 +132,59 @@ pub fn x509_is_valid(content: &[u8]) -> Result<(bool, i64), PayError> {
     Ok((expire_time, cert.validity.not_after.timestamp()))
 }
 
+/// 账单日期是否合法：官方要求 `yyyy-MM-dd`。
+///
+/// SDK 不引入时间库（见 [`now_unix_secs`] 的取舍），这里只做**形状**校验：
+/// 具体日期（以及「只能取 T-1、三个月内」这条业务规则）由调用方负责。
+pub(crate) fn is_bill_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
+
+/// 从账单下载地址里取出**参与签名的 `path?query`**，并顺手挡掉两类地址。
+///
+/// `download_url` 来自「申请交易账单」的应答（该应答本身验签通过），但地址会被原样请求，
+/// 因此这里仍需两条约束：
+/// * **必须在 `/v3/` 之下** —— 官方给的地址就是 `/v3/billdownload/file?token=…`；少了这条，
+///   一旦调用方在「关闭验签」模式（本地 mock）下把任意地址透传进来，本方法就等于一个
+///   「给任意 URL 签名」的工具；
+/// * **默认只接受 https** —— 只有调用方显式把客户端指向明文网关（`base_url` 是 `http://`，
+///   本地联调）时才放行 http。
+pub(crate) fn bill_download_path_and_query(
+    url: &str,
+    allow_plain_http: bool,
+) -> Result<&str, PayError> {
+    let rest = if let Some(rest) = url.strip_prefix("https://") {
+        rest
+    } else if allow_plain_http {
+        url.strip_prefix("http://").ok_or_else(|| {
+            PayError::VerifyError(format!("账单下载地址必须是 http(s) 绝对地址: {url}"))
+        })?
+    } else {
+        return Err(PayError::VerifyError(format!(
+            "账单下载地址必须是 https 绝对地址: {url}"
+        )));
+    };
+    let Some((_host, path_and_query)) = rest.split_once('/') else {
+        return Err(PayError::VerifyError(format!(
+            "账单下载地址缺少路径: {url}"
+        )));
+    };
+    let path_and_query = &rest[rest.len() - path_and_query.len() - 1..];
+    if !path_and_query.starts_with("/v3/") {
+        return Err(PayError::VerifyError(format!(
+            "账单下载地址必须在 /v3/ 之下: {url}"
+        )));
+    }
+    Ok(path_and_query)
+}
+
 #[cfg(test)]
 mod tests {
     use super::random_trade_no;
@@ -149,5 +202,44 @@ mod tests {
     #[test]
     fn random_trade_no_differs_across_calls() {
         assert_ne!(random_trade_no(), random_trade_no(), "两次调用应不同");
+    }
+
+    #[test]
+    fn bill_date_shape_is_validated() {
+        assert!(super::is_bill_date("2026-09-28"));
+        for bad in ["2026-9-28", "20260928", "2026-09-2x", "", "2026/09/28"] {
+            assert!(!super::is_bill_date(bad), "{bad} 不该通过");
+        }
+    }
+
+    #[test]
+    fn bill_download_url_must_be_v3_and_https() {
+        assert_eq!(
+            super::bill_download_path_and_query(
+                "https://api.mch.weixin.qq.com/v3/billdownload/file?token=abc",
+                false
+            )
+            .expect("官方地址应当被接受"),
+            "/v3/billdownload/file?token=abc"
+        );
+        // 明文 http:只有调用方把客户端指向明文网关(本地联调)时才放行
+        let plain = "http://127.0.0.1:9817/v3/billdownload/file?token=abc";
+        assert!(super::bill_download_path_and_query(plain, false).is_err());
+        assert_eq!(
+            super::bill_download_path_and_query(plain, true).expect("联调网关应当可用"),
+            "/v3/billdownload/file?token=abc"
+        );
+        // 非 /v3/ 之下的地址一律拒绝(否则本方法成了「给任意 URL 签名」的工具)
+        for bad in [
+            "https://evil.example.com/steal",
+            "https://api.mch.weixin.qq.com/",
+            "https://api.mch.weixin.qq.com",
+            "not-a-url",
+        ] {
+            assert!(
+                super::bill_download_path_and_query(bad, false).is_err(),
+                "{bad} 不该被接受"
+            );
+        }
     }
 }

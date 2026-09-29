@@ -3395,3 +3395,139 @@ dual_test! {
         assert_eq!(mock.requests().len(), 0, "公钥 ID 连一次证书请求都不该触发");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 账单（对账）：申请交易账单 + 下载账单文件
+// ---------------------------------------------------------------------------
+
+dual_test! {
+    fn trade_bill_asks_for_the_csv_and_returns_hash_and_url() {
+        // 申请账单是**普通已签名端点**：应答照常强制验签,查询串必须原样参与签名。
+        let mock = Mock::start(vec![MockResponse::json(
+            200,
+            r#"{"hash_type":"SHA1","hash_value":"79bb0f45fc4c42234a918000b2668d689e2bde04","download_url":"https://api.mch.weixin.qq.com/v3/billdownload/file?token=xxx"}"#,
+        )
+        .signed_with_serial(TEST_PLATFORM_SERIAL)
+        .for_path("/v3/bill/tradebill")]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let bill = call!(wechat_pay.trade_bill(
+            "2026-09-28",
+            wechat_pay_rust_sdk::model::BillType::Success,
+            Some(wechat_pay_rust_sdk::model::BillTarType::Gzip),
+        ))
+        .expect("申请账单应当成功");
+
+        assert_eq!(bill.hash_type, "SHA1");
+        assert_eq!(bill.hash_value, "79bb0f45fc4c42234a918000b2668d689e2bde04");
+        assert_eq!(
+            bill.download_url,
+            "https://api.mch.weixin.qq.com/v3/billdownload/file?token=xxx"
+        );
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(
+            requests[0].path,
+            "/v3/bill/tradebill?bill_date=2026-09-28&bill_type=SUCCESS&tar_type=GZIP",
+            "查询串必须完整带上(bill_type 与 tar_type 都是官方取值)"
+        );
+        assert!(
+            requests[0].header("authorization").is_some(),
+            "申请账单是已签名端点"
+        );
+    }
+}
+
+dual_test! {
+    fn trade_bill_rejects_a_malformed_bill_date_without_sending() {
+        // bill_date 会拼进签名串:形状不对时直接失败,不要发一个必然 400 的请求
+        let mock = Mock::start(vec![]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        let err = call!(wechat_pay.trade_bill(
+            "2026-9-28",
+            wechat_pay_rust_sdk::model::BillType::All,
+            None,
+        ))
+        .expect_err("非法日期必须被拒");
+
+        assert!(matches!(err, PayError::VerifyError(_)), "实际: {err:?}");
+        assert_eq!(mock.requests().len(), 0, "不该发出任何请求");
+    }
+}
+
+dual_test! {
+    fn download_bill_returns_raw_bytes_and_skips_verification() {
+        // 官方明文:账单文件应答**不带签名头**。这里让 mock 不写任何签名头,
+        // 并断言拿到的是**原始字节**(未压缩文本,真正的 gzip 流由调用方解压)。
+        let csv = "`交易时间,`商户订单号,`订单金额\n`2026-09-28 10:00:00,`O-1,`5.00\n";
+        let mock = Mock::start(vec![
+            MockResponse::json(200, csv)
+                .without_signature_headers()
+                .for_path("/v3/billdownload/file"),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+        let download_url = format!("{}/v3/billdownload/file?token=xxx", mock.base_url);
+
+        let bytes = call!(wechat_pay.download_bill(&download_url)).expect("无签名头的账单应答应当照常返回");
+
+        assert_eq!(String::from_utf8(bytes).expect("测试体是文本"), csv);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "不该重试或预拉证书");
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/v3/billdownload/file?token=xxx");
+        assert!(
+            requests[0].header("authorization").is_some(),
+            "下载账单要带商户签名(官方示例同样带 Authorization)"
+        );
+    }
+}
+
+dual_test! {
+    fn download_bill_refuses_urls_outside_v3() {
+        // 地址虽然来自(已验签的)申请账单应答,但会被原样请求:
+        // 非 /v3/ 之下的地址一律拒绝,免得这个方法变成「给任意 URL 签名」的工具。
+        let mock = Mock::start(vec![]);
+        let wechat_pay = client_for(&mock.base_url);
+
+        for bad in [
+            "https://evil.example.com/steal",
+            "https://api.mch.weixin.qq.com/",
+            "not-a-url",
+        ] {
+            let err = call!(wechat_pay.download_bill(bad)).expect_err("越界地址必须被拒");
+            assert!(matches!(err, PayError::VerifyError(_)), "{bad}: {err:?}");
+        }
+        assert_eq!(mock.requests().len(), 0);
+    }
+}
+
+dual_test! {
+    fn download_bill_reports_errors_as_unverified_api_errors() {
+        // 非 2xx:官方用 JSON 错误信封说明原因(如 403 NO_AUTH);这条应答没验签,必须如实标记
+        let mock = Mock::start(vec![
+            MockResponse::json(403, r#"{"code":"NO_AUTH","message":"权限异常"}"#)
+                .without_signature_headers()
+                .for_path("/v3/billdownload/file"),
+        ]);
+        let wechat_pay = client_for(&mock.base_url);
+        let download_url = format!("{}/v3/billdownload/file?token=xxx", mock.base_url);
+
+        let err = call!(wechat_pay.download_bill(&download_url)).expect_err("403 必须报错");
+
+        match err {
+            PayError::ApiError { status, response, .. } => {
+                assert_eq!(status, 403);
+                let marked = response
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("[未验签]"));
+                assert!(marked, "必须如实标记未验签: {response:?}");
+                assert_eq!(response.code.as_deref(), Some("NO_AUTH"));
+            }
+            other => panic!("应为 ApiError,实际 {other:?}"),
+        }
+        assert_eq!(mock.requests().len(), 1, "4xx 不重试");
+    }
+}

@@ -707,3 +707,51 @@ impl RefundsParams {
 }
 
 impl ParamsTrait for RefundsParams {}
+
+/// 交易账单类型（申请交易账单的 `bill_type`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BillType {
+    /// 当日所有订单（不含充值退款订单）
+    All,
+    /// 当日成功支付的订单
+    Success,
+    /// 当日退款订单
+    Refund,
+}
+
+impl BillType {
+    /// 官方取值（查询串里用的就是它）
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Success => "SUCCESS",
+            Self::Refund => "REFUND",
+        }
+    }
+}
+
+impl std::fmt::Display for BillType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 账单压缩类型（申请交易账单的 `tar_type`）。官方目前只支持 GZIP。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BillTarType {
+    /// `.gzip` 压缩后的账单文件流
+    Gzip,
+}
+
+impl BillTarType {
+    /// 官方取值
+    pub fn as_str(&self) -> &'static str {
+        "GZIP"
+    }
+}
+
+impl std::fmt::Display for BillTarType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}

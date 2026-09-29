@@ -10,8 +10,9 @@
 - **用途**：封装微信支付 APIv3 的 HTTP 接口，供商户后端调用。**没有 CLI、没有服务端、没有代码生成**。
 - **已封装的端点**：JSAPI / APP / H5 / Native / 付款码 下单（⚠ 付款码那条名不副实，见「已知限制与陷阱」）、
   统一下单入口 `pay()`、申请退款、查单、关单、查退款、证书列表与平台证书拉取、
-  H5 页面取 `weixin://` 链接，以及回调的验签与 AES-256-GCM 解密。
-- **未实现**：账单下载、分账、转账。不要以为它们在某个模块里没被找到 —— 确实没有。
+  **交易账单（`trade_bill` + `download_bill`）**、H5 页面取 `weixin://` 链接，
+  以及回调的验签与 AES-256-GCM 解密。
+- **未实现**：资金账单（`/v3/bill/fundflowbill`）、分账、转账。不要以为它们在某个模块里没被找到 —— 确实没有。
 - **这是 fork，不发布到 crates.io**：`Cargo.toml` 设了 `publish = false`（该名字在 crates.io 属于上游）。
   引入只能用 **git（固定 tag）或 path**；写成 `wechat-pay-rust-sdk = "0.3.0"` 会解析到上游代码或直接失败。
 - `README.md` 通过 `#![doc = include_str!("../README.md")]`（`src/lib.rs:1`）**直接充当 crate 文档** —— 改 README 就是改公开文档。
@@ -213,6 +214,10 @@ cargo +1.89.0 check --all-targets
 应答验签不需要端点做任何事：它发生在 `request()` 内部（默认强制）。唯一显式的选择是
 `ResponseCheck`（`Strict` / `CertificateSelfCheck`），而它只对 `GET /v3/certificates` 用
 `CertificateSelfCheck` —— 普通端点照抄邻居即可。
+⚠ **例外：账单下载**（`download_bill`）按官方明文**跳过验签**，因此它**不走 `request()`**：
+地址是绝对的（不能拼 `base_url`）、也不需要平台密钥（不能触发 `ensure_keys()`），
+签名串第二行取官方的 `path?query`（`util::bill_download_path_and_query` 负责拆解与放行规则：
+必须在 `/v3/` 之下、默认只接受 https）。它的响应体是**原始字节**（可能是 gzip 流）。
 
 ### 双模式写法（改 `src/async_impl/` 时最先看这段）
 
@@ -477,7 +482,9 @@ MockResponse::json(200, body)          // 默认：正确签名（serial = TEST_
   落库去重仍需业务侧实现（微信最多重试 15 次通知）。
 - **超时后查单**：SDK 不做写接口超时的自动重试，也**不会**替你调 `query_order` ——
   查到状态之后怎么处置（继续等 / 关单 / 退款）是业务决策。判据用 `PayError::may_have_taken_effect()`。
-- **账单下载**（对账用）尚未封装。
+- **账单下载**（对账用）已封装，但**没有省心的部分**：官方不给下载应答签名（跳过验签）、
+  摘要算法是 **SHA1**（不是 SHA256）、账单文件是 **gzip** 流且字段带反引号前缀、金额单位是**元** ——
+  完整性、解压与解析都在调用方（宿主项目 `backend/src/modules/payment/bill.rs` 有一份实现参考）。
 
 **测试**
 

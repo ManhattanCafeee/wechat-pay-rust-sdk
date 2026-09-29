@@ -7,6 +7,7 @@ use crate::model::MicroParams;
 use crate::model::NativeParams;
 use crate::model::ParamsTrait;
 use crate::model::RefundsParams;
+use crate::model::{BillTarType, BillType};
 use crate::notify::{NotifyHeaders, check_timestamp_skew, response_signature_headers};
 use crate::pay::{PackagePrefix, ResponseVerify, WechatPay, WechatPayTrait};
 use crate::request::HttpMethod;
@@ -16,7 +17,9 @@ use crate::response::JsapiResponse;
 use crate::response::MicroResponse;
 use crate::response::RefundsResponse;
 use crate::response::ResponseTrait;
-use crate::response::{CertificateResponse, NativeResponse, TransactionResponse};
+use crate::response::{
+    CertificateResponse, NativeResponse, TradeBillResponse, TransactionResponse,
+};
 use crate::retry::{Delivery, RequestKind, classify, should_retry};
 use reqwest::header::{HeaderMap, REFERER};
 use serde_json::{Map, Value};
@@ -576,6 +579,111 @@ impl WechatPay {
         let body = params.to_json()?;
         self.request_json(HttpMethod::POST, url, &body, RequestKind::Refund)
             .await
+    }
+
+    /// 申请交易账单：返回账单文件的下载地址与 SHA1 摘要（文件本身再用
+    /// [`WechatPay::download_bill`] 下载）。
+    ///
+    /// `GET /v3/bill/tradebill?bill_date=…&bill_type=…&tar_type=GZIP`
+    ///
+    /// 官方规则（对账口径）：
+    /// * 微信在**每日 10 点后**生成**昨日**账单，`bill_date` 只支持三个月内的账单；
+    /// * 账单里**只有支付成功的订单**，金额单位是**元**（保留两位小数），
+    ///   下载到的文件需要按行解析；
+    /// * 「账单文件不存在」返回 `NO_STATEMENT_EXIST`、「仍在生成」返回 `STATEMENT_CREATING`、
+    ///   频率过高返回 429 `FREQUENCY_LIMITED` —— 都按 `PayError::ApiError` 的 `code` 区分。
+    ///
+    /// `bill_type` 建议用 [`BillType::Success`]（对账只需要成功支付的订单）。
+    #[maybe_async_attr]
+    pub async fn trade_bill(
+        &self,
+        bill_date: &str,
+        bill_type: BillType,
+        tar_type: Option<BillTarType>,
+    ) -> Result<TradeBillResponse, PayError> {
+        // bill_date 只允许 yyyy-MM-dd:它是**拼进签名串**的,形状不对会让签名与请求一起失败
+        if !crate::util::is_bill_date(bill_date) {
+            return Err(PayError::VerifyError(format!(
+                "账单日期必须是 yyyy-MM-dd: {bill_date}"
+            )));
+        }
+        let mut url = format!(
+            "/v3/bill/tradebill?bill_date={bill_date}&bill_type={}",
+            bill_type.as_str()
+        );
+        if let Some(tar_type) = tar_type {
+            url.push_str("&tar_type=");
+            url.push_str(tar_type.as_str());
+        }
+        self.get_pay(&url).await
+    }
+
+    /// 下载账单文件（第二步）：对 [`WechatPay::trade_bill`] 返回的 `download_url` 发**已签名** GET。
+    ///
+    /// ⚠ 与其余端点相反的两点，都是官方明文规定的：
+    /// * 账单文件的应答**不带签名头** ⇒ 本方法**跳过应答验签**，也**不能**声称内容已验签；
+    ///   完整性必须由调用方用 `hash_type` / `hash_value`（SHA1）自行比对；
+    /// * 地址是**绝对的**且 5 分钟内有效 ⇒ 这里按官方给的地址**原样**请求（不套用网关前缀，
+    ///   否则就把请求发到了另一个 host）；地址必须落在 `/v3/` 之下、默认必须 https
+    ///   （只有调用方显式把客户端指向明文网关时才放行 http，见
+    ///   [`crate::util::bill_download_path_and_query`]）。
+    ///
+    /// 返回**原始字节**：`tar_type = Some(BillTarType::Gzip)` 时是 gzip 流，由调用方解压。
+    /// 非 2xx 会作为**未验签**的 `PayError::ApiError` 返回；下载失败直接重试即可
+    /// （本方法内部已按只读请求的重试策略重试）。
+    #[maybe_async_attr]
+    pub async fn download_bill(&self, download_url: &str) -> Result<Vec<u8>, PayError> {
+        let allow_plain_http = self.base_url().starts_with("http://");
+        let path_and_query =
+            crate::util::bill_download_path_and_query(download_url, allow_plain_http)?;
+        let policy = self.policy_for(RequestKind::Read);
+        let max_attempts = policy.max_attempts();
+        let mut attempt: u32 = 1;
+
+        loop {
+            // 每次尝试重新签名(非 nonce + 新时间戳),签名串第二行用 path?query
+            let headers = self.build_header(HttpMethod::GET, path_and_query, "")?;
+            // ⚠ 只打印路径:下载地址的查询串里带 token,不能进日志。
+            // 绑定名带下划线不是笔误:`debug!` 在未启用 `debug-print` 时展开为空操作,
+            // 那时这个变量确实没被使用(见 `src/macros.rs`)。
+            let _path_only = path_and_query.split('?').next().unwrap_or_default();
+            debug!("download bill: {}", _path_only);
+            let response = self
+                .client
+                .get(download_url)
+                .headers(headers)
+                .send()
+                .await
+                // `.without_url()`:地址里带 token,别让它经错误链进日志
+                .map_err(|err| PayError::RequestError(err.without_url()))?;
+            let status = response.status().as_u16();
+            let request_id = request_id_of(response.headers());
+            let body = response
+                .bytes()
+                .await
+                .map_err(|err| PayError::RequestError(err.without_url()))?
+                .to_vec();
+
+            if (200..300).contains(&status) {
+                return Ok(body);
+            }
+            // 非 2xx:官方用 JSON 错误信封(`{code,message}`)说明原因;这条应答没验签,如实标记
+            let err =
+                PayError::api_error_unverified(status, &String::from_utf8_lossy(&body), request_id);
+            // 分类只在「可重试」时有意义(`classify` 对无需重试的错误返回 `None`)
+            let delivery = classify(&err);
+            let retry = delivery.is_some_and(|delivery| should_retry(delivery, RequestKind::Read));
+            if !retry || attempt >= max_attempts {
+                return Err(err);
+            }
+            let delay = policy.delay_for(attempt);
+            debug!(
+                "retry {}/{} after {:?} ({:?})",
+                attempt, max_attempts, delay, delivery
+            );
+            attempt += 1;
+            sleep_for(delay).await;
+        }
     }
 
     /// 查询订单（按商户订单号）。

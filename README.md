@@ -5,7 +5,7 @@
 > **这是 fork，不是上游，也未发布到 crates.io。** 当前版本 `0.4.0`，相对上游 `0.2.21`
 > 含破坏性改动（见 [CHANGELOG](CHANGELOG.md)）。请按「引入依赖」用 **git 或 path** 引入。
 
-覆盖：JSAPI / Native / APP / H5 / 付款码下单、申请退款、订单查询、关单、退款查询、
+覆盖：JSAPI / Native / APP / H5 / 付款码下单、申请退款、订单查询、关单、退款查询、交易账单（对账）、
 平台证书获取与轮换、**微信支付公钥与平台证书双表并存（灰度期两种签名都认）**、
 支付回调的验签与解密、**出站应答验签（默认强制）**。
 
@@ -625,6 +625,34 @@ let config = WechatPayConfig {
   可以用 `wechat_pay.with_key_refresh_wait(Duration::from_secs(5))` 调大预算 ——
   等超预算的请求会拿到 `UnknownPlatformSerial`（消息里带预算毫秒数），`Duration::ZERO`
   则是完全不等待。
+
+## 交易账单（对账）
+
+```rust
+use wechat_pay_rust_sdk::model::{BillTarType, BillType};
+
+// 1) 申请账单：微信每日 10 点后生成「昨日」账单（北京时间），只支持三个月内、
+//    且账单里**只有支付成功的订单**、金额单位是**元**。
+let bill = wechat_pay
+    .trade_bill("2026-09-28", BillType::Success, Some(BillTarType::Gzip))
+    .await?;
+
+// 2) 下载账单文件（原始字节；GZIP 时是 gzip 流，自己解压）
+let bytes = wechat_pay.download_bill(&bill.download_url).await?;
+
+// 3) 官方要求：比对 hash_value 确认完整性（hash_type 固定 SHA1）
+assert_eq!(sha1_hex(&content), bill.hash_value);
+```
+
+⚠ 与其它端点相反的两点（官方明文，别照抄「默认强制验签」那套）：
+
+- **账单文件的应答不带签名头** ⇒ `download_bill` 跳过应答验签，也**不**声称内容已验签；
+  完整性只能靠第 3 步的摘要比对。
+- **下载地址是绝对的** ⇒ 按官方给的地址原样请求（不套用 `base_url`），且只接受 `/v3/` 之下、
+  默认只接受 https。
+
+错误处理：`NO_STATEMENT_EXIST`（该日没有账单）与 `STATEMENT_CREATING`（仍在生成）会以
+`ApiError.response.code` 返回，调用方据此区分「没账单」与「稍后再取」。
 
 ## 错误处理
 

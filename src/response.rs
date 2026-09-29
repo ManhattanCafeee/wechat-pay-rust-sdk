@@ -411,3 +411,19 @@ pub struct TransactionPromotionGoodsDetail {
     /// 【商品备注】 商品备注。
     pub goods_remark: Option<String>,
 }
+
+/// 申请交易账单响应（`GET /v3/bill/tradebill`）：账单文件的下载地址与完整性摘要。
+///
+/// ⚠ 官方给的摘要算法是 **SHA1**（`hash_type` 固定 `SHA1`），且账单**下载**应答不带签名头 ——
+/// 完整性只能靠调用方比对 `hash_value`，`WechatPay::download_bill` 不做验签（也没有可验的东西）。
+#[derive(Debug, Deserialize)]
+pub struct TradeBillResponse {
+    ///【摘要类型】 固定为 `SHA1`
+    pub hash_type: String,
+    ///【摘要值】 账单文件的 SHA1 摘要（十六进制），用于校验文件一致性
+    pub hash_value: String,
+    ///【下载地址】 下一步下载账单文件的地址（官方：5 分钟内有效）
+    pub download_url: String,
+}
+
+impl ResponseTrait for TradeBillResponse {}

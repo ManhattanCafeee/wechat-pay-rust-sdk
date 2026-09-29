@@ -117,6 +117,18 @@
   **冷启动不预拉证书**、按需（未知 serial）拉一次证书后重验、显式刷新仍可用（模式未被切走）、
   `set_platform_keys` 仍整体替换并切静态模式、未知公钥 ID 连一次证书请求都不触发，
   以及「轮换表刷新失败但有静态密钥时请求照发」。
+- **`WechatPay::trade_bill(bill_date, bill_type, tar_type)` + `WechatPay::download_bill(download_url)`**：
+  交易账单（对账用）的两个端点。申请账单走常规**已验签** GET（`GET /v3/bill/tradebill`，
+  `bill_date=yyyy-MM-dd`、`bill_type` ∈ `ALL/SUCCESS/REFUND`、`tar_type=GZIP`），
+  返回 `{ hash_type, hash_value, download_url }`（构造 `TradeBillResponse`，配套
+  `model::BillType` / `model::BillTarType`）。⚠ 两条官方规则与其它端点**相反**，已在文档里写明：
+  ① 账单**下载**应答不带签名头（官方明文），因此 `download_bill` **跳过应答验签**、也不做
+  `ensure_keys()`（不需要平台密钥）—— 完整性必须由调用方比对 `hash_value`（官方 `hash_type`
+  固定 **SHA1**，不是 SHA256）；② 下载地址是**绝对的**，若按 `base_url` 前缀拼接会发到别的主机，
+  所以按官方给的地址**原样**请求（签名串第二行用它的 `path?query`），并只接受 `/v3/` 之下、
+  默认只接受 https（只有调用方把客户端指向明文网关时才放行 http）。
+  `download_bill` 返回**原始字节**（`tar_type=GZIP` 时是 gzip 流，由调用方解压），
+  非 2xx 以**未验签**的 `ApiError` 返回（消息带 `[未验签]`）。
 
 ### 行为变更
 
