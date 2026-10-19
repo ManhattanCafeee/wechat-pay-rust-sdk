@@ -6,9 +6,13 @@
 > 相对上游 `0.2.21` 修掉了一批正确性与安全性问题并补齐端点（见 [CHANGELOG](CHANGELOG.md)）。
 > **非腾讯官方，也未获原作者背书。**
 
-覆盖：JSAPI / Native / APP / H5 / 付款码下单、申请退款、订单查询、关单、退款查询、交易账单（对账）、
+覆盖：JSAPI / Native / APP / H5 下单、申请退款、订单查询、关单、退款查询、交易账单（对账）、
 平台证书获取与轮换、**微信支付公钥与平台证书双表并存（灰度期两种签名都认）**、
 支付回调的验签与解密、**出站应答验签（默认强制）**。
+
+⚠ **付款码支付未实现**：`micro_pay()` 名义上对应付款码，但它实际发往 JSAPI 下单端点，
+`MicroParams` 也没有付款码必需的 `auth_code` —— 不要使用；小程序支付请用 `jsapi_pay`。
+资金账单（`/v3/bill/fundflowbill`）、分账、转账同样未实现。
 
 # API文档
 - [wechatpay-v3](#wechatpay-v3)
@@ -28,6 +32,7 @@
   - [回调通知：验签与防重放](#回调通知验签与防重放)
   - [应答验签（默认强制）](#应答验签默认强制)
   - [平台证书轮换](#平台证书轮换)
+  - [交易账单（对账）](#交易账单对账)
   - [错误处理](#错误处理)
   - [超时与连接复用](#超时与连接复用)
   - [自动重试](#自动重试)
@@ -55,6 +60,9 @@ wechatpay-v3 = { version = "0.4.0", features = ["debug-print"] }
 >
 > MSRV 1.89（edition 2024）。
 > ⚠ 不存在 `blocking` feature —— 同步是**默认**行为，异步才需要 feature。
+>
+> 下面的示例默认按**同步** API 写；带 `.await` 的片段是启用 `async` feature 后的写法，
+> 方法名与参数相同，只是返回 `Future`。
 
 ## native支付
 ```rust
@@ -806,3 +814,10 @@ let wechat_pay = wechat_pay.with_base_urls(
   这种越界行为，它依然要由你先查单确认。
 - 不配置备域名（默认）时行为与以前完全一致。
 - ⚠ 这两个地址只能来自你自己的配置，**绝不能让用户输入接触它们**。
+
+## 许可证
+
+Apache-2.0，见仓库里的
+[LICENSE](https://github.com/ManhattanCafeee/wechat-pay-rust-sdk/blob/main/LICENSE)。
+本 crate 是 `wechat-pay-rust-sdk` 的独立 fork，上游版权归属、修改声明与商标说明见
+[NOTICE](https://github.com/ManhattanCafeee/wechat-pay-rust-sdk/blob/main/NOTICE)。
