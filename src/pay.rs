@@ -74,7 +74,7 @@ fn build_client(timeouts: HttpTimeouts) -> Client {
 /// 字符串，位置传参写反了照样编译，要等到网关返回 401 `SIGN_ERROR`（甚至更晚）才暴露。
 ///
 /// ```no_run
-/// # use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPay, WechatPayConfig};
+/// # use wechatpay_v3::pay::{ResponseVerify, WechatPay, WechatPayConfig};
 /// let config = WechatPayConfig {
 ///     appid: "wx123".into(),
 ///     mch_id: "1900000001".into(),
@@ -524,7 +524,7 @@ impl WechatPay {
     /// （先配好备域名再调它，等于把两者一起换掉）。
     ///
     /// ```no_run
-    /// # use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPay, WechatPayConfig};
+    /// # use wechatpay_v3::pay::{ResponseVerify, WechatPay, WechatPayConfig};
     /// # let wechat_pay = WechatPay::from_config(WechatPayConfig {
     /// #     appid: "a".into(), mch_id: "b".into(), private_key: "c".into(),
     /// #     serial_no: "d".into(), v3_key: "e".into(), notify_url: "f".into(),
@@ -603,7 +603,7 @@ impl WechatPay {
     ///
     /// ```no_run
     /// # use std::time::Duration;
-    /// # use wechat_pay_rust_sdk::pay::{HttpTimeouts, ResponseVerify, WechatPay, WechatPayConfig};
+    /// # use wechatpay_v3::pay::{HttpTimeouts, ResponseVerify, WechatPay, WechatPayConfig};
     /// # let wechat_pay = WechatPay::from_config(WechatPayConfig {
     /// #     appid: "a".into(), mch_id: "b".into(), private_key: "c".into(),
     /// #     serial_no: "d".into(), v3_key: "e".into(), notify_url: "f".into(),
@@ -632,8 +632,8 @@ impl WechatPay {
     /// **策略只控制次数与间隔；「该不该重试」由失败分类决定**，详见 [`crate::retry`]。
     ///
     /// ```no_run
-    /// # use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPay, WechatPayConfig};
-    /// # use wechat_pay_rust_sdk::retry::RetryPolicy;
+    /// # use wechatpay_v3::pay::{ResponseVerify, WechatPay, WechatPayConfig};
+    /// # use wechatpay_v3::retry::RetryPolicy;
     /// # let wechat_pay = WechatPay::from_config(WechatPayConfig {
     /// #     appid: "a".into(), mch_id: "b".into(), private_key: "c".into(),
     /// #     serial_no: "d".into(), v3_key: "e".into(), notify_url: "f".into(),
@@ -809,7 +809,7 @@ impl WechatPay {
     /// 覆盖主域名、[`WechatPay::with_base_urls`] 配置主 + 备域名。
     ///
     /// ```no_run
-    /// # use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPay, WechatPayConfig};
+    /// # use wechatpay_v3::pay::{ResponseVerify, WechatPay, WechatPayConfig};
     /// let wechat_pay = WechatPay::from_config(WechatPayConfig {
     ///     appid: "wx123".into(),
     ///     mch_id: "1900000001".into(),

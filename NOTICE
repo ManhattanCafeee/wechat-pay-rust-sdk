@@ -1,4 +1,4 @@
-wechat-pay-rust-sdk
+wechatpay-v3
 Copyright 2024-2026 lake <102535481@qq.com> and other contributors
 
 This product includes software originally developed as part of
@@ -13,6 +13,12 @@ Original contributors:
 
 Fork maintained at https://github.com/ManhattanCafeee/wechat-pay-rust-sdk
 Modifications Copyright 2026 ManhattanCafeee
+
+This crate is an independent fork of wechat-pay-rust-sdk, published as
+`wechatpay-v3`. It is not affiliated with, sponsored by, or endorsed by
+the original maintainers or by Tencent. "WeChat Pay" and "微信支付" are
+trademarks of Tencent; those names are used only to describe the API
+this library talks to.
 
 Note: the crate package description in Cargo.toml previously declared
 "license = \"MIT\"" while the distributed LICENSE text was Apache-2.0.

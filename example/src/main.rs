@@ -18,10 +18,10 @@
 
 use actix_web::web::{Bytes, Data};
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, post};
-use wechat_pay_rust_sdk::error::PayError;
-use wechat_pay_rust_sdk::model::{WechatPayDecodeData, WechatPayNotify};
-use wechat_pay_rust_sdk::notify::NotifyHeaders;
-use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
+use wechatpay_v3::error::PayError;
+use wechatpay_v3::model::{WechatPayDecodeData, WechatPayNotify};
+use wechatpay_v3::notify::NotifyHeaders;
+use wechatpay_v3::pay::{PayNotifyTrait, WechatPay};
 
 /// 失败应答：官方要求校验或处理失败时返回 4XX / 5XX，body 为
 /// `{"code":"FAIL","message":"…"}`，微信收到后会按退避策略重投。

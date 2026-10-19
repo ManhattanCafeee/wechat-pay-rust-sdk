@@ -130,7 +130,7 @@ impl PayError {
     /// 会如实告诉他没这回事），漏判成 `false` 则可能诱导他换个单号重新下单。
     ///
     /// ```
-    /// # use wechat_pay_rust_sdk::error::PayError;
+    /// # use wechatpay_v3::error::PayError;
     /// # fn handle(err: PayError) {
     /// if err.may_have_taken_effect() {
     ///     // 去查单确认，而不是直接重试下单

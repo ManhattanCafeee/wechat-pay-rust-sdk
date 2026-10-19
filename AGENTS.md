@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 微信支付 APIv3 的 Rust 客户端库（**社区维护 fork，非腾讯官方**）。
-包名 `wechat-pay-rust-sdk`，Rust 代码里的 crate 名是 `wechat_pay_rust_sdk`。
+包名 `wechatpay-v3`（发布名；上游同名包 `wechat-pay-rust-sdk` 归原作者所有），Rust 代码里的 crate 名是 `wechatpay_v3`。
 
 ---
 
@@ -13,8 +13,9 @@
   **交易账单（`trade_bill` + `download_bill`）**、H5 页面取 `weixin://` 链接，
   以及回调的验签与 AES-256-GCM 解密。
 - **未实现**：资金账单（`/v3/bill/fundflowbill`）、分账、转账。不要以为它们在某个模块里没被找到 —— 确实没有。
-- **这是 fork，不发布到 crates.io**：`Cargo.toml` 设了 `publish = false`（该名字在 crates.io 属于上游）。
-  引入只能用 **git（固定 tag）或 path**；写成 `wechat-pay-rust-sdk = "0.3.0"` 会解析到上游代码或直接失败。
+- **发布名是 `wechatpay-v3`**：`wechat-pay-rust-sdk` 这个名字在 crates.io 归上游（本仓库是它的 fork），
+  所以用独立名字发布；`Cargo.toml` 不再设 `publish = false`，发版前用 `cargo publish --dry-run` 验证。
+  从 **crates.io / git（固定 tag）/ path** 引入时用的都是 `wechatpay-v3`（crate 名 `wechatpay_v3`）。
 - `README.md` 通过 `#![doc = include_str!("../README.md")]`（`src/lib.rs:1`）**直接充当 crate 文档** —— 改 README 就是改公开文档。
 
 ## Architecture & Data Flow
@@ -277,7 +278,7 @@ cargo +1.89.0 check --all-targets
 
 | Path | Why it matters |
 | --- | --- |
-| `Cargo.toml` | feature 矩阵、`[lints]`、`rust-version`、`publish = false`、`[lib] doctest = false`、workspace 成员 |
+| `Cargo.toml` | feature 矩阵、`[lints]`、`rust-version`、`[package.metadata.docs.rs]`、`[lib] doctest = false`、workspace 成员 |
 | `src/lib.rs` | crate 文档来源（include README）、`#![forbid(unsafe_code)]`、模块清单 |
 | `src/async_impl/pay.rs` | 所有端点方法 + 传输层 + 重试循环 —— 改动最集中的文件 |
 | `src/retry.rs` | 重试策略与失败分类；模块文档里有完整的官方依据 |

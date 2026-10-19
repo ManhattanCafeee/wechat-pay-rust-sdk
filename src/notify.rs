@@ -25,16 +25,16 @@
 //! 所以同一笔订单可能回调多次。幂等必须由业务侧落库完成：
 //!
 //! ```no_run
-//! # use wechat_pay_rust_sdk::cert::PlatformKeys;
-//! # use wechat_pay_rust_sdk::notify::NotifyHeaders;
-//! # use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
+//! # use wechatpay_v3::cert::PlatformKeys;
+//! # use wechatpay_v3::notify::NotifyHeaders;
+//! # use wechatpay_v3::pay::{PayNotifyTrait, WechatPay};
 //! # fn handle(keys: &PlatformKeys, wechat_pay: &WechatPay, headers: NotifyHeaders, raw_body: &str) {
 //! // 1. 校验来源与新鲜度（本模块）
 //! keys.verify_notify(&headers, raw_body).expect("非法回调");
 //!
 //! // 2. 解密出业务数据（入口会先校验 resource.algorithm）
 //! //    （实际字段来自 raw_body 的 resource 节点）
-//! # use wechat_pay_rust_sdk::model::WechatPayNotifySource;
+//! # use wechatpay_v3::model::WechatPayNotifySource;
 //! # let resource = WechatPayNotifySource {
 //! #     algorithm: "AEAD_AES_256_GCM".into(),
 //! #     ciphertext: String::new(),

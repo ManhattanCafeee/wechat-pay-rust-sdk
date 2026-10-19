@@ -15,21 +15,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use wechat_pay_rust_sdk::cert::{PlatformKeys, REFRESH_INTERVAL_SECS};
-use wechat_pay_rust_sdk::error::{ErrorKind, PayError};
-use wechat_pay_rust_sdk::model::{
+use wechatpay_v3::cert::{PlatformKeys, REFRESH_INTERVAL_SECS};
+use wechatpay_v3::error::{ErrorKind, PayError};
+use wechatpay_v3::model::{
     AmountInfo, AppParams, Currency, GoodsDetail, JsapiParams, MicroParams, NativeParams,
     OrderDetail, PayerInfo, RefundsParams, SceneInfo, SettleInfo, WechatPayNotifySource,
     WechatPayRefundDecodeData,
 };
-use wechat_pay_rust_sdk::notify::NotifyHeaders;
-use wechat_pay_rust_sdk::pay::{
+use wechatpay_v3::notify::NotifyHeaders;
+use wechatpay_v3::pay::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, HttpTimeouts, PayNotifyTrait, ResponseVerify,
     WechatPay, WechatPayConfig, WechatPayTrait,
 };
-use wechat_pay_rust_sdk::request::HttpMethod;
-use wechat_pay_rust_sdk::retry::RetryPolicy;
-use wechat_pay_rust_sdk::util;
+use wechatpay_v3::request::HttpMethod;
+use wechatpay_v3::retry::RetryPolicy;
+use wechatpay_v3::util;
 
 /// 测试专用 RSA 私钥（PKCS#8, 2048 bit）。
 ///
@@ -3413,8 +3413,8 @@ dual_test! {
 
         let bill = call!(wechat_pay.trade_bill(
             "2026-09-28",
-            wechat_pay_rust_sdk::model::BillType::Success,
-            Some(wechat_pay_rust_sdk::model::BillTarType::Gzip),
+            wechatpay_v3::model::BillType::Success,
+            Some(wechatpay_v3::model::BillTarType::Gzip),
         ))
         .expect("申请账单应当成功");
 
@@ -3447,7 +3447,7 @@ dual_test! {
 
         let err = call!(wechat_pay.trade_bill(
             "2026-9-28",
-            wechat_pay_rust_sdk::model::BillType::All,
+            wechatpay_v3::model::BillType::All,
             None,
         ))
         .expect_err("非法日期必须被拒");

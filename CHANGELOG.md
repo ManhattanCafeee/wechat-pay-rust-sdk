@@ -4,12 +4,11 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.4.0] - 2026-10-19
 
-> 相对已打 tag 的 `v0.3.0`，按 0.x 语义升 **`0.4.0`**（新增默认开启的行为）——
-> `Cargo.toml` 的 `version` 已同步为 `0.4.0`，打上 `v0.4.0` tag 后把本节改名为 `[0.4.0]` 即可
-> （README 的安装片段也是按 `v0.4.0` 写的：`v0.3.0` 是 `WechatPay::new(...)` 时代，
-> 与本文档的 `WechatPayConfig` / `from_config` 示例对不上）。
+> **首个以 `wechatpay-v3` 发布到 crates.io 的版本。** 本仓库是 `wechat-pay-rust-sdk` 的独立 fork
+> （上游同名包归原作者所有），按 0.x 语义从 `0.3.0` 升到 `0.4.0`（新增默认开启的行为），
+> 对应本仓库的 `v0.4.0` tag。
 
 ### 破坏性变更
 
@@ -260,9 +259,8 @@
 
 ## [0.3.0] - 2026-09-11
 
-> **不发布到 crates.io。** 本仓库是 fork —— `wechat-pay-rust-sdk` 这个名字在 crates.io 属于上游，
-> `Cargo.toml` 已设 `publish = false`，引入方式见 README「引入依赖」（git / path）。
-> 版本号仍按语义化版本管理：相对上游 `0.2.21` 含破坏性改动，故取 `0.3.0`。
+> 本仓库是 `wechat-pay-rust-sdk` 的独立 fork（上游同名包归原作者所有），以 `wechatpay-v3` 之名发布。
+> 版本号按语义化版本管理：相对上游 `0.2.21` 含破坏性改动，故取 `0.3.0`。
 
 ### 破坏性变更
 

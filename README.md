@@ -1,18 +1,17 @@
-# wechat-pay-rust-sdk
+# wechatpay-v3
 
-微信支付 APIv3 的 Rust SDK（**社区维护，非腾讯官方**）。
+微信支付 APIv3 的 Rust 客户端。
 
-> **这是 fork，不是上游，也未发布到 crates.io。** 当前版本 `0.4.0`，相对上游 `0.2.21`
-> 含破坏性改动（见 [CHANGELOG](CHANGELOG.md)）。请按「引入依赖」用 **git 或 path** 引入。
+> **这是 [`wechat-pay-rust-sdk`](https://github.com/dounine/wechat-pay-rust-sdk) 的独立 fork**，
+> 相对上游 `0.2.21` 修掉了一批正确性与安全性问题并补齐端点（见 [CHANGELOG](CHANGELOG.md)）。
+> **非腾讯官方，也未获原作者背书。**
 
 覆盖：JSAPI / Native / APP / H5 / 付款码下单、申请退款、订单查询、关单、退款查询、交易账单（对账）、
 平台证书获取与轮换、**微信支付公钥与平台证书双表并存（灰度期两种签名都认）**、
 支付回调的验签与解密、**出站应答验签（默认强制）**。
 
-[![QQ群](https://img.shields.io/badge/QQ%E7%BE%A4-799168925-blue)](http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=dLoye8pBcO60zGzqLjGO0l-GgMIaf6wQ&authKey=LfxBdZ5A%2F9eWJbKpzTcuWPjmQu5UdIJ3TVTpqRAQYkCID50WLkYoIXcGxGKzupG3&noverify=0&group_code=799168925)
-
 # API文档
-- [wechat-pay-rust-sdk](#wechat-pay-rust-sdk)
+- [wechatpay-v3](#wechatpay-v3)
 - [API文档](#api文档)
 - [使用指南](#使用指南)
   - [native支付](#native支付)
@@ -37,35 +36,30 @@
 # 使用指南
 引入依赖
 
-本 crate **未发布到 crates.io**，用 git 或 path 引入：
-
 ```toml
-# 方式一：git —— 建议固定 tag，避免跟随 main 漂移导致构建不可复现
-#   需先把本仓库 push 到 remote，并打上 tag v0.4.0
-#   ⚠ 不要用 v0.3.0：那是 `WechatPay::new(...)` 时代的 tag，与本文档示例
-#     （`WechatPayConfig` / `from_config`）对不上。要钉提交号就写 rev = "<commit>"。
-wechat-pay-rust-sdk = { git = "https://github.com/ManhattanCafeee/wechat-pay-rust-sdk", tag = "v0.4.0" }
+# 同步（默认）：blocking 客户端
+wechatpay-v3 = "0.4.0"
 
-# 方式二：path —— 适合边改 SDK 边调业务代码
-wechat-pay-rust-sdk = { path = "../wechat-pay-rust-sdk" }
+# 异步：与同步版同名的方法返回 Future；下游需自带带 timer 的 tokio runtime
+wechatpay-v3 = { version = "0.4.0", features = ["async"] }
 
-# 异步：在上面任一方式的基础上加 features
-wechat-pay-rust-sdk = { path = "../wechat-pay-rust-sdk", features = ["async"] }
+# 调试日志：会打印请求体与 Authorization 头（含 openid、金额），生产环境不要开
+wechatpay-v3 = { version = "0.4.0", features = ["debug-print"] }
 
-# 调试日志（会输出请求体与 Authorization 头，生产环境不要开）
-wechat-pay-rust-sdk = { path = "../wechat-pay-rust-sdk", features = ["debug-print"] }
+# 边改 SDK 边调业务代码：path = "../wechat-pay-rust-sdk"（features 同上）
 ```
 
-> ⚠ **不要**写成 `wechat-pay-rust-sdk = "0.4.0"` —— 该名字在 crates.io 属于上游（最高 `0.2.21`），
-> 这句话要么解析到**上游代码**、要么直接解析失败，两种情况都拿不到本 fork 的修复。
+> ⚠ 从上游 `wechat-pay-rust-sdk` 0.2.x 迁移过来时注意：本 crate 从 `0.4.0` 起发布，含**破坏性改动**
+> （`WechatPay::new(...)` → `WechatPayConfig` + `from_config`、删除 `WeChatResponse<T>`、
+> 默认强制应答验签、退款重试走独立的分钟级策略等），详见 [CHANGELOG](CHANGELOG.md)。
 >
 > MSRV 1.89（edition 2024）。
 > ⚠ 不存在 `blocking` feature —— 同步是**默认**行为，异步才需要 feature。
 
 ## native支付
 ```rust
-use wechat_pay_rust_sdk::model::NativeParams;
-use wechat_pay_rust_sdk::pay::{WechatPay, WechatPayConfig};
+use wechatpay_v3::model::NativeParams;
+use wechatpay_v3::pay::{WechatPay, WechatPayConfig};
 
 let private_key_path = "./apiclient_key.pem";
 let private_key = std::fs::read_to_string(private_key_path).unwrap();
@@ -93,9 +87,9 @@ NativeResponse {
 ## h5支付
 
 ```rust
-use wechat_pay_rust_sdk::model::{H5Params, H5SceneInfo};
-use wechat_pay_rust_sdk::pay::WechatPay;
-use wechat_pay_rust_sdk::util;
+use wechatpay_v3::model::{H5Params, H5SceneInfo};
+use wechatpay_v3::pay::WechatPay;
+use wechatpay_v3::util;
 
 let wechat_pay = WechatPay::from_env();
 let body = wechat_pay.h5_pay(H5Params::new(
@@ -136,8 +130,8 @@ weixin://wap/pay?prepayid%3Dwx13013716281xa5df8313490000&package=35748946&nonces
 ## jsapi支付
 
 ```rust
-use wechat_pay_rust_sdk::model::JsapiParams;
-use wechat_pay_rust_sdk::pay::WechatPay;
+use wechatpay_v3::model::JsapiParams;
+use wechatpay_v3::pay::WechatPay;
 
 let wechat_pay = WechatPay::from_env();
 let body = wechat_pay.jsapi_pay(JsapiParams::new(
@@ -158,8 +152,8 @@ JsapiResponse {
 ## app支付
 
 ```rust
-use wechat_pay_rust_sdk::model::AppParams;
-use wechat_pay_rust_sdk::pay::WechatPay;
+use wechatpay_v3::model::AppParams;
+use wechatpay_v3::pay::WechatPay;
 
 let wechat_pay = WechatPay::from_env();
 let body = wechat_pay.app_pay(AppParams::new(
@@ -183,8 +177,8 @@ AppResponse {
 `https://api.weixin.qq.com/sns/jscode2session` 换 `openid`；那是小程序 API，不在本 SDK 范围内）。
 
 ```rust
-use wechat_pay_rust_sdk::model::JsapiParams;
-use wechat_pay_rust_sdk::pay::WechatPay;
+use wechatpay_v3::model::JsapiParams;
+use wechatpay_v3::pay::WechatPay;
 
 let wechat_pay = WechatPay::from_env();
 let response = wechat_pay.jsapi_pay(JsapiParams::new(
@@ -227,7 +221,7 @@ println!("{args}");
 > 推荐入口是 `wechat_pay.decrypt_notify(&notify.resource)` —— 它会先校验 `resource.algorithm`。
 
 ```rust
-use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
+use wechatpay_v3::pay::{PayNotifyTrait, WechatPay};
 let associated_data = "transaction";
 let nonce = "gZiqzlfayUu2";
 let ciphertext = "pCidqdiS5IIj5f9Pw9j69zuzu8l8IxcPCkfsTBKzna4gqZztNAqTMUY/Ai0rtj8qhaX0naYZF3a2lRid/ofK/83MNv+Neb5+w/0+UOO9nLNJvIFy3oFeMf2PTbp6tgDE35T5AoP9iKQ+1VkXTiUdRxzFoRx6/LfBzHmeuVEDHKScRqjrf6NdxuDDD0ciCQaiHmb18Y0BRZdfNxWTAC83Rar5yTX2NNZPBtGdFDG3yAK2I3Vp7ZKLeMa92ecExNGwHrdJ+HxWw66IIdwVqJLlNmTG0c5zUpSc8yovnaJi1Wv/TC7Tm5NzcwdHsdRE110tIWFbvNmIzIIb+3P33JFWmaXXb1VVDC43DqtlplttYwL6H3kU0ABgHMMbccTwYmP4cSY8BCAL01754nqipxWogEC/la9iQiw85+rLRo/Ny9k3mp8n35D6bDNtS1LiaslbLM92ZbfKeglTg54F/R1l5xWolAVpx8iTz8Oc+XJClXdWr8j5poyh8zK2/RrXPRfr+8s2/oGeGvdaqJbN/LviYcCMDbXU9pKDScWlSi4akxfJu0EatPDvFEbn5DYRQnn5v6wCeesYkEL+wiFCAIs=";
@@ -295,7 +289,7 @@ async fn pay_notify(data: Json<WechatPayNotify>, req: HttpRequest) -> impl Respo
 
 ## 读取平台证书
 ```rust
-use wechat_pay_rust_sdk::pay::WechatPay;
+use wechatpay_v3::pay::WechatPay;
 
 let wechat_pay = WechatPay::from_env();
 let response = wechat_pay.certificates().expect("certificates error");
@@ -323,8 +317,8 @@ CertificateResponse {
 ```
 解密上面的证书
 ```rust
-use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
-use wechat_pay_rust_sdk::response::Certificate;
+use wechatpay_v3::pay::{PayNotifyTrait, WechatPay};
+use wechatpay_v3::response::Certificate;
 
 let wechat_pay = WechatPay::from_env();
 let response = wechat_pay.certificates().expect("certificates error");
@@ -360,7 +354,7 @@ xxxx...
 > 默认强制，见「应答验签」一节 —— 那里不需要你手工传公钥。
 
 ```rust
-use wechat_pay_rust_sdk::pay::{PayNotifyTrait, WechatPay};
+use wechatpay_v3::pay::{PayNotifyTrait, WechatPay};
 
 let wechat_pay = WechatPay::from_env();
 let pub_key = std::fs::read_to_string("pubkey.pem").unwrap();
@@ -408,9 +402,9 @@ async fn pay_notify(bytes: Bytes, req: HttpRequest) -> impl Responder {
 ## 退款申请
 
 ```rust
-    use wechat_pay_rust_sdk::error::PayError;
-    use wechat_pay_rust_sdk::model::RefundsParams;
-    use wechat_pay_rust_sdk::pay::WechatPay;
+    use wechatpay_v3::error::PayError;
+    use wechatpay_v3::model::RefundsParams;
+    use wechatpay_v3::pay::WechatPay;
     
     let wechat_pay = WechatPay::from_env();
     let req = RefundsParams::new("123456", 1, 1, None, Some("123456"));
@@ -462,9 +456,9 @@ match refund.status.as_str() {
 ## 回调通知：验签与防重放
 
 ```rust
-use wechat_pay_rust_sdk::model::WechatPayNotify;
-use wechat_pay_rust_sdk::notify::NotifyHeaders;
-use wechat_pay_rust_sdk::pay::PayNotifyTrait; // decrypt_notify 是 trait 方法
+use wechatpay_v3::model::WechatPayNotify;
+use wechatpay_v3::notify::NotifyHeaders;
+use wechatpay_v3::pay::PayNotifyTrait; // decrypt_notify 是 trait 方法
 
 // 启动时拉一次平台证书，之后每 12 小时内刷新
 let mut keys = wechat_pay.fetch_platform_keys().await?;
@@ -523,7 +517,7 @@ let data = wechat_pay.decrypt_notify(&notify.resource)?;
 「请求未受理」这类结论，而调用方在超时兜底时正是靠它们决定要不要换个单号重开。
 
 ```rust
-use wechat_pay_rust_sdk::pay::{ResponseVerify, WechatPayConfig};
+use wechatpay_v3::pay::{ResponseVerify, WechatPayConfig};
 
 let config = WechatPayConfig {
     appid: "wx123".into(),
@@ -629,7 +623,7 @@ let config = WechatPayConfig {
 ## 交易账单（对账）
 
 ```rust
-use wechat_pay_rust_sdk::model::{BillTarType, BillType};
+use wechatpay_v3::model::{BillTarType, BillType};
 
 // 1) 申请账单：微信每日 10 点后生成「昨日」账单（北京时间），只支持三个月内、
 //    且账单里**只有支付成功的订单**、金额单位是**元**。
@@ -660,7 +654,7 @@ assert_eq!(sha1_hex(&content), bill.hash_value);
 `Err(PayError::ApiError)`。用 `kind()` 做三层归类决定处置策略：
 
 ```rust
-use wechat_pay_rust_sdk::error::{ErrorKind, PayError};
+use wechatpay_v3::error::{ErrorKind, PayError};
 
 match wechat_pay.jsapi_pay(params).await {
     Ok(response) => { /* response.prepay_id / response.sign_data */ }
@@ -703,7 +697,7 @@ HTTP 客户端由 `WechatPay` 持有并跨请求复用（连接池共享）。
 
 ```rust
 use std::time::Duration;
-use wechat_pay_rust_sdk::pay::HttpTimeouts;
+use wechatpay_v3::pay::HttpTimeouts;
 
 let wechat_pay = wechat_pay.with_timeouts(HttpTimeouts {
     request: Duration::from_secs(30),
@@ -767,7 +761,7 @@ match wechat_pay.jsapi_pay(params).await {
 
 ```rust
 use std::time::Duration;
-use wechat_pay_rust_sdk::retry::RetryPolicy;
+use wechatpay_v3::retry::RetryPolicy;
 
 // 通用：默认 3 次尝试，指数退避 + 全抖动
 // （抖动是**向下**取的，所以首次等待是 0–200ms 之间的随机值，base_delay 是上限）

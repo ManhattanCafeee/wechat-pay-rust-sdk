@@ -66,7 +66,7 @@ pub const DEFAULT_REFUND_MAX_DELAY: Duration = Duration::from_secs(120);
 /// 配合 struct update 语法只改想改的那项。
 ///
 /// ```
-/// use wechat_pay_rust_sdk::retry::RetryPolicy;
+/// use wechatpay_v3::retry::RetryPolicy;
 /// use std::time::Duration;
 ///
 /// // 关掉重试
